@@ -42,7 +42,7 @@ fn probability(value: &Value) -> Result<f64> {
         .ok_or_else(|| fail("Model score must be a number between 0 and 1"))
 }
 
-fn parse_choice(body: &Value, question: &str, allowed: &[&str]) -> Result<(String, f64, Value)> {
+fn parse_choice<'a>(body: &'a Value, question: &str, allowed: &[&str]) -> Result<(&'a str, f64, &'a Value)> {
     let answer = &body["answers"][question];
     if field_str(answer, "type") != "choice" {
         return Err(fail("Clef-omni did not return a choice"));
@@ -52,7 +52,7 @@ fn parse_choice(body: &Value, question: &str, allowed: &[&str]) -> Result<(Strin
     if !allowed.contains(&choice) {
         return Err(fail("Clef-omni returned an unknown choice"));
     }
-    Ok((choice.to_string(), confidence, answer["probabilities"].clone()))
+    Ok((choice, confidence, &answer["probabilities"]))
 }
 
 fn parse_decision(raw: Value) -> Result<Decision> {
@@ -70,8 +70,8 @@ fn parse_decision(raw: Value) -> Result<Decision> {
     let remove_probability = probability(&action_probs["remove"])?;
     let critical_probability = probability(&severity_probs["critical"])?;
     Ok(Decision {
-        action, action_confidence, remove_probability, category,
-        category_confidence, severity, critical_probability,
+        action: action.to_owned(), action_confidence, remove_probability, category: category.to_owned(),
+        category_confidence, severity: severity.to_owned(), critical_probability,
     })
 }
 

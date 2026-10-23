@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
 use crate::util::{fail, field_str, field_int, secret};
+use crate::body::response_bytes;
 
 pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     let token = secret(env, "BOT_TOKEN")?;
@@ -14,14 +15,18 @@ pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     init.with_headers(headers);
     init.with_body(Some(JsValue::from_str(&payload)));
     let request = Request::new_with_init(&url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
+    let mut response = Fetch::Request(request).send().await
+        .map_err(|_| fail(&format!("Telegram method {method} network request failed")))?;
     let status = response.status_code();
-    let data: Value = response.json().await?;
+    let bytes = response_bytes(&mut response, 1024 * 1024).await
+        .map_err(|_| fail(&format!("Telegram method {method} response could not be read")))?;
+    let mut data: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| fail(&format!("Telegram method {method} returned invalid JSON")))?;
     if status != 200 || data["ok"] != true {
         // Never log upstream URLs because Telegram's token appears in the path.
         return Err(fail(&format!("Telegram method {method} failed (HTTP {status})")));
     }
-    Ok(data.get("result").cloned().unwrap_or(Value::Null))
+    Ok(data["result"].take())
 }
 
 pub async fn group_rules(env: &Env, chat_id: i64) -> Result<String> {
@@ -139,20 +144,13 @@ pub async fn download(env: &Env, file_id: &str, max_len: usize) -> Result<Vec<u8
     }
     let token = secret(env, "BOT_TOKEN")?;
     let url = format!("https://api.telegram.org/file/bot{token}/{path}");
-    let mut response = Fetch::Request(Request::new(&url, Method::Get)?).send().await?;
+    let mut response = Fetch::Request(Request::new(&url, Method::Get)?).send().await
+        .map_err(|_| fail("Telegram file download network request failed"))?;
     if response.status_code() != 200 {
         return Err(fail("Telegram file download failed"));
     }
-    if let Some(length) = response.headers().get("Content-Length")? {
-        if length.parse::<usize>().map(|x| x > max_len).unwrap_or(true) {
-            return Err(fail("Media content-length is over limit"));
-        }
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > max_len {
-        return Err(fail("Media downloaded beyond size limit"));
-    }
-    Ok(bytes)
+    response_bytes(&mut response, max_len).await
+        .map_err(|_| fail("Telegram file download failed or exceeded its size limit"))
 }
 
 pub fn normalize(msg: &Value) -> Value {

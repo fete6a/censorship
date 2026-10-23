@@ -31,11 +31,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
-      - name: Resolve dependency lockfiles
-        run: |
-          cargo generate-lockfile
-          cargo generate-lockfile --manifest-path tools/history-import/Cargo.toml
-          cargo generate-lockfile --manifest-path transcoder/Cargo.toml
+      - name: Resolve npm deployment lockfile
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Save dependency lockfiles
         uses: actions/upload-artifact@v4
         with:
@@ -44,11 +41,12 @@ jobs:
             Cargo.lock
             tools/history-import/Cargo.lock
             transcoder/Cargo.lock
+            package-lock.json
       - name: Rust unit tests
         run: |
-          cargo test --lib
-          cargo test --manifest-path tools/history-import/Cargo.toml
-          cargo test --manifest-path transcoder/Cargo.toml
+          cargo test --lib --locked
+          cargo test --manifest-path tools/history-import/Cargo.toml --locked
+          cargo test --manifest-path transcoder/Cargo.toml --locked
       - name: Cache Worker build tools
         id: worker-tools
         uses: actions/cache@v4
@@ -85,5 +83,5 @@ jobs:
             echo 'Configure both GitHub Actions Cloudflare secrets before deployment' >&2
             exit 1
           fi
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npx wrangler deploy

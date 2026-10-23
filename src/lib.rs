@@ -37,10 +37,14 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             return Response::error("Payload Too Large", 413);
         }
     }
-    let bytes = req.bytes().await?;
-    if bytes.len() > MAX_UPDATE_BYTES {
-        return Response::error("Payload Too Large", 413);
+    if req.inner().body().is_none() {
+        return Response::error("Bad JSON", 400);
     }
+    let bytes = match body::read_limited(req.stream()?, MAX_UPDATE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(body::ReadError::TooLarge) => return Response::error("Payload Too Large", 413),
+        Err(body::ReadError::Stream(error)) => return Err(error),
+    };
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => return Response::error("Bad JSON", 400),

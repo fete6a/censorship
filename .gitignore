@@ -5,6 +5,5 @@ target/
 /.dev.vars
 /.env
 *.log
-Cargo.lock
 __pycache__/
 *.py[cod]

@@ -1,3 +1,51 @@
+use futures_util::{Stream, StreamExt};
+use worker::{Error, Response, ResponseBody, Result};
+
+#[derive(Debug)]
+pub enum ReadError {
+    TooLarge,
+    Stream(Error),
+}
+
+impl From<ReadError> for Error {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::TooLarge => Error::RustError("Body exceeds size limit".into()),
+            ReadError::Stream(error) => error,
+        }
+    }
+}
+
+/// Stop accumulating as soon as the limit is crossed, even without Content-Length.
+pub async fn read_limited<S>(mut stream: S, limit: usize) -> std::result::Result<Vec<u8>, ReadError>
+where
+    S: Stream<Item = Result<Vec<u8>>> + Unpin,
+{
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReadError::Stream)?;
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(ReadError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub async fn response_bytes(response: &mut Response, limit: usize) -> Result<Vec<u8>> {
+    if let Some(length) = response.headers().get("Content-Length")? {
+        if length.parse::<usize>().map(|n| n > limit).unwrap_or(true) {
+            return Err(ReadError::TooLarge.into());
+        }
+    }
+    match response.body() {
+        ResponseBody::Empty => Ok(Vec::new()),
+        ResponseBody::Body(bytes) if bytes.len() <= limit => Ok(bytes.clone()),
+        ResponseBody::Body(_) => Err(ReadError::TooLarge.into()),
+        ResponseBody::Stream(_) => Ok(read_limited(response.stream()?, limit).await?),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
