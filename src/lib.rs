@@ -5,7 +5,7 @@ mod tg;
 mod util;
 
 use serde_json::Value;
-use worker::{console_error, console_log, Context, Env, MessageBatch, MessageExt, Method, Request, Response, Result, ScheduledEvent};
+use worker::{console_error, console_log, Context, Env, MessageBatch, MessageExt, Method, Request, Response, Result, ScheduleContext, ScheduledEvent};
 use crate::util::{safe_equal, secret};
 
 const MAX_UPDATE_BYTES: usize = 1024 * 1024;
@@ -68,7 +68,7 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
 }
 
 #[worker::event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: Context) -> Result<()> {
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
     if let Err(error) = moderation::process_pending_tick(&env).await {
         console_error!("pending_ban_tick_failed: {}",error);
         return Err(error);
