@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,15 +28,38 @@ jobs:
       - name: Python and SQLite tests
         run: python3 -m unittest discover -s tests -v
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
+      - name: Resolve dependency lockfiles
+        run: |
+          cargo generate-lockfile
+          cargo generate-lockfile --manifest-path tools/history-import/Cargo.toml
+          cargo generate-lockfile --manifest-path transcoder/Cargo.toml
+      - name: Save dependency lockfiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-lockfiles
+          path: |
+            Cargo.lock
+            tools/history-import/Cargo.lock
+            transcoder/Cargo.lock
       - name: Rust unit tests
         run: |
           cargo test --lib
           cargo test --manifest-path tools/history-import/Cargo.toml
           cargo test --manifest-path transcoder/Cargo.toml
+      - name: Cache Worker build tools
+        id: worker-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/bin/worker-codegen
+            ~/.cache/worker-build
+          key: ${{ runner.os }}-${{ runner.arch }}-worker-build-0.8.7-rust-1.99.1
       - name: Install worker-build
+        if: steps.worker-tools.outputs.cache-hit != 'true'
         run: cargo install worker-build --version 0.8.7 --locked
       - name: Build optimized Worker with fat LTO
         run: worker-build --release
