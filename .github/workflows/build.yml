@@ -31,8 +31,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
-      - name: Resolve npm deployment lockfile
-        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Save dependency lockfiles
         uses: actions/upload-artifact@v4
         with:
