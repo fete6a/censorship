@@ -129,7 +129,7 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
         "audio": input_media.audio,
         "videos": input_media.videos
     });
-    let raw: Value = env.ai("AI")?.run("@cf/cloudflare/clef-omni", &payload).await?;
+    let raw = crate::inference::run(env, "@cf/cloudflare/clef-omni", &payload).await?;
     parse_decision(raw)
 }
 
@@ -255,7 +255,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
                         store::set_strike_action(env, chat_id, msg_id, "muted_pending").await?;
                         let timer = json!({"kind":"ban_check","chat_id":chat_id,
                             "user_id":user_id,"message_id":msg_id});
-                        if let Err(error) = env.queue("BAN_DELAY_QUEUE")?.send(timer).await {
+                        if let Err(error) = crate::queueing::send(env, "BAN_DELAY_QUEUE", &timer).await {
                             console_error!("ban_timer_enqueue_failed: {}",error);
                         }
                         notice = format!("用户 {user_id} 因 {category} 已禁言 60 秒（近 7 天 {count} 次违规）。如管理员未取消，将在到期后封禁。取消命令：/cancel {user_id}");
@@ -298,7 +298,7 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
             return None;
         }
     }
-    if !matches!(cmd, "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+    if !matches!(cmd, "/start" | "/help" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
         return None;
     }
     Some((cmd, words.collect()))
@@ -311,8 +311,20 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
     let Some(actor) = tg::author(msg) else { return Ok(true); };
     let private = field_str(&msg["chat"], "type") == "private";
+    if matches!(cmd, "/start" | "/help") {
+        tg::send(env,origin_chat_id,concat!(
+            "Commands for group administrators (private chat):\n",
+            "/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
+            "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
+            "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
+            "Use a negative GROUP_ID, for example -1001234567890. ",
+            "You must be an administrator of that specific group. ",
+            "Inside a group, omit GROUP_ID; commands apply only to that group and stay silent."
+        )).await?;
+        return Ok(true);
+    }
     let (chat_id,args): (i64, Vec<&str>) = if private {
-        let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()) else {
+        let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
             tg::send(env,origin_chat_id,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
             return Ok(true);
         };
@@ -320,8 +332,9 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     } else {
         (origin_chat_id,words)
     };
-    if !store::can_review(env,chat_id).await? {return Ok(true);}
+    // Authorize the actor against the exact target group before reading its data.
     if !tg::user_is_admin(env,chat_id,actor).await? {return Ok(true);}
+    if !store::can_review(env,chat_id).await? {return Ok(true);}
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/cancel" => {

@@ -15,7 +15,7 @@
     "ENABLE_BAN": "true",
     "IMMEDIATE_BAN": "false",
     "ARCHIVE_DAYS": "0",
-    "BOT_USERNAME": "",
+    "BOT_USERNAME": "rationality_censorship_bot",
     "ADMIN_DM_CHAT_ID": ""
   },
   "d1_databases": [

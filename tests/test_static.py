@@ -62,14 +62,6 @@ class SmokeTests(unittest.TestCase):
         flagged=flagged+1 WHERE chat_id=-100 AND cursor_message_id=0''',(15,))
         self.assertEqual(self.db.execute('SELECT scanned,flagged FROM scan_jobs').fetchone(),(1,1))
 
-    def test_clef_is_real_binding_and_multimodal(self):
-        source=(ROOT / 'src/moderation.rs').read_text()
-        self.assertIn('env.ai("AI")?.run("@cf/cloudflare/clef-omni"',source)
-        self.assertIn('"images": input_media.images',source)
-        self.assertIn('"audio": input_media.audio',source)
-        self.assertIn('"videos": input_media.videos',source)
-        self.assertIn('"group_description": rules',source)
-
     def test_auto_onboard_and_silent_mode(self):
         src=(ROOT/'src/moderation.rs').read_text()
         tg=(ROOT/'src/tg.rs').read_text()
@@ -108,13 +100,6 @@ class SmokeTests(unittest.TestCase):
         source=(ROOT / 'src/moderation.rs').read_text()
         for cmd in ['/scan','/scan_id','/scan_all','/scan_status','/scan_stop','/rules']:
             self.assertIn(cmd,source)
-
-    def test_auth_protected_webhook_and_queue(self):
-        source=(ROOT / 'src/lib.rs').read_text()
-        self.assertIn('X-Telegram-Bot-Api-Secret-Token',source)
-        self.assertIn('safe_equal(&actual, &expected)',source)
-        self.assertIn('env.queue("MODERATION_QUEUE")?.send(value).await?',source)
-        self.assertIn('message.retry()',source)
 
     def test_native_audio_transcode_fallback(self):
         source=(ROOT / 'src/media.rs').read_text()

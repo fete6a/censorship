@@ -27,6 +27,8 @@
 
 ## 管理员命令（私聊优先）
 
+私聊 `/start` 或 `/help` 查看命令。每次管理操作均通过 Telegram `getChatMember` 检查操作者是否为**目标群组**的管理员，再读取该群的数据；A 群管理员不会因此获得 B 群权限。私聊必须指定负数群组 ID，群内命令只作用于当前群。
+
 | 群内命令（静默） | 私聊命令 | 功能 |
 | --- | --- | --- |
 | `/rules` | `/rules -100GROUP_ID` | 读取群规则 |
@@ -43,6 +45,8 @@ Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任�
 ## GitHub Actions 构建
 
 推送到 `main` 会自动触发 `.github/workflows/build.yml`：下载 Rust stable 和 `wasm32-unknown-unknown` target、安装 `worker-build`、运行 SQLite/静态测试、使用 `Cargo.toml` 的 `lto="fat"` 构建 Wasm，并上传构建产物 Artifacts。无需在 GitHub 保存 BOT_TOKEN。
+
+不提交依赖锁文件或固定补丁版本；每次构建按清单中的兼容版本范围解析依赖，`cargo install worker-build` 检查最新版本。CI 还会用 Node 24 执行实际构建的 Wasm，覆盖 Queue JSON 载荷、Webhook 鉴权及跨群管理权限。
 
 构建 LTO 配置：
 

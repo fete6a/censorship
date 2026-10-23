@@ -28,23 +28,14 @@ jobs:
       - name: Python and SQLite tests
         run: python3 -m unittest discover -s tests -v
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.1
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - name: Save dependency lockfiles
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-lockfiles
-          path: |
-            Cargo.lock
-            tools/history-import/Cargo.lock
-            transcoder/Cargo.lock
-            package-lock.json
       - name: Rust unit tests
         run: |
-          cargo test --lib --locked
-          cargo test --manifest-path tools/history-import/Cargo.toml --locked
-          cargo test --manifest-path transcoder/Cargo.toml --locked
+          cargo test --lib
+          cargo test --manifest-path tools/history-import/Cargo.toml
+          cargo test --manifest-path transcoder/Cargo.toml
       - name: Cache Worker build tools
         id: worker-tools
         uses: actions/cache@v4
@@ -52,13 +43,20 @@ jobs:
           path: |
             ~/.cargo/bin/worker-build
             ~/.cargo/bin/worker-codegen
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cache/worker-build
-          key: ${{ runner.os }}-${{ runner.arch }}-worker-build-0.8.7-rust-1.99.1
+          key: ${{ runner.os }}-${{ runner.arch }}-worker-tools-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-worker-tools-
       - name: Install worker-build
-        if: steps.worker-tools.outputs.cache-hit != 'true'
-        run: cargo install worker-build --version 0.8.7 --locked
+        run: cargo install worker-build
       - name: Build optimized Worker with fat LTO
         run: worker-build --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Built Worker queue and group authorization regression tests
+        run: node --experimental-vm-modules tests/worker_runtime.mjs
       - name: Assert build output
         run: |
           test -s build/index.js
@@ -81,5 +79,5 @@ jobs:
             echo 'Configure both GitHub Actions Cloudflare secrets before deployment' >&2
             exit 1
           fi
-          npm ci --no-audit --no-fund
+          npm install --package-lock=false --no-audit --no-fund
           npx wrangler deploy

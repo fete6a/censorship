@@ -1,8 +1,8 @@
-FROM rust:1.99.1-bookworm AS builder
+FROM rust:bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
-RUN cargo build --release --locked
+RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

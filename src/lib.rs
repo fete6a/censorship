@@ -1,6 +1,8 @@
 mod body;
+mod inference;
 mod media;
 mod moderation;
+mod queueing;
 mod store;
 mod tg;
 mod util;
@@ -54,7 +56,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     }
     // The Queue decouples Telegram webhook delivery from network-bound AI inference.
     // Enqueue failure deliberately returns non-2xx, so Telegram can retry the update.
-    env.queue("MODERATION_QUEUE")?.send(value).await?;
+    queueing::send(&env, "MODERATION_QUEUE", &value).await?;
     Response::ok("Queued")
 }
 

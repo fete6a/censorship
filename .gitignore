@@ -1,4 +1,6 @@
 target/
+Cargo.lock
+package-lock.json
 /build
 /node_modules
 /.wrangler
