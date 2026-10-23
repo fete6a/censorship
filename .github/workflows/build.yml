@@ -27,6 +27,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Rust unit tests
+        run: |
+          cargo test --lib
+          cargo test --manifest-path tools/history-import/Cargo.toml
+          cargo test --manifest-path transcoder/Cargo.toml
       - name: Install worker-build
         run: cargo install worker-build --version 0.8.7 --locked
       - name: Build optimized Worker with fat LTO

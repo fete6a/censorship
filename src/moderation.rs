@@ -621,6 +621,50 @@ pub async fn process_scan_tick(env: &Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn model_response() -> Value {
+        json!({"answers":{
+            "action":{"type":"choice","choice":"remove","confidence":0.99,
+                "probabilities":{"remove":0.99}},
+            "category":{"type":"choice","choice":"spam","confidence":0.9,
+                "probabilities":{"spam":0.9}},
+            "severity":{"type":"choice","choice":"major","confidence":0.9,
+                "probabilities":{"critical":0.01}}
+        }})
+    }
+    #[test]
+    fn rejects_out_of_range_model_scores() {
+        for (question, key) in [("action", "confidence"), ("category", "confidence"),
+            ("severity", "confidence")] {
+            for score in [-0.01, 1.01] {
+                let mut raw = model_response();
+                raw["answers"][question][key] = json!(score);
+                assert!(parse_decision(raw).is_err(), "accepted {question} {score}");
+            }
+        }
+        for (question, key) in [("action", "remove"), ("severity", "critical")] {
+            for score in [-0.01, 1.01] {
+                let mut raw = model_response();
+                raw["answers"][question]["probabilities"][key] = json!(score);
+                assert!(parse_decision(raw).is_err(), "accepted {question} probability {score}");
+            }
+        }
+    }
+    #[test]
+    fn rejects_unknown_model_choices() {
+        for question in ["action", "category", "severity"] {
+            let mut raw = model_response();
+            raw["answers"][question]["choice"] = json!("unexpected");
+            assert!(parse_decision(raw).is_err(), "accepted unknown {question}");
+        }
+    }
+    #[test]
+    fn rejects_missing_model_scores() {
+        for question in ["action", "category", "severity"] {
+            let mut raw = model_response();
+            raw["answers"][question].as_object_mut().unwrap().remove("confidence");
+            assert!(parse_decision(raw).is_err(), "accepted missing {question} confidence");
+        }
+    }
     #[test]
     fn threshold_requires_high_confidence_and_category() {
         let mut d=Decision{action:"remove".into(),action_confidence:0.99,remove_probability:0.98,
