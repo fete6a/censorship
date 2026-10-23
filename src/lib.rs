@@ -68,19 +68,18 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
 }
 
 #[worker::event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if let Err(error) = moderation::process_pending_tick(&env).await {
         console_error!("pending_ban_tick_failed: {}",error);
-        return Err(error);
     }
     if let Err(error) = moderation::process_scan_tick(&env).await {
         console_error!("historical_scan_failed: {}", error);
-        return Err(error);
     }
     // Daily cleanup, keeping retention configurable.
     if crate::util::now().div_euclid(60).rem_euclid(1440) == 0 {
-        store::cleanup(&env).await?;
-        console_log!("cleaned_up_expired_records");
+        match store::cleanup(&env).await {
+            Ok(()) => console_log!("cleaned_up_expired_records"),
+            Err(error) => console_error!("cleanup_failed: {}", error),
+        }
     }
-    Ok(())
 }

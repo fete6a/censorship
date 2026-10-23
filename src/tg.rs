@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
-use crate::util::{fail, field_str, field_int, js_i64, secret};
+use crate::util::{fail, field_str, field_int, secret};
 
 pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     let token = secret(env, "BOT_TOKEN")?;
@@ -186,11 +186,6 @@ pub fn author(msg: &Value) -> Option<i64> {
         return None;
     }
     field_int(&msg["from"], "id")
-}
-
-pub fn is_target_chat_event(event:&Value, group_id:i64) -> bool {
-    field_int(&event["chat"],"id")==Some(group_id)
-        && matches!(field_str(&event["chat"],"type"),"group"|"supergroup")
 }
 
 pub fn is_eligible_group_message(msg: &Value) -> bool {

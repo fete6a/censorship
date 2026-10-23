@@ -1,4 +1,4 @@
-/target
+target/
 /build
 /node_modules
 /.wrangler
@@ -6,3 +6,5 @@
 /.env
 *.log
 Cargo.lock
+__pycache__/
+*.py[cod]

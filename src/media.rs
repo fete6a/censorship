@@ -1,6 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
-use wasm_bindgen::JsValue;
+use serde_json::Value;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
 use crate::tg;
 use crate::util::{config, fail, field_int, field_str, secret};
@@ -174,6 +173,7 @@ pub async fn for_message(env: &Env, msg: &Value) -> Result<ModelMedia> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn telegram_voice_defaults_to_ogg_needing_transcode() {
         let v = json!({"voice":{"file_id":"abc", "file_size":2000,"duration":25}});

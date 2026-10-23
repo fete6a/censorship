@@ -202,9 +202,7 @@ pub struct PendingBan {
     pub chat_id: i64,
     pub user_id: i64,
     pub message_id: i64,
-    pub created_at: i64,
     pub due_at: i64,
-    pub status: String,
 }
 
 pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<PendingBan>> {
@@ -214,11 +212,11 @@ pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Op
     ).bind(&[js_i64(chat_id),js_i64(user_id)])?.first::<PendingBan>(None).await
 }
 
-pub async fn earliest_due(env: &Env) -> Result<Option<PendingBan>> {
+pub async fn due_pending(env: &Env) -> Result<Vec<PendingBan>> {
     env.d1("DB")?.prepare(
         "SELECT chat_id,user_id,message_id,created_at,due_at,status FROM pending_bans \
-         WHERE status='pending' AND due_at<=? ORDER BY due_at LIMIT 1"
-    ).bind(&[js_i64(now())])?.first::<PendingBan>(None).await
+         WHERE status='pending' AND due_at<=? ORDER BY due_at,chat_id,user_id LIMIT 8"
+    ).bind(&[js_i64(now())])?.all().await?.results::<PendingBan>()
 }
 
 pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64) -> Result<()> {
@@ -287,7 +285,6 @@ pub async fn expire_stale_processing(env: &Env) -> Result<()> {
 
 #[derive(Debug, Deserialize)]
 pub struct ManagedChat {
-    pub chat_id: i64,
     pub status: String,
     pub chat_type: String,
 }
