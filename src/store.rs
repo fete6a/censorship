@@ -252,9 +252,9 @@ pub async fn cancel_pending_automatically(env: &Env, chat_id: i64, user_id: i64,
 pub async fn claim_due(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<Option<PendingBan>> {
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status='processing' WHERE chat_id=? AND user_id=? AND message_id=? \
-         AND status='pending' AND due_at<=? \
+         AND status='pending' AND due_at BETWEEN unixepoch()-600 AND unixepoch() \
          RETURNING chat_id,user_id,message_id,created_at,due_at,status"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now())])?
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
       .first::<PendingBan>(None).await
 }
 
