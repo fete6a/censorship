@@ -1,0 +1,8 @@
+/target
+/build
+/node_modules
+/.wrangler
+/.dev.vars
+/.env
+*.log
+Cargo.lock

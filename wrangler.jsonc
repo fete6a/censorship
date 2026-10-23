@@ -1,0 +1,70 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "telegram-clef-omni-moderator",
+  "main": "build/index.js",
+  "compatibility_date": "2026-10-23",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "build": {
+    "command": "worker-build --release"
+  },
+  "vars": {
+    "DRY_RUN": "true",
+    "ENABLE_BAN": "true",
+    "IMMEDIATE_BAN": "false",
+    "ARCHIVE_DAYS": "0",
+    "BOT_USERNAME": "",
+    "ADMIN_DM_CHAT_ID": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "telegram-clef-moderation",
+      "database_id": "REPLACE_WITH_D1_UUID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "MODERATION_QUEUE",
+        "queue": "telegram-clef-moderation-events"
+      },
+      {
+        "binding": "BAN_DELAY_QUEUE",
+        "queue": "telegram-clef-ban-timers",
+        "delivery_delay": 60
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "telegram-clef-moderation-events",
+        "max_batch_size": 4,
+        "max_batch_timeout": 2,
+        "max_retries": 5,
+        "dead_letter_queue": "telegram-clef-moderation-dlq"
+      },
+      {
+        "queue": "telegram-clef-ban-timers",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "telegram-clef-moderation-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
