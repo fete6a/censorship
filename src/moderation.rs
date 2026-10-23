@@ -623,13 +623,13 @@ mod tests {
     use super::*;
     #[test]
     fn threshold_requires_high_confidence_and_category() {
-        let mut d=Decision{action:"remove".into(),action_confidence:.99,remove_probability:.98,
-            category:"fraud".into(),category_confidence:.95,severity:"critical".into(),critical_probability:.99};
+        let mut d=Decision{action:"remove".into(),action_confidence:0.99,remove_probability:0.98,
+            category:"fraud".into(),category_confidence:0.95,severity:"critical".into(),critical_probability:0.99};
         assert!(d.clear_violation());
         d.category="none".into();
         assert!(!d.clear_violation());
         d.category="fraud".into();
-        d.remove_probability=.50;
+        d.remove_probability=0.50;
         assert!(!d.clear_violation());
     }
     #[test]
