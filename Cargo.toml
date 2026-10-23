@@ -18,5 +18,6 @@ base64 = "0.22"
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-strip = true
+# Preserve target_features for wasm-bindgen's externref transform.
+strip = "debuginfo"
 panic = "abort"

@@ -51,7 +51,7 @@ Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任�
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-strip = true
+strip = "debuginfo"
 panic = "abort"
 ```
 

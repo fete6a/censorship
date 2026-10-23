@@ -3,6 +3,7 @@ name: Build Rust/Wasm LTO
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       deploy:
@@ -12,7 +13,7 @@ on:
         required: false
 
 permissions:
-  contents: write  # One-time extraction to commit the source files, no secrets in repo
+  contents: read
 
 jobs:
   build:
@@ -20,20 +21,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Restore source from initial seed
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -f Cargo.toml ]]; then
-            test -s source.bundle.b64
-            base64 -d source.bundle.b64 | gzip -d | tar -x
-            test -f Cargo.toml
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add Cargo.toml src wrangler.jsonc migrations tests tools transcoder README_CN.md README.md package.json .gitignore .env.example build-lto.sh
-            git commit -m 'Add Rust Telegram moderator source (silent multi-group)'
-            git push origin HEAD:main
-          fi
       - name: Python and SQLite tests
         run: python3 -m unittest discover -s tests -v
       - name: Install Rust toolchain
@@ -41,7 +28,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Install worker-build
-        run: cargo install worker-build --locked
+        run: cargo install worker-build --version 0.8.7 --locked
       - name: Build optimized Worker with fat LTO
         run: worker-build --release
       - name: Assert build output
