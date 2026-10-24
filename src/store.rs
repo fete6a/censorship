@@ -249,7 +249,7 @@ pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i
          message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
          status='pending',next_attempt_at=0,attempt_count=0, \
          canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
-         WHERE pending_bans.status IN ('banned','canceled','failed')
+         WHERE pending_bans.status IN ('banned','canceled','failed')"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),js_i64(due_at)])?.run().await?;
     Ok(())
 }
