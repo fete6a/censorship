@@ -61,12 +61,13 @@ class NotificationDocumentationTests(unittest.TestCase):
 
     def test_private_log_recipients_and_log_switch_are_documented(self):
         delivery = self.telegram.split(
-            "pub async fn send_to_review_or_chat(", 1
-        )[1].split("pub async fn delete(", 1)[0]
+            "async fn send_admin_markdown(", 1
+        )[1].split("pub async fn send_to_review_or_chat(", 1)[0]
         self.assertIn("group_logs(env,chat_id)", delivery)
         self.assertIn("getChatAdministrators", delivery)
         self.assertIn('member["user"]["is_bot"]==true', delivery)
-        self.assertIn("send(env,user_id,", delivery)
+        self.assertIn("post_markdown(env,user_id,", delivery)
+        self.assertIn("send_admin_markdown(env,chat_id,", self.telegram)
         self.assertNotIn("ADMIN_DM_CHAT_ID",
                          self.store + self.telegram + self.moderation)
         for doc in (self.en, self.cn):
@@ -81,23 +82,42 @@ class NotificationDocumentationTests(unittest.TestCase):
     def test_group_notices_remain_independent_of_private_logs(self):
         sender = self.telegram.split(
             "pub async fn send_group_notice(", 1
-        )[1].split("pub async fn send_to_review_or_chat(", 1)[0]
-        self.assertIn('api(env,"sendMessage"', sender)
+        )[1].split("async fn send_admin_markdown(", 1)[0]
+        self.assertIn("post_markdown(env,chat_id,", sender)
+        self.assertIn("send_group_action_notice(", sender)
         self.assertNotIn("group_logs", sender)
+        self.assertIn('"parse_mode":"MarkdownV2"', self.telegram)
         review = self.moderation.split("pub async fn review(", 1)[1].split(
             "fn command_parts(", 1
         )[0]
         self.assertIn("tg::delete(env, chat_id, msg_id).await?;", review)
-        self.assertIn("tg::send_group_notice(env,chat_id,&notice).await;", review)
+        self.assertIn("tg::send_group_action_notice(env,chat_id,msg_id,user,", review)
         self.assertIn("tg::ban(env,chat_id,user_id).await", self.moderation)
-        self.assertGreaterEqual(
-            self.moderation.count("tg::send_group_notice(env,chat_id,&notice).await;"), 2
-        )
+        self.assertIn("tg::send_group_action_notice(env,chat_id,message_id,Some(user_id),", self.moderation)
         self.assertIn("if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice", self.moderation)
         self.assertIn("does not disable group action notices", self.en)
         self.assertIn("不关闭群内处罚通知", self.cn)
         self.assertIn("`/threshold`", self.en)
         self.assertIn("`/threshold`", self.cn)
+
+    def test_binary_model_and_queue_batch_scope(self):
+        import json
+        config=json.loads((ROOT / "wrangler.jsonc").read_text())
+        moderation=next(q for q in config["queues"]["consumers"]
+                        if q["queue"]=="telegram-clef-moderation-events")
+        self.assertEqual(moderation["max_batch_size"],20)
+        self.assertEqual(moderation["max_batch_timeout"],10)
+        self.assertIn('"violation": {',self.moderation)
+        self.assertIn('"type": "noul"',self.moderation)
+        questions=self.moderation.split("fn moderation_questions() -> Value",1)[1].split(
+            "async fn classify(",1
+        )[0]
+        self.assertNotIn('"action": {',questions)
+        self.assertIn('formatting::ReviewLine', (ROOT/"src/lib.rs").read_text())
+        self.assertIn("last_review_log", self.store)
+        self.assertNotIn("send_to_review_or_chat(env, chat_id, &format!(",self.store)
+        self.assertIn("10 秒",self.cn)
+        self.assertIn("10 seconds",self.en)
 
     def test_permissions_privacy_and_security_claims(self):
         for doc in (self.en, self.cn):
