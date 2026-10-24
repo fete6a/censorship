@@ -403,19 +403,19 @@ pub async fn conclude_pending(env: &Env, chat_id: i64, user_id: i64, message_id:
 /// of pending. The second UPDATE finalizes fenced processing rows.
 pub async fn retry_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<()> {
     env.d1("DB")?.prepare(
-        "UPDATE pending_bans SET status='pending' \\
-         WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing' \\
-         AND NOT EXISTS (SELECT 1 FROM warning_adjustments a JOIN violations v \\
-           ON v.chat_id=a.chat_id AND v.user_id=a.user_id \\
-           WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \\
+        "UPDATE pending_bans SET status='pending' \
+         WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing' \
+         AND NOT EXISTS (SELECT 1 FROM warning_adjustments a JOIN violations v \
+           ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+           WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
              AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid)"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
     env.d1("DB")?.prepare(
-        "UPDATE pending_bans SET status='canceled', cancellation_reason='warning_count_adjusted', \\
-         resolved_at=unixepoch() WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing' \\
-         AND EXISTS (SELECT 1 FROM warning_adjustments a JOIN violations v \\
-           ON v.chat_id=a.chat_id AND v.user_id=a.user_id \\
-           WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \\
+        "UPDATE pending_bans SET status='canceled', cancellation_reason='warning_count_adjusted', \
+         resolved_at=unixepoch() WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing' \
+         AND EXISTS (SELECT 1 FROM warning_adjustments a JOIN violations v \
+           ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+           WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
              AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid)"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
     Ok(())
