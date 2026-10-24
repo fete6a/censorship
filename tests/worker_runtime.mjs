@@ -306,10 +306,10 @@ await test('20 event window groups private reviews by chat without leaking to ot
  const a=messages.find(x=>x.args.chat_id===11)?.args.text;
  const b=messages.find(x=>x.args.chat_id===21)?.args.text;
  assert.match(a,/审核摘要/);assert.match(a,/14 条/);
- assert.match(a,/t\\.me\/c\/100\/800/);
- assert.doesNotMatch(a,/t\\.me\/c\/200\/900/);
- assert.match(b,/4 条/);assert.match(b,/t\\.me\/c\/200\/900/);
- assert.doesNotMatch(b,/t\\.me\/c\/100\/800/);
+ assert.ok(a.includes('t.me/c/100/800'));
+ assert.ok(!a.includes('t.me/c/200/900'));
+ assert.match(b,/4 条/);assert.ok(b.includes('t.me/c/200/900'));
+ assert.ok(!b.includes('t.me/c/100/800'));
  assert.ok(messages.every(x=>x.args.parse_mode==='MarkdownV2'));
  assert.ok(messages.every(x=>x.args.link_preview_options?.is_disabled===true));
 });
@@ -342,9 +342,9 @@ await test('MarkdownV2 action notice uses numeric Telegram links without exposin
  await f.consume(message(groupA,889));
  const notice=f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA)?.args;
  assert.equal(notice?.parse_mode,'MarkdownV2');
- assert.match(notice.text,/tg:\\/\\/user\\?id=22/);
+ assert.ok(notice.text.includes('tg://user?id=22'));
  assert.match(notice.text,/已删除/);
- assert.doesNotMatch(notice.text,/t\\.me\\/c\\/100\\/889/,'deleted content is not linked');
+ assert.ok(!notice.text.includes('t.me/c/100/889'),'deleted content is not linked');
 });
 
 await test('review logs default on and go only to the reviewed group human administrators', async () => {
