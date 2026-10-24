@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -53,6 +53,10 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
         bind(...args) { values = args; return this; },
         async first() {
           statements.push({ sql, values, operation: 'read' });
+          if (flipAfterClaim && sql.includes('pending_bans')) {
+            if(sql.startsWith('UPDATE')) settings.set(groupA,{dry_run:1,logs_enabled:0});
+            return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
+          }
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
           if (sql.includes('violations') && sql.includes('COUNT')) return {count:0};
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
@@ -93,7 +97,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     ] });
     if (method === 'getChatMember' && args.user_id===22 && pauseMember) await pauseMember();
     if (method === 'getChatMember') return Response.json({ ok: true, result: {
-      user: { id: args.user_id }, status: args.chat_id === groupA ? 'administrator' : 'member',
+      user: { id: args.user_id }, status: args.chat_id === groupA && !(flipAfterClaim && args.user_id===22) ? 'administrator' : 'member',
     } });
     if (method === 'deleteMessage') return Response.json({ok:true,result:true});
     if (method === 'sendMessage' && dmFail) return Response.json({ok:false},{status:403});
@@ -277,4 +281,12 @@ await test('turning dry-run on stops a review waiting for a Telegram lookup',asy
  await f.consume({...command(`/dry_run ${groupA} on`),update_id:511});
  release();await review;
  assert.equal(f.telegram.some(c=>['deleteMessage','restrictChatMember','banChatMember'].includes(c.method)),false);
+});
+
+await test('dry-run enabled after claim cancels processing case without banning or retrying',async()=>{
+ const f=fixture({flipAfterClaim:true});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume({kind:'ban_check',chat_id:groupA,user_id:22,message_id:42});
+ const done=f.statements.find(s=>s.sql.includes("status='processing'")&&s.operation==='write');
+ assert.equal(done?.values[0],'canceled');
+ assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
 });

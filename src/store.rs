@@ -262,7 +262,7 @@ pub async fn claim_due(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -
 }
 
 pub async fn conclude_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, status: &str) -> Result<()> {
-    if !matches!(status, "banned" | "failed") { return Err(fail("Invalid pending case result")); }
+    if !matches!(status, "banned" | "failed" | "canceled") { return Err(fail("Invalid pending case result")); }
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status=?,resolved_at=? WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_str(status),js_i64(now()),js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
