@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
-use crate::util::{fail, field_str, field_int, js_i64, secret};
+use crate::util::{fail, field_str, field_int, secret};
+use crate::body::response_bytes;
 
 pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     let token = secret(env, "BOT_TOKEN")?;
@@ -14,14 +15,18 @@ pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     init.with_headers(headers);
     init.with_body(Some(JsValue::from_str(&payload)));
     let request = Request::new_with_init(&url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
+    let mut response = Fetch::Request(request).send().await
+        .map_err(|_| fail(&format!("Telegram method {method} network request failed")))?;
     let status = response.status_code();
-    let data: Value = response.json().await?;
+    let bytes = response_bytes(&mut response, 1024 * 1024).await
+        .map_err(|_| fail(&format!("Telegram method {method} response could not be read")))?;
+    let mut data: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| fail(&format!("Telegram method {method} returned invalid JSON")))?;
     if status != 200 || data["ok"] != true {
         // Never log upstream URLs because Telegram's token appears in the path.
         return Err(fail(&format!("Telegram method {method} failed (HTTP {status})")));
     }
-    Ok(data.get("result").cloned().unwrap_or(Value::Null))
+    Ok(data["result"].take())
 }
 
 pub async fn group_rules(env: &Env, chat_id: i64) -> Result<String> {
@@ -36,22 +41,57 @@ pub async fn user_is_admin(env: &Env, chat_id: i64, user_id: i64) -> Result<bool
     Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
 }
 
-/// Silent mode: Telegram supergroup and group IDs are negative. Never attempt
-/// sendMessage to a group. For private commands the target is the human user's
-/// positive Telegram ID (only works after they started the bot themselves).
+/// Only for command authorization: inaccessible/nonexistent target groups
+/// cause terminal Telegram HTTP 400/403 errors that must not fill the DLQ.
+/// Leave moderation lookups strict and keep 429/5xx/network errors retryable.
+pub async fn user_is_admin_for_command(env: &Env, chat_id: i64, user_id: i64) -> Result<bool> {
+    let member = match api(env, "getChatMember", json!({"chat_id": chat_id, "user_id": user_id})).await {
+        Ok(member) => member,
+        Err(error) => {
+            let detail = error.to_string();
+            if detail.contains("Telegram method getChatMember failed (HTTP 400)") ||
+               detail.contains("Telegram method getChatMember failed (HTTP 403)") {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    };
+    Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
+}
+
+/// Private command replies and admin logs only.
 pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
     if chat_id <= 0 { return Ok(()); }
     api(env, "sendMessage", json!({"chat_id": chat_id, "text": text})).await?;
     Ok(())
 }
 
-/// Optional audit alerts ONLY to an explicitly configured private user chat.
-/// No fallback to the moderated group, even if a configuration is invalid.
-pub async fn send_to_review_or_chat(env: &Env, _chat_id: i64, text: &str) -> Result<()> {
-    let target = crate::util::config(env, "ADMIN_DM_CHAT_ID").parse::<i64>().unwrap_or(0);
-    if target <= 0 { return Ok(()); }
-    // Notifications are optional; Telegram forbids cold-start DMs to users.
-    let _ = send(env, target, text).await;
+/// Public action notices must remain in the group where the action occurred.
+/// Independent of the private admin logs setting; delivery is best effort.
+pub async fn send_group_notice(env: &Env, chat_id: i64, text: &str) {
+    if chat_id>=0 {return;}
+    if api(env,"sendMessage",json!({"chat_id":chat_id,"text":text})).await.is_err() {
+        worker::console_error!("group_notice_delivery_failed");
+    }
+}
+
+/// Deliver only to current human administrators of this exact group. No global recipient.
+pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
+    if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
+    let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
+        Ok(value)=>value,
+        Err(_)=>{worker::console_error!("group_admin_logs_unavailable");return Ok(());}
+    };
+    if let Some(admins)=admins.as_array() {
+        for member in admins {
+            if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
+            if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
+                if send(env,user_id,&format!("Group {chat_id}\n{text}")).await.is_err() {
+                    worker::console_error!("group_admin_log_dm_failed");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -139,20 +179,13 @@ pub async fn download(env: &Env, file_id: &str, max_len: usize) -> Result<Vec<u8
     }
     let token = secret(env, "BOT_TOKEN")?;
     let url = format!("https://api.telegram.org/file/bot{token}/{path}");
-    let mut response = Fetch::Request(Request::new(&url, Method::Get)?).send().await?;
+    let mut response = Fetch::Request(Request::new(&url, Method::Get)?).send().await
+        .map_err(|_| fail("Telegram file download network request failed"))?;
     if response.status_code() != 200 {
         return Err(fail("Telegram file download failed"));
     }
-    if let Some(length) = response.headers().get("Content-Length")? {
-        if length.parse::<usize>().map(|x| x > max_len).unwrap_or(true) {
-            return Err(fail("Media content-length is over limit"));
-        }
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > max_len {
-        return Err(fail("Media downloaded beyond size limit"));
-    }
-    Ok(bytes)
+    response_bytes(&mut response, max_len).await
+        .map_err(|_| fail("Telegram file download failed or exceeded its size limit"))
 }
 
 pub fn normalize(msg: &Value) -> Value {
@@ -186,11 +219,6 @@ pub fn author(msg: &Value) -> Option<i64> {
         return None;
     }
     field_int(&msg["from"], "id")
-}
-
-pub fn is_target_chat_event(event:&Value, group_id:i64) -> bool {
-    field_int(&event["chat"],"id")==Some(group_id)
-        && matches!(field_str(&event["chat"],"type"),"group"|"supergroup")
 }
 
 pub fn is_eligible_group_message(msg: &Value) -> bool {

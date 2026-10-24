@@ -15,14 +15,13 @@
     "ENABLE_BAN": "true",
     "IMMEDIATE_BAN": "false",
     "ARCHIVE_DAYS": "0",
-    "BOT_USERNAME": "",
-    "ADMIN_DM_CHAT_ID": ""
+    "BOT_USERNAME": "rationality_censorship_bot"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "telegram-clef-moderation",
-      "database_id": "REPLACE_WITH_D1_UUID",
+      "database_id": "aca7a855-3657-4d2d-b1cf-7e7734ebda49",
       "migrations_dir": "migrations"
     }
   ],

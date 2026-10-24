@@ -1,21 +1,24 @@
-# Telegram Clef-omni 审核机器人（静默多群版）
+# Telegram Clef-omni 审核机器人（多群独立管理版）
 
 **状态：** Rust 源码 + GitHub Actions LTO 编译方案。部署前请先确认 GitHub Actions 的 `Build Rust/Wasm` 结果成功。默认 `DRY_RUN=true`，即审核并归档，不自动删除。
+
+**管理员私人审核日志默认开启。** 即使保持 dry-run，常规审核结果仍会尝试私聊发送给该群当前的人类管理员；实际删除与封禁完成后还会尝试在群内公告。机器人并非完全静默。
 
 ## 自动发现群组
 
 - **无需设置固定 `GROUP_CHAT_ID`**。Bot API 推送的 `my_chat_member` 会在机器人被加入、晋升、降级或移出群组时触发；程序把群组及权限记录到 D1 `managed_chats`。
 - 若机器人在 Webhook 配置前已加入某群，无法主动遍历过去加入的群。第一次收到该群的消息后，通过 `getMe + getChatMember` 尝试登记。
-- 机器人需要成为管理员才能接收全量群消息（不必关闭 Privacy Mode），并至少拥有 **删除消息** 权限。**限制成员** 权限只能在超级群组启用禁言与封禁，否则仅能删除审核识别的违规消息。
+- 机器人需要成为管理员才能接收全量群消息（不必关闭 Privacy Mode），并至少拥有 **删除消息**（`can_delete_messages`）权限。**限制成员**（`can_restrict_members`）权限只能在超级群组启用禁言与封禁，否则仅能删除审核识别的违规消息。**群内处罚通知及 `/threshold` 回复还需要机器人能向群内发送消息**；仅有删除/限制成员权限，不代表 Telegram 一定接受 `sendMessage`。
 - `getChat.description` 的文字就是处罚规则；群简介为空则不自动处罚。建议规则明确、简短并告诉用户。不同群组独立归档及处罚。
 - 删除机器人或移除权限会将该群停用，并取消未到期的待封禁任务。
 
-## 绝不向群组发送消息
+## 群内处罚通知与私聊日志
 
-- 全部 `sendMessage` 目标都必须是正数 Telegram 私聊 ID；程序对负数群组 ID 直接跳过通知。没有群内发言权限也能审核和删除。
-- 删除、警告、封禁的审计记录放到 Cloudflare D1 `violations`、`archived_messages` 和 `pending_bans`；不会给群成员发送公开警告信息。
-- 设置可选变量 `ADMIN_DM_CHAT_ID`（正数且管理员已私聊 `/start`）才会收到异常/处罚提醒；留空则不发送任何自动通知。
-- 管理员命令可以在群内发出（不会收到群内回复），**建议在机器人私聊执行命令**，例如：`/cancel -1001234567890 12345678`。机器人每次验证发送者是否为目标群管理员。
+- 完成删除后，在原群公布消息 ID、违规类别与警告；达到累计阈值时说明禁言 60 秒、待封禁及 `/cancel USER_ID` 取消方法。实际封禁成功后另发确认，不提前声称已封禁。
+- 群内处罚通知仅尝试发送到实际发生处罚的群，不转发被删消息原文。审计与 dry-run 不发送声称已处罚的公告；只有 Telegram 真正确认封禁后才发布封禁完成通知。群内发消息失败不会撤销或重复已完成处罚，通知不单独重试。
+- 管理员私聊审核日志默认开启，包含允许、待核实、审计和 dry-run 的审核状态以及部分处罚、扫描、取消状态。每次发送时通过 `getChatAdministrators` 重新查询**目标群当前的非机器人管理员**。管理员必须先主动私聊机器人（例如 `/start`），且未屏蔽机器人；Telegram 拒绝私聊或管理员查询失败时无法送达。运行错误一般记录在 Worker 控制台，不保证全部通过私聊推送。
+- `/logs off` **仅关闭该群主动发送的管理员私人审核日志**，不关闭群内处罚通知、公开 `/threshold` 回复、D1 归档、Worker 控制台日志或私聊命令回复；不影响其他群。仅通知发送失败不会撤销处罚或重试整个审核。
+- `/threshold` 查询或修改阈值时在群内公开回复，**即使已设置 `/logs off` 也会发送**；其他管理员命令通常不在群内回复，但处罚可能产生群公告。所有管理操作都检查发送者是否为目标群管理员。
 
 ## 审核及处罚
 
@@ -23,12 +26,17 @@
 - 判断标准以群简介为准，要求较高置信度。不在群简介禁止范围内的内容不得因此模型自带的“喜好”被处罚。
 - 清晰违规：先删除消息并在 D1 记录警告。7 天累计 3 次（默认）会触发禁言 60 秒（超级群组）。到期且管理员未取消则自动封禁。
 - 管理员始终不被自动封禁；其他管理员也可以在 Telegram UI 手动解除禁言，或通过 `/cancel` 取消待封禁处罚。
-- 必须设置 `DRY_RUN=false` 才启用真实删除和处罚。建议先运行真实流量审计，再开启。
+- 群管理员用 `/dry-run off` 为本群启用真实删除和处罚（未设置时沿用全局 `DRY_RUN`）。建议先运行真实流量审计，再开启。
 
 ## 管理员命令（私聊优先）
 
-| 群内命令（静默） | 私聊命令 | 功能 |
+私聊 `/start` 或 `/help` 查看命令。每次管理操作均通过 Telegram `getChatMember` 检查操作者是否为**目标群组**的管理员，再读取该群的数据；A 群管理员不会因此获得 B 群权限。私聊必须指定负数群组 ID，群内命令只作用于当前群。
+
+| 群内命令 | 私聊命令 | 功能 |
 | --- | --- | --- |
+| `/threshold 0.75` | `/threshold -100GROUP_ID 0.75` | 仅本群管理员设置删除阈值；省略数值查询，支持 `75%`；群内公开回复 |
+| `/dry-run off`（或 `/dry_run off`） | `/dry_run -100GROUP_ID off` | 为当前群启用实际处罚；`on` 恢复审计并取消本群待封禁任务；省略参数查询 |
+| `/logs off` | `/logs -100GROUP_ID off` | 只关闭当前群的管理员主动私聊日志；`on` 恢复；省略参数查询；不关闭群公告 |
 | `/rules` | `/rules -100GROUP_ID` | 读取群规则 |
 | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 取消待封禁，尝试恢复发言权限 |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
@@ -44,6 +52,8 @@ Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任�
 
 推送到 `main` 会自动触发 `.github/workflows/build.yml`：下载 Rust stable 和 `wasm32-unknown-unknown` target、安装 `worker-build`、运行 SQLite/静态测试、使用 `Cargo.toml` 的 `lto="fat"` 构建 Wasm，并上传构建产物 Artifacts。无需在 GitHub 保存 BOT_TOKEN。
 
+不提交依赖锁文件或固定补丁版本；每次构建按清单中的兼容版本范围解析依赖，`cargo install worker-build` 检查最新版本。CI 还会用 Node 24 执行实际构建的 Wasm，覆盖 Queue JSON 载荷、Webhook 鉴权及跨群管理权限。
+
 构建 LTO 配置：
 
 ```toml
@@ -51,11 +61,11 @@ Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任�
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-strip = true
+strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。
+GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。手动 GitHub Actions 部署先执行 `wrangler d1 migrations apply DB --remote`，成功后才执行 `wrangler deploy`。Cloudflare API Token 必须有 D1 迁移/写入权限；普通 PR/push 构建不修改生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -85,5 +95,13 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 - 消息文字、caption 和 Telegram 媒体 `file_id` 将保存在 D1；媒体字节在审核时临时下载给 Workers AI，并不长期保存。`ARCHIVE_DAYS=0` 表示不自动清理归档，请根据隐私需求修改。
 - Bot Token 是管理员凭据，**必须通过 BotFather 轮换用户曾在聊天中贴出的密钥**，不可上传到 GitHub。Webhook secret 另用随机字符串。
-- `ADMIN_DM_CHAT_ID` 只能填写私聊 ID，机器人不能主动给从未发起过聊天的用户发送 DM。
-- 本项目没有内置 Telegram UI，它通过 Telegram Bot API 和 Cloudflare Rust Workers 运行；请先做真实端到端误判、权限、取消期测试。
+- **通知与隐私：** 默认私聊审核日志会披露群组 ID、消息 ID、状态、分类、置信度等元数据；处罚公告会披露违规消息 ID、类别以及适用时的用户 ID 和处罚状态，但不会转发原文。`/logs off` 不会删除已发送日志、不影响 D1 归档与保留期、不关闭 Worker 控制台日志或群内公告。机器人被移出群、无群内发言能力、无法获取管理员列表，或管理员未主动私聊/已屏蔽机器人时，对应通知可能无法送达。
+- 本项目没有内置 Telegram UI，它通过 Telegram Bot API 和 Cloudflare Rust Workers 运行；请先做真实端到端误判、权限、取消期和通知送达测试。
+
+## 每群设置和管理员日志
+
+群内 `/dry-run off`（菜单别名 `/dry_run off`）仅为当前群开启实际处罚；`on` 恢复审计并取消该群待执行封禁。私聊使用 `/dry_run -100GROUP_ID off`。未设置时沿用全局 `DRY_RUN=true`；即使处于 dry-run，私人审核日志默认仍会发送尝试。各群独立设置。
+
+日志默认开启，涵盖常规审核状态（包括放行、审计、dry-run）及部分处罚/扫描/取消状态；不承诺每一种运行异常都私聊推送。机器人每次通过 `getChatAdministrators` 查询本群当前人类管理员，跳过机器人账号；对方必须先主动私聊机器人（例如 `/start`），且 Telegram 允许私聊送达。群内 `/logs off` 关闭该群私人审核日志，`/logs on` 恢复；私聊使用 `/logs -100GROUP_ID off`。发送失败不会撤销已完成的审核或处罚。**全局 `ADMIN_DM_CHAT_ID` 已不参与收件人选择，留空也不会关闭默认私人日志。** `/logs off` 也不会阻止群内删除警告、待封禁或成功封禁通知及群内 `/threshold` 回复。
+
+删除阈值默认 0.93（93%），可用 `/threshold 0.75` 或 `/threshold 75%` 设置 0–1 / 0%–100%。模型必须选择 remove；动作置信度至少为 min(80%, 本群阈值)，类别置信度仍须达到 75%，类别不能是 none。只影响之后的审核，不自动重审旧消息或改变已有待封禁任务。群内命令不可指定其他群，私聊必须指定目标群 ID 且验证该群管理员身份。

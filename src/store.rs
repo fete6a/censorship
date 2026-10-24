@@ -68,6 +68,9 @@ pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &st
         js_i64(chat_id), js_i64(message_id),
     ])?;
     stmt.run().await?;
+    let _ = tg::send_to_review_or_chat(env, chat_id, &format!(
+        "message={message_id} status={status} category={category} probability={probability:.3}"
+    )).await;
     Ok(())
 }
 
@@ -202,9 +205,7 @@ pub struct PendingBan {
     pub chat_id: i64,
     pub user_id: i64,
     pub message_id: i64,
-    pub created_at: i64,
     pub due_at: i64,
-    pub status: String,
 }
 
 pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<PendingBan>> {
@@ -214,11 +215,31 @@ pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Op
     ).bind(&[js_i64(chat_id),js_i64(user_id)])?.first::<PendingBan>(None).await
 }
 
-pub async fn earliest_due(env: &Env) -> Result<Option<PendingBan>> {
+/// Fetch at most eight per Cron tick; never-attempted timers run before retries.
+pub async fn due_pending(env: &Env) -> Result<Vec<PendingBan>> {
     env.d1("DB")?.prepare(
         "SELECT chat_id,user_id,message_id,created_at,due_at,status FROM pending_bans \
-         WHERE status='pending' AND due_at<=? ORDER BY due_at LIMIT 1"
-    ).bind(&[js_i64(now())])?.first::<PendingBan>(None).await
+         WHERE status='pending' AND due_at<=?1 AND next_attempt_at<=?1 \
+         ORDER BY next_attempt_at,due_at,chat_id,user_id LIMIT 8"
+    ).bind(&[js_i64(now())])?.all().await?.results::<PendingBan>()
+}
+
+/// Reserve a per-case retry slot *before* Telegram calls, including getChatMember.
+/// Keep status pending so admin /cancel can still win before atomic claim_due.
+/// Conditional D1 update also limits overlapping Cron/Queue attempts.
+/// Retry intervals are 60 seconds, then 120, capped at 240 seconds.
+pub async fn begin_pending_attempt(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<bool> {
+    let attempted = env.d1("DB")?.prepare(
+        "UPDATE pending_bans SET attempt_count=attempt_count+1, \
+         next_attempt_at=unixepoch() + CASE WHEN attempt_count=0 THEN 60 \
+         WHEN attempt_count=1 THEN 120 ELSE 240 END \
+         WHERE chat_id=? AND user_id=? AND message_id=? AND status='pending' \
+         AND due_at BETWEEN unixepoch()-600 AND unixepoch() \
+         AND next_attempt_at<=unixepoch() \
+         RETURNING chat_id,user_id,message_id,created_at,due_at,status"
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
+      .first::<PendingBan>(None).await?;
+    Ok(attempted.is_some())
 }
 
 pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64) -> Result<()> {
@@ -226,7 +247,8 @@ pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i
         "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
          VALUES(?,?,?,?,?,'pending') ON CONFLICT(chat_id,user_id) DO UPDATE SET \
          message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
-         status='pending',canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
+         status='pending',next_attempt_at=0,attempt_count=0, \
+         canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
          WHERE pending_bans.status IN ('banned','canceled','failed')"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),js_i64(due_at)])?.run().await?;
     Ok(())
@@ -254,14 +276,14 @@ pub async fn cancel_pending_automatically(env: &Env, chat_id: i64, user_id: i64,
 pub async fn claim_due(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<Option<PendingBan>> {
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status='processing' WHERE chat_id=? AND user_id=? AND message_id=? \
-         AND status='pending' AND due_at<=? \
+         AND status='pending' AND due_at BETWEEN unixepoch()-600 AND unixepoch() \
          RETURNING chat_id,user_id,message_id,created_at,due_at,status"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now())])?
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
       .first::<PendingBan>(None).await
 }
 
 pub async fn conclude_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, status: &str) -> Result<()> {
-    if !matches!(status, "banned" | "failed") { return Err(fail("Invalid pending case result")); }
+    if !matches!(status, "banned" | "failed" | "canceled") { return Err(fail("Invalid pending case result")); }
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status=?,resolved_at=? WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_str(status),js_i64(now()),js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
@@ -272,6 +294,17 @@ pub async fn retry_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i6
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status='pending' WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
+    Ok(())
+}
+
+/// Expire overdue pending rows even when backoff delays their next attempt.
+/// This preserves the original strict ten-minute expiry without batch starvation.
+pub async fn expire_overdue_pending(env: &Env) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE pending_bans SET status='canceled', \
+         cancellation_reason='timer_too_late',resolved_at=unixepoch() \
+         WHERE status='pending' AND due_at<unixepoch()-600"
+    ).run().await?;
     Ok(())
 }
 
@@ -287,7 +320,6 @@ pub async fn expire_stale_processing(env: &Env) -> Result<()> {
 
 #[derive(Debug, Deserialize)]
 pub struct ManagedChat {
-    pub chat_id: i64,
     pub status: String,
     pub chat_type: String,
 }
@@ -331,4 +363,48 @@ pub async fn can_review(env: &Env, chat_id: i64) -> Result<bool> {
 pub async fn can_auto_ban(env: &Env, chat_id: i64) -> Result<bool> {
     Ok(managed_chat(env,chat_id).await?.is_some_and(|c|
         c.status == "active" && c.chat_type == "supergroup"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GroupSettings {
+    pub dry_run: Option<i64>,
+    pub logs_enabled: i64,
+    pub remove_threshold: Option<f64>,
+}
+pub async fn group_settings(env: &Env, chat_id: i64) -> Result<Option<GroupSettings>> {
+    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled,remove_threshold FROM group_settings WHERE chat_id=?")
+        .bind(&[js_i64(chat_id)])?.first::<GroupSettings>(None).await
+}
+pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
+    Ok(group_settings(env,chat_id).await?.and_then(|s|s.dry_run)
+        .map(|value|value!=0).unwrap_or_else(||crate::util::flag(env,"DRY_RUN",true)))
+}
+pub async fn group_logs(env: &Env, chat_id: i64) -> Result<bool> {
+    Ok(group_settings(env,chat_id).await?.map(|s|s.logs_enabled!=0).unwrap_or(true))
+}
+pub async fn group_threshold(env: &Env, chat_id: i64) -> Result<f64> {
+    Ok(group_settings(env,chat_id).await?.and_then(|s|s.remove_threshold).unwrap_or(0.93))
+}
+pub async fn set_group_threshold(env: &Env, chat_id: i64, threshold: f64) -> Result<()> {
+    if chat_id>=0 || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(fail("Invalid group ID or threshold"));
+    }
+    env.d1("DB")?.prepare(
+        "INSERT INTO group_settings(chat_id,remove_threshold) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET remove_threshold=excluded.remove_threshold"
+    ).bind(&[js_i64(chat_id),JsValue::from_f64(threshold)])?.run().await?;
+    Ok(())
+}
+pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: bool) -> Result<()> {
+    if chat_id>=0 {return Err(fail("Invalid group ID"));}
+    let sql=if dry_run {
+        "INSERT INTO group_settings(chat_id,dry_run) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run"
+    } else {
+        "INSERT INTO group_settings(chat_id,logs_enabled) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET logs_enabled=excluded.logs_enabled"
+    };
+    env.d1("DB")?.prepare(sql).bind(&[js_i64(chat_id),js_i64(i64::from(enabled))])?.run().await?;
+    if dry_run && enabled {
+        env.d1("DB")?.prepare("UPDATE pending_bans SET status='canceled',cancellation_reason='dry_run_enabled',resolved_at=? WHERE chat_id=? AND status='pending'")
+            .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
+    }
+    Ok(())
 }

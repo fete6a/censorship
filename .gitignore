@@ -1,8 +1,11 @@
-/target
+target/
+Cargo.lock
+package-lock.json
 /build
 /node_modules
 /.wrangler
 /.dev.vars
 /.env
 *.log
-Cargo.lock
+__pycache__/
+*.py[cod]

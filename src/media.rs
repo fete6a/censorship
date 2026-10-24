@@ -1,8 +1,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
-use wasm_bindgen::JsValue;
+use serde_json::Value;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
 use crate::tg;
+use crate::body::response_bytes;
 use crate::util::{config, fail, field_int, field_str, secret};
 
 const MAX_IMAGE: usize = 4 * 1024 * 1024;
@@ -109,14 +109,9 @@ async fn transcode_audio(env: &Env, bytes: Vec<u8>, input_mime: &str) -> Result<
     if response.headers().get("Content-Type")?.unwrap_or_default().split(';').next() != Some("audio/mpeg") {
         return Err(fail("Audio transcoder must return audio/mpeg"));
     }
-    if let Some(length) = response.headers().get("Content-Length")? {
-        if length.parse::<usize>().map(|n| n > MAX_AUDIO).unwrap_or(true) {
-            return Err(fail("Transcoded audio exceeds media limit"));
-        }
-    }
-    let result = response.bytes().await?;
-    if result.is_empty() || result.len() > MAX_AUDIO {
-        return Err(fail("Transcoded audio invalid or too large"));
+    let result = response_bytes(&mut response, MAX_AUDIO).await?;
+    if result.is_empty() {
+        return Err(fail("Transcoded audio is empty"));
     }
     Ok(result)
 }
@@ -138,7 +133,7 @@ pub async fn for_message(env: &Env, msg: &Value) -> Result<ModelMedia> {
     if meta.kind == MediaKind::Audio && meta.duration.is_some_and(|n| n > 300) {
         return Err(fail("Audio exceeds Clef-omni 300-second limit"));
     }
-    let mut mime = meta.mime.clone();
+    let mut mime = meta.mime;
     let mut bytes = tg::download(env, &meta.file_id, max).await?;
     if bytes.is_empty() {
         return Err(fail("Empty media file"));
@@ -174,6 +169,7 @@ pub async fn for_message(env: &Env, msg: &Value) -> Result<ModelMedia> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn telegram_voice_defaults_to_ogg_needing_transcode() {
         let v = json!({"voice":{"file_id":"abc", "file_size":2000,"duration":25}});

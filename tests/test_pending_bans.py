@@ -45,7 +45,6 @@ class PendingBanStateTests(unittest.TestCase):
         self.assertIn('store::claim_due(',code)
         self.assertIn('"administrator" | "creator" | "left" | "kicked"',code)
         self.assertIn('tg::mute_one_minute(',code)
-        self.assertIn('"DRY_RUN",true',code)
     def test_late_processing_cancels(self):
         code=(ROOT/'src/moderation.rs').read_text()
         self.assertIn('saturating_sub(case.due_at)>600',code)

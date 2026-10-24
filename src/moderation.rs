@@ -3,7 +3,6 @@ use worker::{console_error, console_log, Env, Result};
 use crate::{media, store, tg};
 use crate::util::{config, fail, field_int, field_str, flag, now};
 
-const REMOVE_THRESHOLD: f64 = 0.93;
 const ACTION_CONFIDENCE: f64 = 0.80;
 const CATEGORY_CONFIDENCE: f64 = 0.75;
 const DELETE_WINDOW: i64 = 48 * 3600;
@@ -21,10 +20,10 @@ pub struct Decision {
 }
 
 impl Decision {
-    fn clear_violation(&self) -> bool {
+    fn clear_violation(&self, threshold: f64) -> bool {
         self.action == "remove"
-            && self.remove_probability >= REMOVE_THRESHOLD
-            && self.action_confidence >= ACTION_CONFIDENCE
+            && self.remove_probability >= threshold
+            && self.action_confidence >= ACTION_CONFIDENCE.min(threshold)
             && self.category != "none"
             && self.category_confidence >= CATEGORY_CONFIDENCE
     }
@@ -37,17 +36,22 @@ pub enum Mode {
     HistoricalEnforce,
 }
 
-fn parse_choice(body: &Value, question: &str) -> Result<(String, f64, Value)> {
+fn probability(value: &Value) -> Result<f64> {
+    value.as_f64().filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+        .ok_or_else(|| fail("Model score must be a number between 0 and 1"))
+}
+
+fn parse_choice<'a>(body: &'a Value, question: &str, allowed: &[&str]) -> Result<(&'a str, f64, &'a Value)> {
     let answer = &body["answers"][question];
     if field_str(answer, "type") != "choice" {
         return Err(fail("Clef-omni did not return a choice"));
     }
     let choice = field_str(answer, "choice");
-    let confidence = answer["confidence"].as_f64().unwrap_or(0.0);
-    if choice.is_empty() || !confidence.is_finite() {
-        return Err(fail("Clef-omni choice result is incomplete"));
+    let confidence = probability(&answer["confidence"])?;
+    if !allowed.contains(&choice) {
+        return Err(fail("Clef-omni returned an unknown choice"));
     }
-    Ok((choice.to_string(), confidence, answer["probabilities"].clone()))
+    Ok((choice, confidence, &answer["probabilities"]))
 }
 
 fn parse_decision(raw: Value) -> Result<Decision> {
@@ -58,17 +62,15 @@ fn parse_decision(raw: Value) -> Result<Decision> {
     } else {
         raw.get("result").unwrap_or(&raw)
     };
-    let (action, action_confidence, action_probs) = parse_choice(body, "action")?;
-    let (category, category_confidence, _) = parse_choice(body, "category")?;
-    let (severity, _severity_confidence, severity_probs) = parse_choice(body, "severity")?;
-    let remove_probability = action_probs["remove"].as_f64().ok_or_else(|| fail("No remove probability"))?;
-    let critical_probability = severity_probs["critical"].as_f64().unwrap_or(0.0);
-    if !remove_probability.is_finite() || !critical_probability.is_finite() {
-        return Err(fail("Model returned nonfinite probabilities"));
-    }
+    let (action, action_confidence, action_probs) = parse_choice(body, "action", &["allow", "review", "remove"])?;
+    let (category, category_confidence, _) = parse_choice(body, "category",
+        &["none", "spam", "fraud", "harassment", "hate", "adult", "threat", "other"])?;
+    let (severity, _, severity_probs) = parse_choice(body, "severity", &["none", "minor", "major", "critical"])?;
+    let remove_probability = probability(&action_probs["remove"])?;
+    let critical_probability = probability(&severity_probs["critical"])?;
     Ok(Decision {
-        action, action_confidence, remove_probability, category,
-        category_confidence, severity, critical_probability,
+        action: action.to_owned(), action_confidence, remove_probability, category: category.to_owned(),
+        category_confidence, severity: severity.to_owned(), critical_probability,
     })
 }
 
@@ -126,7 +128,7 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
         "audio": input_media.audio,
         "videos": input_media.videos
     });
-    let raw: Value = env.ai("AI")?.run("@cf/cloudflare/clef-omni", &payload).await?;
+    let raw = crate::inference::run(env, "@cf/cloudflare/clef-omni", &payload).await?;
     parse_decision(raw)
 }
 
@@ -146,15 +148,12 @@ fn category_name(category: &str) -> &'static str {
 /// Returns true if the message is an unambiguous model-flagged violation.
 /// An AI failure, a missing group description, and unsupported media
 /// always result in zero punitive actions (fail open).
-pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<bool> {
+pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
     let (chat_id, msg_id) = tg::ids(msg).ok_or_else(|| fail("Missing message ID"))?;
     let rules = match tg::group_rules(env, chat_id).await {
         Ok(p) if !p.trim().is_empty() => p,
         Ok(_) => {
             store::finish_review(env, chat_id, msg_id, "no_group_description", "none", 0.0).await?;
-            if report {
-                tg::send_to_review_or_chat(env, chat_id, "群简介为空：未执行处罚。请先将群规写入群简介。 ").await?;
-            }
             return Ok(false);
         }
         Err(error) => {
@@ -167,61 +166,37 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
         Ok(d) => d,
         Err(error) => {
             store::finish_review(env, chat_id, msg_id, "review_error", "none", 0.0).await?;
-            if report || (mode == Mode::Live && !config(env, "ADMIN_DM_CHAT_ID").is_empty()) {
-                let _ = tg::send_to_review_or_chat(env, chat_id, &format!(
-                    "消息 {msg_id} 无法自动审核（可能是媒体过大/格式不支持/模型暂不可用），未执行处罚；需人工复核。"
-                )).await;
-            }
             console_error!("review_unavailable chat={} message={} error={}", chat_id, msg_id, error);
             // Never retry unsupported files indefinitely. Queue retries on other errors.
             return Ok(false);
         }
     };
 
-    let clear = decision.clear_violation();
+    let clear = decision.clear_violation(store::group_threshold(env,chat_id).await?);
     let category = category_name(&decision.category);
-    let detail = format!(
-        "消息 {msg_id} 审核：{} / {} / {}，删除概率 {:.3}，判定置信度 {:.3}",
-        decision.action, category, decision.severity,
-        decision.remove_probability, decision.action_confidence,
-    );
     if !clear {
         let kind = if decision.action == "review" { "needs_review" } else { "allow" };
         store::finish_review(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability).await?;
-        if report {
-            tg::send_to_review_or_chat(env, chat_id, &detail).await?;
-        } else if decision.action == "review" && !config(env, "ADMIN_DM_CHAT_ID").is_empty() {
-            let _ = tg::send_to_review_or_chat(env, chat_id, &detail).await;
-        }
         return Ok(false);
     }
 
-    let safe_mode = flag(env, "DRY_RUN", true);
+    let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
         store::finish_review(env, chat_id, msg_id,
             if safe_mode { "dry_run_flag" } else { "audit_flag" },
             &decision.category, decision.remove_probability).await?;
-        if report {
-            tg::send_to_review_or_chat(env, chat_id, &format!("{detail}（仅审查，没有处罚）")).await?;
-        }
         return Ok(true);
     }
 
     let sent_at = field_int(msg, "date").unwrap_or(0);
     if sent_at <= 0 || now().saturating_sub(sent_at) >= DELETE_WINDOW {
         store::finish_review(env, chat_id, msg_id, "too_old_to_delete", &decision.category, decision.remove_probability).await?;
-        if report {
-            tg::send_to_review_or_chat(env, chat_id, &format!("{detail}（超过 Telegram 删除时限，未处罚）")).await?;
-        }
         return Ok(true);
     }
 
     // A repeated live update, edit, or historical rescan must not issue a second strike.
     if store::has_strike(env, chat_id, msg_id).await? {
         store::finish_review(env, chat_id, msg_id, "previously_deleted", &decision.category, decision.remove_probability).await?;
-        if report {
-            tg::send_to_review_or_chat(env, chat_id, &format!("{detail}（此前已处罚，不重复计数）")).await?;
-        }
         return Ok(true);
     }
 
@@ -232,9 +207,14 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
     } else {
         true // Anonymous administrator/channel sender: no attributable ban or strike.
     };
+    // Settings may change while Telegram lookups are in flight.
+    if store::group_dry_run(env,chat_id).await? {
+        store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
+        return Ok(true);
+    }
     tg::delete(env, chat_id, msg_id).await?;
 
-    let mut notice = format!("违规消息 {msg_id} 已删除：{category}。");
+    let mut notice = String::new();
     if let Some(user_id) = user {
         store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability).await?;
         let count = store::recent_strikes(env, chat_id, user_id).await?;
@@ -255,7 +235,10 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
                 let already_restricted = field_str(&member,"status") == "restricted" &&
                     (field_int(&member,"until_date").unwrap_or(0) == 0 ||
                      field_int(&member,"until_date").unwrap_or(0) > now() + 60);
-                if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
+                if store::group_dry_run(env,chat_id).await? {
+                    store::set_strike_action(env,chat_id,msg_id,"deleted_no_mute_dry_run").await?;
+                    notice="Dry-run enabled; further punishment stopped.".into();
+                } else if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
                     store::set_strike_action(env,chat_id,msg_id,"existing_external_restriction").await?;
                     notice = format!("用户 {user_id} 已有更长期的限制或不在群内，机器人不会覆盖原处罚或创建新封禁任务。 ");
                 } else {
@@ -266,7 +249,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
                         store::set_strike_action(env, chat_id, msg_id, "muted_pending").await?;
                         let timer = json!({"kind":"ban_check","chat_id":chat_id,
                             "user_id":user_id,"message_id":msg_id});
-                        if let Err(error) = env.queue("BAN_DELAY_QUEUE")?.send(timer).await {
+                        if let Err(error) = crate::queueing::send(env, "BAN_DELAY_QUEUE", &timer).await {
                             console_error!("ban_timer_enqueue_failed: {}",error);
                         }
                         notice = format!("用户 {user_id} 因 {category} 已禁言 60 秒（近 7 天 {count} 次违规）。如管理员未取消，将在到期后封禁。取消命令：/cancel {user_id}");
@@ -281,6 +264,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
             }
         } else {
             store::set_strike_action(env, chat_id, msg_id, "warned").await?;
+            notice.push_str(&format!("警告用户 {user_id}："));
             if is_admin {
                 notice.push_str("发送者为管理员，不会自动封禁。");
             } else {
@@ -290,15 +274,11 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode, report: bool) -> Result<
     } else {
         notice.push_str("匿名/频道身份：无法归属具体用户，不封禁。");
     }
+    let notice=format!("违规消息 {msg_id} 已删除：{category}。\n{notice}");
+    tg::send_group_notice(env,chat_id,&notice).await;
     store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
     // Notification failure must not erase the successful deletion.
-    // No group messages. D1 remains the audit trail; optional private DM only.
     let _ = tg::send_to_review_or_chat(env, chat_id, &notice).await;
-    if report { // Also send the score to the configured review group, if any.
-        if !config(env, "ADMIN_DM_CHAT_ID").is_empty() {
-            let _ = tg::send_to_review_or_chat(env, chat_id, &detail).await;
-        }
-    }
     Ok(true)
 }
 
@@ -314,21 +294,37 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
             return None;
         }
     }
-    if !matches!(cmd, "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+    if !matches!(cmd, "/start" | "/help" | "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
         return None;
     }
     Some((cmd, words.collect()))
 }
 
-/// Admin commands may be issued in a group (silently, no response) or privately
-/// as `/cancel -100GROUP_ID USER_ID`. The bot never sends messages to groups.
+/// Commands authorize against the exact target group. Threshold commands reply
+/// in their origin group; other group commands retain silent responses.
 async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let Some((cmd, words)) = command_parts(env,msg) else { return Ok(false); };
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
-    let Some(actor) = tg::author(msg) else { return Ok(true); };
     let private = field_str(&msg["chat"], "type") == "private";
+    if matches!(cmd, "/start" | "/help") {
+        // These commands only operate privately; group text must be moderated.
+        if !private { return Ok(false); }
+        tg::send(env,origin_chat_id,concat!(
+            "Commands for group administrators (private chat):\n",
+            "/threshold GROUP_ID 0.75 (or 75%)\n/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
+            "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
+            "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
+            "Use a negative GROUP_ID, for example -1001234567890. ",
+            "You must be an administrator of that specific group. ",
+            "Inside a group, omit GROUP_ID; commands apply only to that group. ",
+            "Threshold commands confirm in the group; moderation actions are announced there."
+        )).await?;
+        return Ok(true);
+    }
+    // Anonymous group senders must not bypass moderation with a command prefix.
+    let Some(actor) = tg::author(msg) else { return Ok(private); };
     let (chat_id,args): (i64, Vec<&str>) = if private {
-        let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()) else {
+        let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
             tg::send(env,origin_chat_id,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
             return Ok(true);
         };
@@ -336,10 +332,43 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     } else {
         (origin_chat_id,words)
     };
-    if !store::can_review(env,chat_id).await? {return Ok(true);}
-    if !tg::user_is_admin(env,chat_id,actor).await? {return Ok(true);}
+    // A denied group command is still an ordinary group message to moderate.
+    // Private denials stay silent and acknowledge the update.
+    if !tg::user_is_admin_for_command(env,chat_id,actor).await? {return Ok(private);}
+    if !store::can_review(env,chat_id).await? {return Ok(private);}
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
+        "/threshold" => {
+            if !args.is_empty() {
+                let value=if let [raw]=args.as_slice() {
+                    let (number,divisor)=raw.strip_suffix('%').map(|n|(n,100.0)).unwrap_or((raw,1.0));
+                    number.parse::<f64>().ok().map(|n|n/divisor)
+                        .filter(|n|n.is_finite() && (0.0..=1.0).contains(n))
+                } else {None};
+                let Some(value)=value else {
+                    let usage="Use /threshold 0.75 or /threshold 75% (range 0 to 1 or 0% to 100%). In private chats specify GROUP_ID first.";
+                    if private {tg::send(env,origin_chat_id,usage).await?;} else {tg::send_group_notice(env,chat_id,usage).await;}
+                    return Ok(true);
+                };
+                store::set_group_threshold(env,chat_id,value).await?;
+            }
+            let value=store::group_threshold(env,chat_id).await?;
+            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; model must choose remove and category confidence must be at least 75%.",value,value*100.0);
+            if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice(env,chat_id,&reply).await;}
+        }
+        "/dry-run" | "/dry_run" | "/logs" => {
+            let dry_run=cmd!="/logs";
+            if !args.is_empty() {
+                let enabled=match args.as_slice() {
+                    ["on"]=>true,["off"]=>false,
+                    _=>{tg::send(env,origin_chat_id,"Use on or off; in private chats specify GROUP_ID first.").await?;return Ok(true);}
+                };
+                store::set_group_option(env,chat_id,dry_run,enabled).await?;
+            }
+            let enabled=if dry_run {store::group_dry_run(env,chat_id).await?} else {store::group_logs(env,chat_id).await?};
+            let label=if dry_run {"dry-run"} else {"logs"};
+            tg::send(env,origin_chat_id,&format!("Group {chat_id}: {label} {}",if enabled {"on"} else {"off"})).await?;
+        }
         "/cancel" => {
             let target = args.first().and_then(|s|s.parse::<i64>().ok()).or_else(||
                 if private {None} else {msg.get("reply_to_message").and_then(tg::author)});
@@ -409,7 +438,7 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
             }
             store::archive(env,&target).await?;
             let mode=if enforce {Mode::HistoricalEnforce} else {Mode::Audit};
-            let flagged=review(env,&target,mode,false).await?;
+            let flagged=review(env,&target,mode).await?;
             tg::send(env,origin_chat_id,&format!("消息 {}: flagged={flagged}, enforce={enforce}",target["message_id"])).await?;
         }
         _=>{}
@@ -491,7 +520,7 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<()> {
         store::mark_update_done(env,update_id).await?;
         return Ok(());
     }
-    let Some((chat_id,_))=tg::ids(msg) else{return Ok(());};
+    if tg::ids(msg).is_none() {return Ok(());}
     if !ensure_group_enrolled(env,&msg["chat"]).await? || !tg::is_eligible_group_message(msg) {
         store::mark_update_done(env,update_id).await?;
         return Ok(());
@@ -502,7 +531,7 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<()> {
     }
     if tg::message_has_payload(msg) {
         store::archive(env,msg).await?;
-        review(env,msg,Mode::Live,false).await?;
+        review(env,msg,Mode::Live).await?;
     }
     store::mark_update_done(env,update_id).await?;
     Ok(())
@@ -514,7 +543,6 @@ pub async fn process_queue_item(env: &Env, item: &Value) -> Result<()> {
         let Some(chat_id)=field_int(item,"chat_id") else{return Err(fail("Timer missing chat_id"));};
         let Some(user_id)=field_int(item,"user_id") else{return Err(fail("Timer missing user_id"));};
         let Some(message_id)=field_int(item,"message_id") else{return Err(fail("Timer missing message_id"));};
-        if !store::can_auto_ban(env,chat_id).await? { return Ok(()); }
         finalize_pending(env,chat_id,user_id,message_id).await
     } else {
         process_update(env,item).await
@@ -525,10 +553,18 @@ pub async fn process_queue_item(env: &Env, item: &Value) -> Result<()> {
 pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i64) -> Result<()> {
     let Some(case)=store::current_pending(env,chat_id,user_id).await? else{return Ok(());};
     if case.message_id!=message_id || now()<case.due_at {return Ok(());}
-    if !store::can_auto_ban(env,chat_id).await? || !flag(env,"ENABLE_BAN",true) || flag(env,"DRY_RUN",true) {
+    // Expire overdue cases even while Telegram is unreachable.
+    if now().saturating_sub(case.due_at)>600 {
+        store::cancel_pending_automatically(env,chat_id,user_id,message_id,"timer_too_late").await?;
+        return Ok(());
+    }
+    if !store::can_auto_ban(env,chat_id).await? || !flag(env,"ENABLE_BAN",true) || store::group_dry_run(env,chat_id).await? {
         store::cancel_pending_automatically(env,chat_id,user_id,message_id,"banning_disabled").await?;
         return Ok(());
     }
+    // Reserve a retry slot before any Telegram lookup, or the earliest failures
+    // monopolize all eight Cron slots. This leaves admin cancellation possible.
+    if !store::begin_pending_attempt(env,chat_id,user_id,message_id).await? {return Ok(());}
     // Never ban a promoted administrator or somebody who already left / was banned.
     // If Telegram is unreachable, do not issue a punitive API request.
     let member=tg::get_member(env,chat_id,user_id).await?;
@@ -539,19 +575,21 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
         },
         _=>{}
     }
-    if now().saturating_sub(case.due_at)>600 {
-        store::cancel_pending_automatically(env,chat_id,user_id,message_id,"timer_too_late").await?;
-        return Ok(());
-    }
     // Atomic claim excludes concurrent /cancel and repeated delayed messages.
     if store::claim_due(env,chat_id,user_id,message_id).await?.is_none() {return Ok(());}
+    if store::group_dry_run(env,chat_id).await? {
+        store::conclude_pending(env,chat_id,user_id,message_id,"canceled").await?;
+        return Ok(());
+    }
     match tg::ban(env,chat_id,user_id).await {
         Ok(())=>{
             store::conclude_pending(env,chat_id,user_id,message_id,"banned").await?;
             store::set_strike_action(env,chat_id,message_id,"banned_after_review").await?;
-            let _=tg::send_to_review_or_chat(env,chat_id,&format!(
+            let notice=format!(
                 "用户 {user_id} 在 60 秒管理员复核期内未被取消，现已执行封禁。"
-            )).await;
+            );
+            tg::send_group_notice(env,chat_id,&notice).await;
+            let _=tg::send_to_review_or_chat(env,chat_id,&notice).await;
             Ok(())
         },
         Err(e)=>{
@@ -564,9 +602,13 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
 
 pub async fn process_pending_tick(env:&Env)->Result<()> {
     store::expire_stale_processing(env).await?;
-    for _ in 0..8 {
-        let Some(case)=store::earliest_due(env).await? else{break;};
-        finalize_pending(env,case.chat_id,case.user_id,case.message_id).await?;
+    store::expire_overdue_pending(env).await?;
+    // Snapshot only ready cases; persisted backoff rotates failed attempts
+    // behind fresh due timers, even if their Telegram requests keep failing.
+    for case in store::due_pending(env).await? {
+        if let Err(error) = finalize_pending(env,case.chat_id,case.user_id,case.message_id).await {
+            console_error!("pending_case_failed chat={} user={} error={}",case.chat_id,case.user_id,error);
+        }
     }
     Ok(())
 }
@@ -609,7 +651,7 @@ pub async fn process_scan_tick(env: &Env) -> Result<()> {
         };
         let msg: Value = serde_json::from_str(&item.payload)?;
         let mode = if job.enforce == 1 { Mode::HistoricalEnforce } else { Mode::Audit };
-        let flagged = review(env,&msg,mode,false).await?;
+        let flagged = review(env,&msg,mode).await?;
         store::advance_scan(env,&job,item.message_id,flagged).await?;
         job.cursor_message_id = item.message_id;
         job.scanned += 1;
@@ -621,16 +663,60 @@ pub async fn process_scan_tick(env: &Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn model_response() -> Value {
+        json!({"answers":{
+            "action":{"type":"choice","choice":"remove","confidence":0.99,
+                "probabilities":{"remove":0.99}},
+            "category":{"type":"choice","choice":"spam","confidence":0.9,
+                "probabilities":{"spam":0.9}},
+            "severity":{"type":"choice","choice":"major","confidence":0.9,
+                "probabilities":{"critical":0.01}}
+        }})
+    }
+    #[test]
+    fn rejects_out_of_range_model_scores() {
+        for (question, key) in [("action", "confidence"), ("category", "confidence"),
+            ("severity", "confidence")] {
+            for score in [-0.01, 1.01] {
+                let mut raw = model_response();
+                raw["answers"][question][key] = json!(score);
+                assert!(parse_decision(raw).is_err(), "accepted {question} {score}");
+            }
+        }
+        for (question, key) in [("action", "remove"), ("severity", "critical")] {
+            for score in [-0.01, 1.01] {
+                let mut raw = model_response();
+                raw["answers"][question]["probabilities"][key] = json!(score);
+                assert!(parse_decision(raw).is_err(), "accepted {question} probability {score}");
+            }
+        }
+    }
+    #[test]
+    fn rejects_unknown_model_choices() {
+        for question in ["action", "category", "severity"] {
+            let mut raw = model_response();
+            raw["answers"][question]["choice"] = json!("unexpected");
+            assert!(parse_decision(raw).is_err(), "accepted unknown {question}");
+        }
+    }
+    #[test]
+    fn rejects_missing_model_scores() {
+        for question in ["action", "category", "severity"] {
+            let mut raw = model_response();
+            raw["answers"][question].as_object_mut().unwrap().remove("confidence");
+            assert!(parse_decision(raw).is_err(), "accepted missing {question} confidence");
+        }
+    }
     #[test]
     fn threshold_requires_high_confidence_and_category() {
         let mut d=Decision{action:"remove".into(),action_confidence:0.99,remove_probability:0.98,
             category:"fraud".into(),category_confidence:0.95,severity:"critical".into(),critical_probability:0.99};
-        assert!(d.clear_violation());
+        assert!(d.clear_violation(0.93));
         d.category="none".into();
-        assert!(!d.clear_violation());
+        assert!(!d.clear_violation(0.93));
         d.category="fraud".into();
         d.remove_probability=0.50;
-        assert!(!d.clear_violation());
+        assert!(!d.clear_violation(0.93));
     }
     #[test]
     fn choice_result_has_to_match_schema() {
@@ -638,6 +724,6 @@ mod tests {
           "probabilities":{"remove":0.99}},
           "category":{"type":"choice","choice":"spam","confidence":0.9,"probabilities":{"spam":0.9}},
           "severity":{"type":"choice","choice":"major","confidence":0.9,"probabilities":{"critical":0.01}}}});
-        assert!(parse_decision(result).unwrap().clear_violation());
+        assert!(parse_decision(result).unwrap().clear_violation(0.93));
     }
 }

@@ -1,5 +1,8 @@
+mod body;
+mod inference;
 mod media;
 mod moderation;
+mod queueing;
 mod store;
 mod tg;
 mod util;
@@ -36,10 +39,14 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             return Response::error("Payload Too Large", 413);
         }
     }
-    let bytes = req.bytes().await?;
-    if bytes.len() > MAX_UPDATE_BYTES {
-        return Response::error("Payload Too Large", 413);
+    if req.inner().body().is_none() {
+        return Response::error("Bad JSON", 400);
     }
+    let bytes = match body::read_limited(req.stream()?, MAX_UPDATE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(body::ReadError::TooLarge) => return Response::error("Payload Too Large", 413),
+        Err(body::ReadError::Stream(error)) => return Err(error),
+    };
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => return Response::error("Bad JSON", 400),
@@ -49,7 +56,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     }
     // The Queue decouples Telegram webhook delivery from network-bound AI inference.
     // Enqueue failure deliberately returns non-2xx, so Telegram can retry the update.
-    env.queue("MODERATION_QUEUE")?.send(value).await?;
+    queueing::send(&env, "MODERATION_QUEUE", &value).await?;
     Response::ok("Queued")
 }
 
@@ -68,19 +75,18 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
 }
 
 #[worker::event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> Result<()> {
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if let Err(error) = moderation::process_pending_tick(&env).await {
         console_error!("pending_ban_tick_failed: {}",error);
-        return Err(error);
     }
     if let Err(error) = moderation::process_scan_tick(&env).await {
         console_error!("historical_scan_failed: {}", error);
-        return Err(error);
     }
     // Daily cleanup, keeping retention configurable.
     if crate::util::now().div_euclid(60).rem_euclid(1440) == 0 {
-        store::cleanup(&env).await?;
-        console_log!("cleaned_up_expired_records");
+        match store::cleanup(&env).await {
+            Ok(()) => console_log!("cleaned_up_expired_records"),
+            Err(error) => console_error!("cleanup_failed: {}", error),
+        }
     }
-    Ok(())
 }
