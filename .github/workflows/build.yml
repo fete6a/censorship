@@ -15,12 +15,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.deploy == true && 'deploy' || 'build' }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy != true }}
-
 jobs:
   build:
+    concurrency:
+      group: build-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -60,7 +59,8 @@ jobs:
       - name: Assert build output
         run: |
           test -s build/index.js
-          find build -maxdepth 2 -type f -name '*.wasm' -size +0c -print -quit | grep -q .
+          test -s build/index_bg.wasm
+          sha256sum build/index.js build/index_bg.wasm > build/SHA256SUMS
       - name: Upload Worker build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -68,21 +68,28 @@ jobs:
           path: build/
           retention-days: 30
           if-no-files-found: error
-      - name: Deploy to Cloudflare (explicit dispatch only)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy == true }}
+
+  deploy:
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy == true)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: cloudflare-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Download tested Worker artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-worker-fat-lto
+          path: build/
+      - name: Deploy verified artifact and check health
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
-            echo 'Configure both GitHub Actions Cloudflare secrets before deployment' >&2
-            exit 1
-          fi
-          npm install --package-lock=false --no-audit --no-fund
-          # Current-schema-only release: verify compatibility, never upgrade D1 in CI.
-          npx wrangler d1 execute DB --remote --command "SELECT next_attempt_at,attempt_count FROM pending_bans LIMIT 0"
-          npx wrangler d1 execute DB --remote --command "SELECT logs_enabled,remove_threshold FROM group_settings LIMIT 0"
-          npx wrangler d1 execute DB --remote --command "SELECT chat_type,status FROM managed_chats LIMIT 0"
-          npx wrangler d1 execute DB --remote --command "SELECT last_status,last_category FROM archived_messages LIMIT 0"
-          npx wrangler deploy
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/deploy-ci.sh

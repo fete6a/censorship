@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -62,6 +62,10 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('pending_bans')) return null;
           if (sql.includes('SELECT last_status,last_category,last_probability FROM archived_messages'))
             {if(digestFail && values[0]===groupA)throw new Error('digest read unavailable');return reviews.get(`${values[0]}:${values[1]}`) || null;}
+          if(sql.includes('SELECT message_id FROM archived_messages')) {
+            const ids=[...reviews].filter(([key,row])=>key.startsWith(`${values[0]}:`)&&!['pending','deleted','previously_deleted'].includes(row.last_status)).map(([key])=>Number(key.split(':')[1]));
+            return ids.length?{message_id:Math.max(...ids)}:null;
+          }
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
           if (sql.includes('managed_chats')) return { status: 'active', chat_type: 'supergroup' };
           throw new Error(`Unexpected D1 read: ${sql}`);
@@ -126,8 +130,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     if (method === 'deleteMessage') return Response.json({ok:true,result:true});
     if (method === 'sendMessage' && ((dmFail && args.chat_id>0)||(noticeFail && args.chat_id<0))) return Response.json({ok:false},{status:403});
     if (method === 'sendMessage') return Response.json({ ok: true, result: { message_id: 1 } });
+    if(method==='getChat' && groupInfoFail && telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===args.chat_id).length>1) return Response.json({ok:false},{status:503});
     if (method === 'getChat') return Response.json({ ok: true, result: {
-      id: args.chat_id, type: 'supergroup', description: 'Do not post advertisements',
+      id: args.chat_id, type: 'supergroup',title:groupTitles[args.chat_id],username:groupUsernames[args.chat_id],invite_link:groupInvite, description: 'Do not post advertisements',
     } });
     throw new Error(`Unexpected Telegram method: ${method}`);
   };
@@ -570,4 +575,42 @@ await test('a failed digest read cannot retry completed reviews or suppress anot
  assert.ok(outcomes.every(x=>x.acked&&!x.retried));
  assert.equal(f.completed.size,2);
  assert.deepEqual(f.telegram.filter(c=>c.method==='sendMessage').map(c=>c.args.chat_id),[21]);
+});
+
+await test('private digests identify each group by its own clickable name and numeric ID',async()=>{
+ const f=fixture();await f.consumeBatch([message(groupA,1500),message(groupB,1501)]);
+ const sends=f.telegram.filter(c=>c.method==='sendMessage');
+ const a=sends.find(c=>c.args.chat_id===11)?.args.text||'';
+ const b=sends.find(c=>c.args.chat_id===21)?.args.text||'';
+ assert.ok(a.includes('[Group A](https://t.me/group_a)'));assert.ok(a.includes('-100100'));
+ assert.ok(b.includes('[Group B](https://t.me/group_b)'));assert.ok(!b.includes('Group A'));
+ assert.ok(!a.includes('group_b'));
+});
+await test('private supergroup name links to a surviving reviewed message without creating invitations',async()=>{
+ const f=fixture({groupUsernames:{}});await f.consume(message(groupA,1502));
+ const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
+ assert.ok(text.includes('[Group A](https://t.me/c/100/1502)'));
+ assert.equal(f.telegram.some(c=>c.method.includes('InviteLink')),false);
+});
+await test('private enforcement logs use an existing group invite link and escape its name',async()=>{
+ const f=fixture({remove:true,groupUsernames:{},groupInvite:'https://t.me/+Existing_Invite-1',groupTitles:{[groupA]:'Group *A* [x]'}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:1});await f.consume(message(groupA,1503));
+ const sends=f.telegram.filter(c=>c.method==='sendMessage'&&c.args.chat_id===11);
+ assert.ok(sends.length>0);
+ for(const c of sends)assert.ok(c.args.text.includes('[Group \\*A\\* \\[x\\]](https://t.me/+Existing_Invite-1)'));
+});
+await test('group metadata failure keeps committed reviews and delivers a safe ID-based link',async()=>{
+ const f=fixture({groupInfoFail:true,groupUsernames:{}});await f.consume(message(groupA,1504));
+ assert.equal(f.completed.has(1504),true);
+ const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
+ assert.ok(text.includes('(https://t.me/c/100/1504)'));
+ assert.ok(text.includes('-100100'));
+});
+
+await test('group metadata cannot inject an external URL into private logs',async()=>{
+ const f=fixture({groupUsernames:{[groupA]:'x](https://evil.example)'},groupInvite:'https://evil.example/invite'});
+ await f.consume(message(groupA,1505));
+ const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
+ assert.ok(text.includes('[Group A](https://t.me/c/100/1505)'));
+ assert.ok(!text.includes('evil.example'));
 });

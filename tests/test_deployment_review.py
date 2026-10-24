@@ -7,10 +7,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeploymentReviewTests(unittest.TestCase):
-    def test_manual_deployment_checks_schema_before_publish_without_migration(self):
+    def test_deployment_checks_schema_before_publish_without_migration(self):
         workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy == true }}", workflow)
-        self.assertIn('set -euo pipefail', workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("github.event_name == 'push'", workflow)
+        self.assertIn('needs: build', workflow)
+        script=(ROOT/'scripts/deploy-ci.sh').read_text()
+        self.assertIn('set -euo pipefail', script)
         queries = (
             'SELECT next_attempt_at,attempt_count FROM pending_bans LIMIT 0',
             'SELECT logs_enabled,remove_threshold FROM group_settings LIMIT 0',
@@ -18,9 +21,9 @@ class DeploymentReviewTests(unittest.TestCase):
             'SELECT last_status,last_category FROM archived_messages LIMIT 0',
         )
         for q in queries:
-            self.assertIn(q, workflow)
-            self.assertLess(workflow.index(q), workflow.index('npx wrangler deploy'))
-        self.assertNotIn('d1 migrations apply', workflow)
+            self.assertIn(q, script)
+            self.assertLess(script.index(q), script.index('npx wrangler deploy'))
+        self.assertNotIn('d1 migrations apply', workflow+script)
         self.assertFalse((ROOT / 'migrations').exists(),
                          'Historical migration chain should not ship')
         self.assertFalse((ROOT / '.github/workflows/deploy-once.yml').exists(),
@@ -28,11 +31,10 @@ class DeploymentReviewTests(unittest.TestCase):
 
     def test_deployment_and_builds_use_independent_concurrency(self):
         workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn("&& 'deploy' || 'build'", workflow)
-        self.assertIn(
-            "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy != true }}",
-            workflow
-        )
+        self.assertIn('group: build-${{ github.workflow }}-', workflow)
+        self.assertIn('group: cloudflare-production', workflow)
+        self.assertIn('cancel-in-progress: false', workflow.split('  deploy:',1)[1])
+        self.assertIn('actions/download-artifact@v4', workflow)
 
     def test_current_schema_can_bootstrap_one_empty_database(self):
         script = (ROOT / 'schema/current.sql').read_text()
@@ -60,3 +62,4 @@ class DeploymentReviewTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

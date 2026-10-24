@@ -97,18 +97,25 @@ pub async fn send_group_action_notice(
 }
 
 /// Fetch current human administrators for the exact group; no global DM target.
-async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String]) -> Result<()> {
+async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anchor: Option<i64>) -> Result<()> {
     if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
     let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
         Ok(value)=>value,
         Err(_)=>{worker::console_error!("group_admin_logs_unavailable");return Ok(());}
     };
+    // Metadata failures must not discard completed reviews or their admin logs.
+    let info=api(env,"getChat",json!({"chat_id":chat_id})).await.unwrap_or(Value::Null);
+    let anchor=if anchor.is_some() {anchor} else {
+        crate::store::group_log_anchor(env,chat_id).await.unwrap_or(None)
+    };
+    let heading=formatting::group_heading(chat_id,field_str(&info,"title"),
+        field_str(&info,"username"),field_str(&info,"invite_link"),anchor);
     if let Some(admins)=admins.as_array() {
         for member in admins {
             if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
             if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
                 for markdown in markdowns {
-                    if post_markdown(env,user_id,markdown).await.is_err() {
+                    if post_markdown(env,user_id,&format!("{heading}{markdown}")).await.is_err() {
                         worker::console_error!("group_admin_log_dm_failed");
                     }
                 }
@@ -121,8 +128,7 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String]) -> R
 /// Enforcement, cancellation and scan notifications are independent of the
 /// compact passive review digests.
 pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
-    let display=format!("群组 {}\n{}",chat_id,text);
-    send_admin_markdown(env,chat_id,&[formatting::plain_notice("管理员通知",&display)]).await
+    send_admin_markdown(env,chat_id,&[formatting::plain_notice("管理员通知",text)],None).await
 }
 
 /// Queue batches group successful reviews by originating chat. A single admin
@@ -132,7 +138,9 @@ pub async fn send_review_digest(env: &Env, chat_id: i64, message_ids: &[i64]) ->
     let rows=crate::store::last_review_logs(env,chat_id,message_ids).await?;
     if rows.is_empty() {return Ok(());}
     // Recheck logs immediately before delivery; settings may change during D1 reads.
-    send_admin_markdown(env,chat_id,&formatting::review_digest(chat_id,&rows)).await
+    let anchor=rows.iter().rev().find(|row|!matches!(row.status.as_str(),"deleted"|"previously_deleted"))
+        .map(|row|row.message_id);
+    send_admin_markdown(env,chat_id,&formatting::review_digest(chat_id,&rows),anchor).await
 }
 
 pub async fn delete(env: &Env, chat_id: i64, message_id: i64) -> Result<()> {

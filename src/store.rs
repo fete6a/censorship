@@ -86,6 +86,18 @@ pub async fn last_review_logs(env: &Env, chat_id: i64, message_ids: &[i64]) -> R
     ).bind(&[js_i64(chat_id),js_str(&ids)])?.all().await?.results::<formatting::ReviewLine>()
 }
 
+#[derive(Deserialize)]
+struct MessageIdRow {message_id:i64}
+
+/// Fallback navigation for private-group action logs without a public/invite URL.
+pub async fn group_log_anchor(env: &Env, chat_id: i64) -> Result<Option<i64>> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT message_id FROM archived_messages WHERE chat_id=? AND message_id>0 \
+         AND last_status NOT IN ('pending','deleted','previously_deleted') ORDER BY message_id DESC LIMIT 1"
+    ).bind(&[js_i64(chat_id)])?.first::<MessageIdRow>(None).await?;
+    Ok(row.map(|r|r.message_id))
+}
+
 pub async fn is_update_done(env: &Env, update_id: i64) -> Result<bool> {
     let row = env.d1("DB")?.prepare("SELECT COUNT(*) AS count FROM processed_updates WHERE update_id=?")
         .bind(&[js_i64(update_id)])?.first::<CountRow>(None).await?;

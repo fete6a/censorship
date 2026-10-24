@@ -38,6 +38,12 @@ class StoreQueryTests(unittest.TestCase):
         self.assertEqual(rows,[(5,'allow','spam',0.95),(6,'deleted','spam',0.95)])
         self.assertEqual(self.db.execute(query_for('last_review_logs'),(-100,'[]')).fetchall(),[])
 
+    def test_group_log_link_anchor_excludes_deleted_messages_and_other_groups(self):
+        for chat,msg,status in [(-100,10,'allow'),(-100,11,'deleted'),(-100,12,'pending'),(-200,20,'allow')]:
+            self.db.execute("INSERT INTO archived_messages(chat_id,message_id,sent_at,updated_at,payload,last_status) VALUES(?,?,100,100,'{}',?)",(chat,msg,status))
+        self.assertEqual(self.db.execute(query_for('group_log_anchor'),(-100,)).fetchone(),(10,))
+        self.assertIsNone(self.db.execute(query_for('group_log_anchor'),(-300,)).fetchone())
+
     def test_due_batch_does_not_repeat_one_poison_case(self):
         for user in range(1, 11):
             self.add_case(user, due=150 + user)

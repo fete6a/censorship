@@ -36,6 +36,25 @@ pub fn user_mention(user_id: i64) -> Option<String> {
     Some(format!("[用户 {}](tg://user?id={user_id})",user_id))
 }
 
+/// Only Telegram-generated usernames/invites or numeric member-only message
+/// links become targets. Never interpolate group titles into a URL.
+pub fn group_heading(chat_id: i64, title: &str, username: &str, invite: &str, anchor: Option<i64>) -> String {
+    let title=title.chars().take(128).collect::<String>();
+    let title=if title.trim().is_empty() {format!("群组 {chat_id}")} else {title};
+    let public=!username.is_empty() && username.len()<=32 &&
+        username.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'_');
+    let invite_hash=invite.strip_prefix("https://t.me/+")
+        .or_else(||invite.strip_prefix("https://t.me/joinchat/"));
+    let valid_invite=invite_hash.is_some_and(|hash|!hash.is_empty() && hash.len()<=128 &&
+        hash.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'_' || c==b'-'));
+    let link=if public {Some(format!("https://t.me/{username}"))}
+        else if valid_invite {Some(invite.to_owned())}
+        else {anchor.and_then(|id|message_link(chat_id,id))};
+    let name=escape_md(&title);
+    let label=link.map(|url|format!("[{name}]({url})")).unwrap_or(name);
+    format!("👥 {label}\n🆔 `{chat_id}`\n\n")
+}
+
 pub fn action_notice(title: &str, message_id: i64, user_id: Option<i64>, body: &str) -> String {
     let mut out=format!("⚠️ *{}*\n",escape_md(title));
     if message_id>0 {out.push_str(&format!("🔎 消息：`#{message_id}`\n"));}
