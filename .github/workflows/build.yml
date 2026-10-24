@@ -80,5 +80,9 @@ jobs:
             exit 1
           fi
           npm install --package-lock=false --no-audit --no-fund
-          npx wrangler d1 migrations apply DB --remote
+          # Current-schema-only release: verify compatibility, never upgrade D1 in CI.
+          npx wrangler d1 execute DB --remote --command "SELECT next_attempt_at,attempt_count FROM pending_bans LIMIT 0"
+          npx wrangler d1 execute DB --remote --command "SELECT logs_enabled,remove_threshold FROM group_settings LIMIT 0"
+          npx wrangler d1 execute DB --remote --command "SELECT chat_type,status FROM managed_chats LIMIT 0"
+          npx wrangler d1 execute DB --remote --command "SELECT last_status,last_category FROM archived_messages LIMIT 0"
           npx wrangler deploy

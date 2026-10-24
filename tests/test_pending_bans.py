@@ -6,8 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class PendingBanStateTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
-        self.db.executescript((ROOT / 'migrations/0001_init.sql').read_text())
-        self.db.executescript((ROOT / 'migrations/0002_pending_bans.sql').read_text())
+        self.db.executescript((ROOT / 'schema/current.sql').read_text())
         self.db.execute("INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) VALUES(-100,42,1001,100,160,'pending')")
     def tearDown(self): self.db.close()
     def test_cancellation_wins_before_deadline(self):

@@ -30,8 +30,7 @@ class FakeTelegram:
 class PendingRetryTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
-        for path in sorted((ROOT / "migrations").glob("*.sql")):
-            self.db.executescript(path.read_text())
+        self.db.executescript((ROOT / "schema/current.sql").read_text())
         self.time = 200
         self.db.create_function("unixepoch", 0, lambda: self.time)
         self.tg = FakeTelegram()

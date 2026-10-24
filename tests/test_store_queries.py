@@ -17,8 +17,7 @@ def query_for(function):
 class StoreQueryTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
-        for migration in sorted((ROOT / 'migrations').glob('*.sql')):
-            self.db.executescript(migration.read_text())
+        self.db.executescript((ROOT / 'schema/current.sql').read_text())
 
     def tearDown(self):
         self.db.close()

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class SmokeTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(':memory:')
-        self.db.executescript((ROOT / 'migrations/0001_init.sql').read_text())
+        self.db.executescript((ROOT / 'schema/current.sql').read_text())
 
     def tearDown(self):
         self.db.close()
@@ -73,8 +73,6 @@ class SmokeTests(unittest.TestCase):
         self.assertNotIn('GROUP_CHAT_ID',util)
         conf=json.loads((ROOT/'wrangler.jsonc').read_text())
         self.assertNotIn('GROUP_CHAT_ID',conf['vars'])
-        self.db.executescript((ROOT/'migrations/0002_pending_bans.sql').read_text())
-        self.db.executescript((ROOT/'migrations/0003_managed_chats.sql').read_text())
         for chat_id,status in [(-1001,'active'),(-1002,'delete_only'),(-1003,'paused')]:
             self.db.execute('INSERT INTO managed_chats(chat_id,title,chat_type,status,updated_at) VALUES(?,?,?,?,100)',(chat_id,'A','supergroup',status))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM managed_chats WHERE status IN ('active','delete_only')").fetchone()[0],2)

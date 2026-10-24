@@ -21,9 +21,9 @@ class NotificationDocumentationTests(unittest.TestCase):
         cls.store = read("src/store.rs")
         cls.telegram = read("src/tg.rs")
         cls.moderation = read("src/moderation.rs")
-        cls.migration = read("migrations/0004_group_settings.sql")
+        cls.schema = read("schema/current.sql")
 
-    def test_private_log_default_matches_code_migration_and_both_readmes(self):
+    def test_private_log_default_matches_current_schema_and_both_readmes(self):
         function = re.search(
             r"pub async fn group_logs\b.*?\{(.*?)\n\}",
             self.store, re.DOTALL,
@@ -35,7 +35,7 @@ class NotificationDocumentationTests(unittest.TestCase):
 
         column = re.search(
             r"\blogs_enabled\s+INTEGER\s+NOT\s+NULL\s+DEFAULT\s+([01])\b",
-            self.migration, re.IGNORECASE,
+            self.schema, re.IGNORECASE,
         )
         self.assertIsNotNone(column, "Cannot determine D1 logs_enabled default")
         self.assertEqual(int(column.group(1)), int(default_enabled),
