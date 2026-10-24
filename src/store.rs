@@ -154,21 +154,44 @@ pub async fn recent_strikes(env: &Env, chat_id: i64, user_id: i64) -> Result<i64
 /// Set the effective count without touching historical violations, which are
 /// still needed to prevent duplicate strikes and audit prior enforcement.
 /// One upsert atomically snapshots the latest existing violation rowid.
+/// Persist an idempotent administrator adjustment. A duplicate Telegram update
+/// never advances the baseline and therefore cannot erase later real strikes.
+/// The SQLite trigger atomically cancels any *pending* automatic ban.
 pub async fn set_warning_count(
-    env: &Env, chat_id: i64, user_id: i64, count: i64, actor_id: i64
-) -> Result<()> {
-    if chat_id>=0 || user_id<=0 || actor_id<=0 || !(0..=3).contains(&count) {
-        return Err(fail("Invalid warning adjustment scope, user or count"));
+    env: &Env, chat_id: i64, user_id: i64, count: i64, actor_id: i64, update_id: i64
+) -> Result<bool> {
+    if chat_id >= 0 || user_id <= 0 || actor_id <= 0 || update_id < 0 || !(0..=3).contains(&count) {
+        return Err(fail("Invalid warning adjustment scope, user, count or update"));
     }
-    env.d1("DB")?.prepare(
-        "INSERT INTO warning_adjustments(chat_id,user_id,base_count,adjusted_at,violation_rowid,actor_id) \
-         SELECT ?1,?2,?3,?4,COALESCE(MAX(rowid),0),?5 \
-         FROM violations WHERE chat_id=?1 AND user_id=?2 \
-         ON CONFLICT(chat_id,user_id) DO UPDATE SET \
-           base_count=excluded.base_count,adjusted_at=excluded.adjusted_at, \
-           violation_rowid=excluded.violation_rowid,actor_id=excluded.actor_id"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(count),js_i64(now()),js_i64(actor_id)])?.run().await?;
-    Ok(())
+    let inserted = env.d1("DB")?.prepare(
+        "INSERT OR IGNORE INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) \\
+         VALUES(?,?,?,?,?,?) RETURNING update_id AS count"
+    ).bind(&[js_i64(update_id),js_i64(chat_id),js_i64(user_id),
+        js_i64(count),js_i64(actor_id),js_i64(now())])?.first::<CountRow>(None).await?;
+    Ok(inserted.is_some())
+}
+
+/// A paused moderation request must not schedule an old ban after an
+/// administrator has already reset its underlying violation. A fresh genuine
+/// violation can still create a new pending task.
+pub async fn create_pending_after_warning_check(
+    env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64
+) -> Result<bool> {
+    let inserted = env.d1("DB")?.prepare(
+        "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \\
+         SELECT ?1,?2,?3,?4,?5,'pending' WHERE EXISTS ( \\
+           SELECT 1 FROM violations v WHERE v.chat_id=?1 AND v.user_id=?2 AND v.message_id=?3 \\
+           AND NOT EXISTS (SELECT 1 FROM warning_adjustments a WHERE a.chat_id=?1 \\
+             AND a.user_id=?2 AND a.violation_rowid>=v.rowid)) \\
+         ON CONFLICT(chat_id,user_id) DO UPDATE SET \\
+           message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \\
+           status='pending',next_attempt_at=0,attempt_count=0, \\
+           canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \\
+           WHERE pending_bans.status IN ('banned','canceled','failed') \\
+         RETURNING chat_id AS count"
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),
+        js_i64(now()),js_i64(due_at)])?.first::<CountRow>(None).await?;
+    Ok(inserted.is_some())
 }
 
 pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<i64> {
