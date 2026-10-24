@@ -1113,7 +1113,8 @@ await test('missing warning table blocks deletion before Telegram or strike writ
  assert.equal(f.statements.some(s=>s.sql.includes('INSERT OR IGNORE INTO violations')),false);
  assert.equal(f.completed.has(3100),false);
  assert.equal(f.archives.has(String(groupA)+':3100'),true,'archival can precede the failed preflight');
- assert.ok(f.errors.some(s=>s.includes('no such table: warning_adjustments')));
+ assert.ok(f.statements.some(s=>s.operation==='read' && s.sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')), 'pre-deletion warning-count D1 query must be attempted');
+ assert.equal(f.reviews.get(`${groupA}:3100`)?.last_status,'pending','failed preflight must not report a finished moderation action');
 });
 
 await test('missing warning table fails administrator updates without canceling punishments', async()=>{
