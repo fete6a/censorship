@@ -100,12 +100,12 @@ class WarningAdjustmentSQLTests(unittest.TestCase):
         self.set_count(-100,22,0,3_000_000)
         self.db.execute("DELETE FROM violations WHERE created_at<100")
         add = store_query('add_strike')
-        self.db.execute(add, (-100,2,22,3_000_000,'spam',1))
-        self.assertEqual(self.db.execute('SELECT rowid FROM violations').fetchone(), (101,))
+        self.db.execute(add, (-100,22,2,3_000_000,'spam',1))
+        self.assertEqual(self.db.execute('SELECT rowid,chat_id,user_id,message_id FROM violations').fetchone(), (101,-100,22,2))
         self.assertEqual(self.get_count(-100,22,2_900_000), 1)
         # A duplicate must not move its ID or count, even after later inserts.
-        self.db.execute(add, (-200,3,33,3_000_000,'spam',1))
-        self.db.execute(add, (-100,2,22,3_000_001,'spam',1))
+        self.db.execute(add, (-200,33,3,3_000_000,'spam',1))
+        self.db.execute(add, (-100,22,2,3_000_001,'spam',1))
         self.assertEqual(self.get_count(-100,22,2_900_000), 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM violations').fetchone(), (2,))
 

@@ -133,8 +133,8 @@ pub async fn add_strike(env: &Env, chat_id: i64, message_id: i64, user_id: i64, 
     env.d1("DB")?.prepare(
         "INSERT INTO violations(rowid,chat_id,user_id,message_id,created_at,category,probability,severity,action) \
          SELECT MAX(COALESCE((SELECT MAX(rowid) FROM violations),0), \
-           COALESCE((SELECT violation_rowid FROM warning_adjustments WHERE chat_id=?1 AND user_id=?3),0))+1, \
-           ?1,?3,?2,?4,?5,?6,0,'deleted' WHERE true \
+           COALESCE((SELECT violation_rowid FROM warning_adjustments WHERE chat_id=?1 AND user_id=?2),0))+1, \
+           ?1,?2,?3,?4,?5,?6,0,'deleted' WHERE true \
          ON CONFLICT(chat_id,message_id) DO NOTHING"
     ).bind(&[
         js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),
