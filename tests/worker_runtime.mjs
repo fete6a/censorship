@@ -38,6 +38,7 @@ const groupB = -100200;
 function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active' } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
+  const warningAdjustments = new Map(), strikeEvents = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
   class WorkerQueue {
     async send(body, options) {
@@ -67,7 +68,13 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           }
           if (sql.includes('FROM scan_jobs')) return jobs.get(values[0]) || null;
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
-          if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
+          if (sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')) {
+            const key=`${values[0]}:${values[1]}`,entry=warningAdjustments.get(key);
+            const newer=strikeEvents.filter((x,i)=>x.key===key && (!entry || i>=entry.start)).length;
+            return {count:(entry ? entry.count : strikeCount)+newer};
+          }
+          if (sql.includes('violations') && sql.includes('COUNT'))
+            return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
           if (sql.includes('pending_bans')) return null;
           if (sql.includes('SELECT last_status,last_category,last_probability FROM archived_messages'))
             {if(digestFail && values[0]===groupA)throw new Error('digest read unavailable');return reviews.get(`${values[0]}:${values[1]}`) || null;}
@@ -102,7 +109,13 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('INSERT INTO scan_jobs')) jobs.set(values[0],{chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running'});
           if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[1])) jobs.get(values[1]).status='stopped';
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
-          if (sql.includes('INSERT OR IGNORE INTO violations')) strikes.add(`${values[0]}:${values[2]}`);
+          if (sql.includes('INSERT OR IGNORE INTO violations')) {
+            const key=`${values[0]}:${values[2]}`;
+            if(!strikes.has(key))strikeEvents.push({key:`${values[0]}:${values[1]}`,messageId:values[2]});
+            strikes.add(key);
+          }
+          if (sql.includes('INSERT INTO warning_adjustments'))
+            warningAdjustments.set(`${values[0]}:${values[1]}`,{count:values[2],start:strikeEvents.length,actor:values[4]});
           if (sql.includes('INSERT INTO archived_messages')) {
             archives.set(`${values[0]}:${values[1]}`,JSON.parse(values[5]));
             reviews.set(`${values[0]}:${values[1]}`, {last_status:'pending',last_category:'none',last_probability:0});
@@ -171,7 +184,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     assert.equal(outcome.acked,!retry);
   }
   return { worker, deliveries, statements, telegram, completed, errors, aiCalls,
-    settings, reviews, archives, jobs, consume, consumeBatch, env };
+    settings, reviews, archives, jobs, warningAdjustments, consume, consumeBatch, env };
 }
 
 await test('webhook preserves nested payload and IDs through JSON queue delivery', async () => {
@@ -676,7 +689,7 @@ await test('group metadata cannot inject an external URL into private logs',asyn
 
 await test('every supported command replies in its original chat and topic with private logs off',async()=>{
  for(const privateChat of [false,true]) {
-  for(const text of ['/start','/help','/threshold','/dry-run','/dry_run','/logs','/rules','/cancel 22','/pending 22','/scan','/scan_id','/scan_all','/scan_status','/scan_stop']) {
+  for(const text of ['/start','/help','/threshold','/dry-run','/dry_run','/logs','/rules','/cancel 22','/pending 22','/warnings 22','/scan','/scan_id','/scan_all','/scan_status','/scan_stop']) {
    const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
    const [cmd,...args]=text.split(' ');
    const update=command(privateChat&&!['/start','/help'].includes(cmd)?[cmd,groupA,...args].join(' '):text,
@@ -721,9 +734,9 @@ await test('disabled groups receive command feedback and execute no management a
  assert.equal(f.statements.some(s=>s.sql.includes('UPDATE scan_jobs')),false);
 });
 
-await test('scan of a replied-to message sends progress and the actual audit status in the same topic',async()=>{
+await test('explicit audit scan reports findings without sanctions in the same topic',async()=>{
  const f=fixture({remove:true,score:0.99});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
- const update=command('/scan',{id:groupA,type:'supergroup'});
+ const update=command('/scan audit',{id:groupA,type:'supergroup'});
  update.message.reply_to_message=message(groupA,1600).message;update.message.message_thread_id=88;
  await f.consume(update);
  const sends=f.telegram.filter(c=>c.method==='sendMessage');
@@ -927,6 +940,8 @@ await test('command responses consistently use titled MarkdownV2, localized labe
   ['/scan_all', /✅ \*历史扫描\*\n\n/],
   ['/scan_status', /ℹ️ \*历史扫描进度\*\n\n/],
   ['/scan_stop', /✅ \*历史扫描\*\n\n/],
+  ['/warnings 22', /ℹ️ \*用户警告次数\*\n\n/],
+  ['/warnings 22 2', /✅ \*用户警告次数\*\n\n/],
   ['/dry_run maybe', /⚠️ \*参数错误\*\n\n/],
   ['/unknown', /⚠️ \*未知命令\*\n\n/],
  ];
