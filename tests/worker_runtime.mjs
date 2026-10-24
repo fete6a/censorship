@@ -521,6 +521,20 @@ await test('high violation score with category none is needs_review instead of a
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
 });
+await test('other category behaves like none, never punishing or preserving other in reviews',async()=>{
+  for(const [score,expected] of [[0.99,'needs_review'],[0.6,'allow']]){
+    const f=fixture({remove:true,score,categoryChoice:'other'});
+    f.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.8});
+    await f.consume(message(groupA,1707));
+    assert.deepEqual(f.reviews.get(`${groupA}:1707`),
+      {last_status:expected,last_category:'none',last_probability:score});
+    assert.equal(f.telegram.some(c=>['deleteMessage','restrictChatMember','banChatMember'].includes(c.method)),false);
+    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,0);
+    const digest=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id>0)?.args.text||'';
+    assert.ok(digest.includes(expected==='needs_review'?'人工复核':'通过'));
+    assert.ok(!digest.includes('其他违反群规'));
+  }
+});
 await test('score below threshold is allow as computed by Rust, not a model label',async()=>{
  const f=fixture({remove:true,score:0.6,categoryChoice:'harassment'});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
