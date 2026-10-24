@@ -62,7 +62,7 @@ The default removal threshold is `0.93`; changing it affects subsequent reviews,
 - `ARCHIVE_DAYS=0` means archived messages are **not automatically removed**. Set an appropriate positive retention period for your deployment.
 - `BOT_USERNAME` is used to recognize commands addressed to this bot in groups.
 - There is **no active `ADMIN_DM_CHAT_ID` recipient configuration**. Leaving it unset **does not** disable administrator DMs. Setting it does not select or change the current per-group recipients. Use `/logs off` separately for any group whose private review logs should be disabled.
-- The persistent per-group `logs_enabled` and `dry_run` switches and `remove_threshold` value live in D1; they are **not** controlled by a global DM chat ID. Apply D1 migrations before deploying code that reads these columns.
+- The persistent per-group `logs_enabled` and `dry_run` switches and `remove_threshold` value live in D1; they are **not** controlled by a global DM chat ID. Explicit manual GitHub Actions deployments apply D1 migrations with `wrangler d1 migrations apply DB --remote` before deploying the Worker. The Cloudflare API token needs D1 migration/write permissions. Ordinary PR/push builds do not deploy or migrate.
 
 See `wrangler.jsonc` and `.github/workflows/build.yml` for D1/Queues bindings, Rust fat-LTO CI and optional manual deployment. The Worker needs the D1 migrations, its queues, AI binding, Telegram webhook and secrets configured to operate.
 

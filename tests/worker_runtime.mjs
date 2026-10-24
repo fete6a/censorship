@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -97,6 +97,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
       { status: 'administrator', user: { id: 99, is_bot: true } },
     ] });
     if (method === 'getChatMember' && args.user_id===22 && pauseMember) await pauseMember();
+    if (method === 'getChatMember' && args.chat_id===groupB && memberErrorCode !== null) return Response.json({ok:false},{status:memberErrorCode});
     if (method === 'getChatMember') return Response.json({ ok: true, result: {
       user: { id: args.user_id }, status: args.chat_id === groupA && args.user_id===11 ? 'administrator' : 'member',
     } });
@@ -227,6 +228,40 @@ await test('start command returns command usage privately', async () => {
 function message(group, id = 456) {
   return { update_id: id, message: { message_id: id, date: Math.floor(Date.now()/1000), chat: { id: group, type: 'supergroup' }, from: { id: 22 }, text: 'A normal message' } };
 }
+
+await test('private command to inaccessible group acknowledges terminal errors but retries transient errors',async()=>{
+  for(const code of [400,403]){
+    const f=fixture({memberErrorCode:code});
+    await f.consume(command(`/scan_stop ${groupB}`));
+    assert.equal(f.completed.has(789),true);
+    assert.equal(f.statements.some(s=>s.sql.includes('managed_chats')),false);
+  }
+  for(const code of [429,500,503]){
+    const f=fixture({memberErrorCode:code});
+    await f.consume(command(`/scan_stop ${groupB}`),{retry:true});
+    assert.equal(f.completed.has(789),false);
+  }
+});
+await test('group help commands cannot bypass archiving or model review',async()=>{
+  for(const cmd of ['/start bad content','/help bad content']){
+    const f=fixture(),m=message(groupA,991);
+    m.message.text=cmd;m.message.from={id:11};
+    await f.consume(m);
+    assert.equal(f.aiCalls.length,1);
+    assert.ok(f.statements.some(s=>s.sql.includes('INSERT INTO archived_messages')));
+  }
+});
+await test('anonymous or unauthorized group administrative command cannot bypass review',async()=>{
+  for(const anonymous of [true,false]){
+    const f=fixture(),m=message(groupA,992);
+    m.message.text='/scan_stop bad content';
+    m.message.from={id:22,is_bot:false};
+    if(anonymous)m.message.sender_chat={id:groupA};
+    await f.consume(m);
+    assert.equal(f.aiCalls.length,1);
+  }
+});
+
 await test('group administrator can turn dry-run off only for their group', async () => {
  const f = fixture(); await f.consume(command(`/dry-run ${groupA} off`));
  assert.equal(f.settings.get(groupA)?.dry_run, 0);

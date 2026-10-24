@@ -65,7 +65,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。
+GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。手动 GitHub Actions 部署先执行 `wrangler d1 migrations apply DB --remote`，成功后才执行 `wrangler deploy`。Cloudflare API Token 必须有 D1 迁移/写入权限；普通 PR/push 构建不修改生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
