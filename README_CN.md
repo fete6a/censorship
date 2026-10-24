@@ -46,13 +46,16 @@
 | `/rules` | `/rules -100GROUP_ID` | 群内所有成员可读取本群规则；私聊仍限目标群管理员 |
 | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 取消待封禁，尝试恢复发言权限 |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
-| 回复消息 `/scan` 或 `/scan MESSAGE_ID` | `/scan_id -100GROUP_ID MESSAGE_ID` | 重新审查，不处罚 |
+| `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` | 查询或设置指定用户在目标群近 7 天警告次数；仅目标群管理员可操作 |
+| 回复消息 `/scan [audit]` 或 `/scan MESSAGE_ID [audit]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
 | `/scan_all` | `/scan_all -100GROUP_ID` | 扫描机器人已归档的所有消息，默认仅审计 |
 | `/scan_all enforce` | `/scan_all -100GROUP_ID enforce` | 对仍在可删除期限内的违规消息尝试执行处罚 |
 | `/scan_status` | `/scan_status -100GROUP_ID` | 查询进度 |
 | `/scan_stop` | `/scan_stop -100GROUP_ID` | 停止扫描 |
 
-`/scan`、`/scan_id` 会先回复开始提示，再返回实际保存的审核状态、类别和违规概率。缺少群规或模型失败明确显示审核不可用，不会误报通过；默认仅审计，追加 `enforce` 才请求执行处罚，仍遵守 dry-run、权限和防重复处罚检查。目标必须是同群回复消息或该群已归档的消息 ID。临时服务错误会回复通用失败提示并保留 Queue 重试；回复发送失败不会重放已完成的管理操作。
+`/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 仍默认仅审计**，只有显式追加 `enforce` 才可能处罚。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
+
+`/warnings USER_ID` 仅查询当前群该用户近 7 天的有效警告次数；`/warnings USER_ID 2` 设为 2 次（允许 0–3），私聊需用 `/warnings -100GROUP_ID USER_ID 2`。**必须通过目标群实时管理员身份验证**，群内无法指定别的群，D1 所有读写均按 `(chat_id,user_id)` 隔离。调整不会删除原违规记录，也不会立刻禁言或封禁；调整后新违规继续累计，人工基数 7 天后过期。若存在该用户在该群尚未执行的自动封禁，将尝试取消，且不会覆盖管理员手动设置的更长期禁言。
 
 Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任意拉取旧消息 ID。`tools/history-import/` 提供桌面版文本 JSON 离线导入工具，具体导入方式需由数据持有人授权。旧媒体不在导入范围内。Telegram 对大部分消息有 48 小时删除限制。
 
@@ -79,7 +82,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。只支持 `schema/current.sql` 对应的当前数据库结构，不自动迁移生产数据库。
+GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。新建空 D1 仍用 `schema/current.sql` 一次性初始化；现有数据库需在部署前**手动、一次性**执行幂等的 `schema/ensure_warning_adjustments.sql`，只新增警告调整表，不改原始违规记录。GitHub Actions 不自动更改生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -91,7 +94,7 @@ npx wrangler queues create telegram-clef-moderation-dlq
 npx wrangler d1 execute DB --remote --file schema/current.sql
 ```
 
-上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**；不要用于已存在数据的生产数据库，也不支持旧结构的就地升级。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
+上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**，绝不能用于已有数据的数据库。已运行旧版本的 D1 应先执行 `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql` 或通过 Cloudflare MCP 执行其中的单条 `CREATE TABLE IF NOT EXISTS`；此增量补表不会迁移或清理旧记录。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
 
 ```sh
 read -r -s -p 'BOT_TOKEN: ' BOT_TOKEN; echo
