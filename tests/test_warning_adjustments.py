@@ -20,7 +20,9 @@ class WarningAdjustmentSQLTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         self.db.executescript(SCHEMA)
+        self.next_update_id = 5000
         self.upsert = store_query("set_warning_count")
+        self.pending_sql = store_query("create_pending_after_warning_check")
         self.count = store_query("recent_strikes")
 
     def tearDown(self):
@@ -36,7 +38,8 @@ class WarningAdjustmentSQLTests(unittest.TestCase):
         return self.db.execute(self.count, (chat, user, cutoff)).fetchone()[0]
 
     def set_count(self, chat, user, count, when, actor=11):
-        self.db.execute(self.upsert, (chat, user, count, when, actor))
+        self.db.execute(self.upsert, (self.next_update_id, chat, user, count, actor, when))
+        self.next_update_id += 1
 
     def test_existing_strikes_survive_reset_and_later_strike_counts_even_in_same_second(self):
         timestamp = 1_700_000_000
@@ -79,6 +82,42 @@ class WarningAdjustmentSQLTests(unittest.TestCase):
         self.assertEqual(self.get_count(-100, 22, now + 1), 1)
         self.violation(-100, 22, 3, now + 601)
         self.assertEqual(self.get_count(-100, 22, now + 1), 2)
+
+    def test_same_update_replayed_after_new_strike_does_not_erase_it(self):
+        when = 1_700_000_000
+        self.violation(-100,22,401,when)
+        self.db.execute(self.upsert,(900,-100,22,0,11,when))
+        self.violation(-100,22,402,when+1)
+        self.assertEqual(self.get_count(-100,22,when-7*86400),1)
+        self.db.execute(self.upsert,(900,-100,22,0,11,when+2))
+        self.assertEqual(self.get_count(-100,22,when-7*86400),1)
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM warning_edit_receipts").fetchone(),(1,))
+
+    def test_reset_prevents_late_pending_creation_but_preserves_new_violation(self):
+        when = 1_700_000_000
+        for mid in [401,402,403]: self.violation(-100,22,mid,when)
+        self.set_count(-100,22,0,when)
+        self.assertIsNone(self.db.execute(self.pending_sql,(-100,22,403,when+1,when+61)).fetchone())
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM pending_bans WHERE chat_id=-100 AND user_id=22").fetchone())
+        self.violation(-100,22,404,when+1)
+        self.assertIsNotNone(self.db.execute(self.pending_sql,(-100,22,404,when+1,when+61)).fetchone())
+
+    def test_reset_and_pending_cancel_are_atomic_group_scoped(self):
+        when = 1_700_000_000
+        self.violation(-100,22,500,when)
+        self.violation(-200,22,600,when)
+        for chat,mid in [(-100,500),(-200,600)]:
+            self.db.execute("INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at) VALUES(?,?,?, ?,?)",
+                            (chat,22,mid,when,when+60))
+        self.set_count(-100,22,0,when)
+        self.assertEqual(self.db.execute(
+            "SELECT status FROM pending_bans WHERE chat_id=-100").fetchone(),('canceled',))
+        self.assertEqual(self.db.execute(
+            "SELECT status FROM pending_bans WHERE chat_id=-200").fetchone(),('pending',))
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM warning_adjustments WHERE chat_id=-200").fetchone())
 
     def test_schema_constraints_and_idempotent_existing_database_setup(self):
         for chat, user, count, actor in [(1, 22, 2, 11), (-100, -22, 2, 11),

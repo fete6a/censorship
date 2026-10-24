@@ -262,7 +262,11 @@ async fn review_with_policy_cache(
                 match tg::mute_one_minute(env, chat_id, user_id).await {
                     Ok(deadline) => {
                         // D1 is authoritative; Cron recovers if delayed Queue delivery fails.
-                        store::create_pending(env, chat_id, user_id, msg_id, deadline).await?;
+                        let created=store::create_pending_after_warning_check(env, chat_id, user_id, msg_id, deadline).await?;
+                        if !created {
+                            store::set_strike_action(env,chat_id,msg_id,"warning_adjusted_no_pending").await?;
+                            notice="管理员已调整警告，旧违规不再创建待封禁任务；临时禁言会自行到期。".into();
+                        } else {
                         store::set_strike_action(env, chat_id, msg_id, "muted_pending").await?;
                         let timer = json!({"kind":"ban_check","chat_id":chat_id,
                             "user_id":user_id,"message_id":msg_id});
@@ -270,6 +274,7 @@ async fn review_with_policy_cache(
                             console_error!("ban_timer_enqueue_failed: {}",error);
                         }
                         notice = format!("已禁言 60 秒，到期后封禁。取消命令：/cancel {user_id}");
+                        }
                     }
                     Err(error) => {
                         store::set_strike_action(env, chat_id, msg_id, "mute_failed").await?;
@@ -516,29 +521,25 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                     "用法：/warnings USER_ID [0-3]（私聊：/warnings GROUP_ID USER_ID [0-3]）。\n只允许指定正整数用户 ID；警告次数为 0 至 3。").await?;
                 return Ok(true);
             };
-            let mut pending_canceled=false;
+            let mut adjustment_applied=false;
             if let Some(count)=desired {
-                store::set_warning_count(env,chat_id,user_id,count,actor).await?;
-                // A manual correction must not leave a stale automatic ban in
-                // flight. Only unmute when Telegram still shows our precise
-                // temporary restriction, never override a human restriction.
-                if let Some(case)=store::cancel_pending(env,chat_id,user_id,actor,"warning_count_adjusted").await? {
-                    pending_canceled=true;
-                    let restore=match tg::get_member(env,chat_id,user_id).await {
-                        Ok(member)=>field_str(&member,"status")=="restricted" &&
-                            field_int(&member,"until_date")==Some(case.due_at),
-                        Err(_)=>false,
-                    };
-                    if restore {let _=tg::unmute(env,chat_id,user_id).await;}
-                }
+                let update_id=field_int(msg,"_update_id")
+                    .ok_or_else(||fail("Warning command missing update ID"))?;
+                // The receipt trigger applies baseline and cancels pending ban
+                // atomically. A replay never moves the snapshot past new strikes.
+                adjustment_applied=store::set_warning_count(
+                    env,chat_id,user_id,count,actor,update_id).await?;
+                // Do not call Telegram unmute: a concurrent human restriction
+                // could match the previously observed expiry or change afterward.
+                // Our one-minute restriction expires automatically.
             }
             let count=store::recent_strikes(env,chat_id,user_id).await?;
             let bar=crate::formatting::progress_bar(count as f64,3.0,3);
             let detail=if desired.is_some() {
-                if pending_canceled {
-                    "结果：警告次数已更新；已取消尚未执行的自动封禁。"
+                if adjustment_applied {
+                    "结果：警告次数已更新；已取消尚未执行的待封禁任务。原临时禁言最多持续到到期时间。"
                 } else {
-                    "结果：警告次数已更新；未触发新的处罚。"
+                    "结果：重复更新已忽略；不会覆盖之后产生的新违规。"
                 }
             } else {"结果：仅查询，未修改警告次数。"};
             let response=format!("群组：{chat_id}\n用户：{user_id}\n近 7 天警告：{count}/3  {bar}\n{detail}\n说明：手动设置 7 天后到期；新违规会继续累计。");
@@ -702,7 +703,9 @@ async fn process_update_with_policy_cache(
     }
     // Private admin commands include the negative chat id as their first arg.
     if field_str(&msg["chat"],"type") == "private" {
-        let _=handle_admin_command(env,msg).await?;
+        let mut with_update=msg.clone();
+        with_update["_update_id"]=json!(update_id);
+        let _=handle_admin_command(env,&with_update).await?;
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }
@@ -728,7 +731,9 @@ async fn process_update_with_policy_cache(
             return Err(error);
         }
     };
-    if handle_admin_command(env,msg).await? || !enrolled {
+    let mut with_update=msg.clone();
+    with_update["_update_id"]=json!(update_id);
+    if handle_admin_command(env,&with_update).await? || !enrolled {
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }
