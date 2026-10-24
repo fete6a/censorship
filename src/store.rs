@@ -127,9 +127,15 @@ pub async fn has_strike(env: &Env, chat_id: i64, message_id: i64) -> Result<bool
 }
 
 pub async fn add_strike(env: &Env, chat_id: i64, message_id: i64, user_id: i64, category: &str, probability: f64) -> Result<()> {
+    // SQLite may reuse rowids after retention deletes the last violation.
+    // Stay above this user's manual baseline even when that history is gone.
+    // The allocation and insert are one statement, serialized by SQLite.
     env.d1("DB")?.prepare(
-        "INSERT OR IGNORE INTO violations(chat_id,user_id,message_id,created_at,category,probability,severity,action) \
-         VALUES(?,?,?,?,?,?,0,'deleted')"
+        "INSERT INTO violations(rowid,chat_id,user_id,message_id,created_at,category,probability,severity,action) \
+         SELECT MAX(COALESCE((SELECT MAX(rowid) FROM violations),0), \
+           COALESCE((SELECT violation_rowid FROM warning_adjustments WHERE chat_id=?1 AND user_id=?3),0))+1, \
+           ?1,?3,?2,?4,?5,?6,0,'deleted' WHERE true \
+         ON CONFLICT(chat_id,message_id) DO NOTHING"
     ).bind(&[
         js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),
         js_str(category),JsValue::from_f64(probability),

@@ -43,3 +43,5 @@ The combined release also requires scan_jobs.generation, lease_id and lease_unti
 ## External-operation boundary
 
 `/cancel` never changes Telegram permissions. Warning adjustments cancel pending database work and fence retries; neither command can recall a ban already sent to Telegram. Historical scans fence writes by generation and Cron lease. After a stop, a successful deletion already in flight is recorded, but new mute/ban scheduling is suppressed. A mute already in flight may still complete; an obsolete scan cannot persist a new pending ban afterwards. Telegram offers no conditional transaction spanning D1, member permissions and administrator role changes, so last-moment human edits still require operational review.
+
+Violation insertion allocates an ID above both the remaining history and the user's warning baseline, so retention cannot hide a new strike by reusing an old SQLite rowid. Do not rebuild or VACUUM the violations table independently of its baselines: the implicit rowids are part of the application's warning ordering.

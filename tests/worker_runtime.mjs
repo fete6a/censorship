@@ -178,7 +178,7 @@ function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remov
             if(j&&j.generation===values[1]&&j.lease_id===values[2])j.claimed=false;
           }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
-          if (sql.includes('INSERT OR IGNORE INTO violations')) {
+          if (sql.includes('INSERT INTO violations')) {
             const key=`${values[0]}:${values[2]}`;
             if(!strikes.has(key))strikeEvents.push({key:`${values[0]}:${values[1]}`,messageId:values[2]});
             strikes.add(key);
@@ -586,7 +586,7 @@ await test('noul violation score drives automatic deletion without an allow choi
  await f.consume(message(groupA,704));
  assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[704]);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'deleted');
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.aiCalls[0].input.questions.action,undefined);
  assert.equal(f.aiCalls[0].input.questions.violation.type,'noul');
 });
@@ -617,7 +617,7 @@ await test('other and adult categories behave like none, without punishment or d
     assert.deepEqual(f.reviews.get(`${groupA}:1707`),
       {last_status:expected,last_category:'none',last_probability:score});
     assert.equal(f.telegram.some(c=>['deleteMessage','restrictChatMember','banChatMember'].includes(c.method)),false);
-    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,0);
+    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,0);
     const digest=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id>0)?.args.text||'';
     assert.ok(digest.includes(expected==='needs_review'?'人工复核':'通过'));
     assert.ok(!digest.includes('其他违反群规'));
@@ -644,7 +644,7 @@ await test('edited message crossing threshold creates only one deletion and stri
  await f.consume({update_id:712,edited_message:{...original.message,text:'Edited text again'}});
  assert.equal(f.aiCalls.length,3);
  assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.statements.filter(s=>s.sql.includes('UPDATE archived_messages')).at(-1)?.values[0],'previously_deleted');
 });
 
@@ -1060,7 +1060,7 @@ await test('single /scan enforces by default only in a group with enforcement en
   commandUpdate.message.reply_to_message=message(groupA,2201).message;
   await enforcing.consume(commandUpdate);
   assert.equal(enforcing.telegram.filter(x=>x.method==='deleteMessage').length,1);
-  assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT OR IGNORE INTO violations')));
+  assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT INTO violations')));
   assert.equal(enforcing.reviews.get(`${groupA}:2201`)?.last_status,'deleted');
   assert.match(enforcing.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/已删除/);
 
@@ -1208,7 +1208,7 @@ await test('missing warning table blocks deletion before Telegram or strike writ
  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
  await f.consume(message(groupA,3100),{retry:true});
  assert.equal(f.telegram.some(call=>call.method==='deleteMessage'),false);
- assert.equal(f.statements.some(s=>s.sql.includes('INSERT OR IGNORE INTO violations')),false);
+ assert.equal(f.statements.some(s=>s.sql.includes('INSERT INTO violations')),false);
  assert.equal(f.completed.has(3100),false);
  assert.equal(f.archives.has(String(groupA)+':3100'),true,'archival can precede the failed preflight');
  assert.ok(f.statements.some(s=>s.operation==='read' && s.sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')), 'pre-deletion warning-count D1 query must be attempted');
@@ -1231,12 +1231,12 @@ await test('post-delete count failure is a partial result, and retry avoids dupl
  const update=message(groupA,3102);
  await f.consume(update,{retry:true});
  assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.completed.has(3102),false);
  assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'pending');
  await f.consume(update);
  assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'previously_deleted');
  assert.equal(f.telegram.some(call=>call.method==='restrictChatMember'),false);
 });
