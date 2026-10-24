@@ -66,7 +66,16 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             const ids=[...archives.keys()].filter(key=>key.startsWith(`${values[0]}:`)).map(key=>Number(key.split(':')[1]));
             return {max_id:ids.length?Math.max(...ids):0};
           }
-          if (sql.includes('FROM scan_jobs')) return jobs.get(values[0]) || null;
+          if (sql.includes('FROM scan_jobs')) {
+            if(sql.includes("status='running'")) return [...jobs.values()].find(j=>j.status==='running') || null;
+            return jobs.get(values[0]) || null;
+          }
+          if (sql.includes('INSERT INTO scan_jobs') && sql.includes('RETURNING max_message_id')) {
+            if(jobs.get(values[0])?.status==='running') return null;
+            const job={chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running'};
+            jobs.set(values[0],job);
+            return {max_id:job.max_message_id};
+          }
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
           if (sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')) {
             const key=`${values[0]}:${values[1]}`,entry=warningAdjustments.get(key);
@@ -108,7 +117,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
             settings.set(values[0], row);
           }
-          if (sql.includes('INSERT INTO scan_jobs')) jobs.set(values[0],{chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running'});
+          if (sql.includes('INSERT INTO scan_jobs')) throw new Error('Scan start must use atomic RETURNING');
           if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[1])) jobs.get(values[1]).status='stopped';
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
           if (sql.includes('INSERT OR IGNORE INTO violations')) {
@@ -1097,4 +1106,52 @@ await test('warning count rejects invalid user IDs and out-of-range counts witho
   assert.ok(!f.statements.some(x=>x.sql.includes('INSERT INTO warning_adjustments')),text);
   assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/参数错误/,text);
  }
+});
+
+await test('bulk scan modes and rejected flags',async()=>{
+ for(const [line,enforce] of [['/scan_all',1],['/scan_all enforce',1],['/scan_all audit',0]]){
+  const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  f.archives.set(groupA+':3001',message(groupA,3001).message);
+  await f.consume(command(line,{id:groupA,type:'supergroup'}));
+  assert.equal(f.jobs.get(groupA)?.enforce,enforce,line);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',enforce?/执行模式/:/仅审计/,line);
+ }
+ for(const line of ['/scan_all invalid','/scan_all audit enforce','/scan_all enforce audit']){
+  const f=fixture();await f.consume(command(line,{id:groupA,type:'supergroup'}));
+  assert.equal(f.jobs.size,0,line);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/参数错误/,line);
+ }
+});
+
+await test('bulk scan respects group dry-run',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ await f.consume(command('/scan_all',{id:groupA,type:'supergroup'}));
+ assert.equal(f.jobs.get(groupA)?.enforce,1);
+ assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/模拟模式.*不执行处罚/);
+ assert.equal(f.telegram.some(x=>x.method==='deleteMessage'),false);
+});
+
+await test('duplicate bulk scan does not override active job and stop permits restart',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.archives.set(groupA+':3002',message(groupA,3002).message);
+ await f.consume(command('/scan_all audit',{id:groupA,type:'supergroup'}));
+ const job=f.jobs.get(groupA);job.cursor_message_id=100;job.scanned=3;
+ const second=command('/scan_all enforce',{id:groupA,type:'supergroup'});second.update_id=3003;
+ await f.consume(second);
+ assert.strictEqual(f.jobs.get(groupA),job);
+ assert.equal(job.cursor_message_id,100);assert.equal(job.scanned,3);assert.equal(job.enforce,0);
+ assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/扫描进行中/);
+ const stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=3004;await f.consume(stop);
+ assert.equal(job.status,'stopped');
+ const restart=command('/scan_all enforce',{id:groupA,type:'supergroup'});restart.update_id=3005;await f.consume(restart);
+ assert.equal(f.jobs.get(groupA).enforce,1);assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+});
+
+await test('bulk scan cannot operate on unauthorized target group',async()=>{
+ const denied=fixture();await denied.consume(command('/scan_all '+groupB+' enforce'));
+ assert.equal(denied.jobs.size,0);
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(command('/scan_all audit',{id:groupA,type:'supergroup'}));
+ assert.equal(f.jobs.get(groupA).enforce,0);assert.equal(f.jobs.has(groupB),false);
+ assert.ok(f.statements.filter(x=>x.sql.includes('INSERT INTO scan_jobs')).every(x=>x.values[0]===groupA));
 });
