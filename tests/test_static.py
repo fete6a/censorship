@@ -151,6 +151,7 @@ class SmokeTests(unittest.TestCase):
         other=claim(-200)
         self.assertIsNotNone(other)
         self.assertEqual(advance(-100,new,17,0),(-100,))
+        new=(new[0],new[1],17)  # successful advance updates the Worker's local cursor
         self.assertEqual(finish(-100,new),(-100,))
         self.assertIsNone(finish(-100,new),'completion must be exactly once')
         self.assertEqual(advance(-200,other,17,1),(-200,))
