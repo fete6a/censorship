@@ -976,3 +976,123 @@ await test('rule descriptions escape Markdown while action and digest details us
  assert.ok(!groupNotice.includes('/3030)'), 'deleted message link is not presented');
  assert.ok(outputs.every(x=>x.length<4096),'Telegram message size stays within limit');
 });
+
+
+await test('single /scan enforces by default only in a group with enforcement enabled',async()=>{
+  const enforcing=fixture({remove:true,score:0.99,strikeCount:1});
+  enforcing.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  const commandUpdate=command('/scan',{id:groupA,type:'supergroup'});
+  commandUpdate.message.reply_to_message=message(groupA,2201).message;
+  await enforcing.consume(commandUpdate);
+  assert.equal(enforcing.telegram.filter(x=>x.method==='deleteMessage').length,1);
+  assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT OR IGNORE INTO violations')));
+  assert.equal(enforcing.reviews.get(`\${groupA}:2201`)?.last_status,'deleted');
+  assert.match(enforcing.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/已删除/);
+
+  const dry=fixture({remove:true,score:0.99});
+  dry.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  const dryUpdate=command('/scan',{id:groupA,type:'supergroup'});
+  dryUpdate.message.reply_to_message=message(groupA,2202).message;
+  await dry.consume(dryUpdate);
+  assert.equal(dry.telegram.some(x=>x.method==='deleteMessage'),false);
+  assert.equal(dry.reviews.get(`\${groupA}:2202`)?.last_status,'dry_run_flag');
+  assert.match(dry.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/dry\\-run.*未执行处罚/);
+});
+
+await test('single /scan audit explicitly remains non-punitive even when enforcement is enabled',async()=>{
+  for(const dry_run of [0,1]){
+    const f=fixture({remove:true,score:0.99});
+    f.settings.set(groupA,{dry_run,logs_enabled:0});
+    const update=command('/scan audit',{id:groupA,type:'supergroup'});
+    update.message.reply_to_message=message(groupA,2203).message;
+    await f.consume(update);
+    assert.equal(f.telegram.some(x=>['deleteMessage','restrictChatMember','banChatMember'].includes(x.method)),false);
+    assert.equal(f.reviews.get(`\${groupA}:2203`)?.last_status,'audit_flag');
+    assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/仅审计，未执行处罚/);
+  }
+});
+
+await test('single scan rejects invalid flags and nonpositive message IDs before D1 archive access',async()=>{
+  for(const text of ['/scan nonsense','/scan 0','/scan -100200','/scan 2201 audit enforce','/scan audit 2201']){
+    const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+    await f.consume(command(text,{id:groupA,type:'supergroup'}));
+    assert.equal(f.aiCalls.length,0,text);
+    assert.ok(!f.statements.some(x=>x.sql.includes('SELECT payload FROM archived_messages')),text);
+    assert.ok(!f.telegram.some(x=>x.method==='deleteMessage'),text);
+    assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/参数错误/,text);
+  }
+});
+
+await test('authorized group admin can set and query one member warning count without touching original strikes',async()=>{
+  const f=fixture({strikeCount:2});
+  f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  const set=command('/warnings 22 0',{id:groupA,type:'supergroup'});set.update_id=2600;
+  await f.consume(set);
+  assert.equal(f.warningAdjustments.get(`\${groupA}:22`)?.count,0);
+  const writes=f.statements.filter(x=>x.sql.includes('INSERT INTO warning_adjustments'));
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].values.slice(0,3),[groupA,22,0]);
+  assert.equal(f.telegram.some(x=>['deleteMessage','restrictChatMember','banChatMember'].includes(x.method)),false);
+  assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/0\\/3/);
+  const query=command('/warnings 22',{id:groupA,type:'supergroup'});query.update_id=2601;
+  await f.consume(query);
+  assert.equal(f.statements.filter(x=>x.sql.includes('INSERT INTO warning_adjustments')).length,1);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/仅查询.*未修改警告次数/);
+  assert.equal(f.warningAdjustments.has(`\${groupB}:22`),false);
+});
+
+await test('manual warning adjustments count only subsequent violations without duplicate punishment',async()=>{
+  const f=fixture({remove:true,score:0.99,strikeCount:2});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  const reset=command('/warnings 22 0',{id:groupA,type:'supergroup'});reset.update_id=2700;
+  await f.consume(reset);
+  await f.consume(message(groupA,2701));
+  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+  assert.equal(f.telegram.some(x=>x.method==='restrictChatMember'),false);
+  assert.match(f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA)?.args.text||'',/1\\/3/);
+  const set=command('/warnings 22 3',{id:groupA,type:'supergroup'});set.update_id=2702;
+  await f.consume(set);
+  assert.equal(f.telegram.filter(x=>x.method==='restrictChatMember').length,0,'setting 3 is not itself a penalty');
+  await f.consume(message(groupA,2703));
+  assert.equal(f.telegram.filter(x=>x.method==='restrictChatMember').length,1,'next actionable violation can escalate');
+  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,2);
+});
+
+await test('warning management is isolated by exact target group and rejects unauthorized or anonymous actors',async()=>{
+  const privateDenied=fixture();
+  await privateDenied.consume(command(`/warnings \${groupB} 22 3`));
+  assert.deepEqual(privateDenied.telegram.filter(x=>x.method==='getChatMember').map(x=>x.args),
+    [{chat_id:groupB,user_id:11}]);
+  assert.equal(privateDenied.statements.some(x=>x.sql.includes('warning_adjustments')),false);
+
+  for(const text of [`/warnings \${groupB} 2`,'/warnings 22 2 extra','/warnings -22 2']){
+    const f=fixture();
+    await f.consume(command(text,{id:groupA,type:'supergroup'}));
+    assert.equal(f.warningAdjustments.size,0,text);
+    assert.ok(!f.statements.some(x=>x.sql.includes('warning_adjustments')),text);
+    assert.ok(!f.telegram.some(x=>x.method==='getChatMember'&&x.args.chat_id===groupB),text);
+  }
+  for(const anonymous of [true,false]) {
+    const f=fixture();
+    const update=message(groupA,2800+(anonymous?1:0));update.message.text='/warnings 22 3';
+    if(anonymous)update.message.sender_chat={id:groupA};
+    await f.consume(update);
+    assert.equal(f.warningAdjustments.size,0);
+    assert.equal(f.aiCalls.length,1,'denied group commands remain ordinary moderated messages');
+  }
+  const allowed=fixture();
+  const okay=command(`/warnings \${groupA} 22 2`);okay.update_id=2805;
+  await allowed.consume(okay);
+  assert.equal(allowed.warningAdjustments.get(`\${groupA}:22`)?.count,2);
+  assert.equal(allowed.warningAdjustments.has(`\${groupB}:22`),false);
+});
+
+await test('warning count rejects invalid user IDs and out-of-range counts without D1 writes',async()=>{
+ for(const text of ['/warnings','/warnings 22 -1','/warnings 22 4','/warnings 22 99','/warnings 22 nan','/warnings 0 2','/warnings -100200 2']){
+  const f=fixture();
+  await f.consume(command(text,{id:groupA,type:'supergroup'}));
+  assert.equal(f.warningAdjustments.size,0,text);
+  assert.ok(!f.statements.some(x=>x.sql.includes('INSERT INTO warning_adjustments')),text);
+  assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/参数错误/,text);
+ }
+});
