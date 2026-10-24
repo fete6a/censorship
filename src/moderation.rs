@@ -224,6 +224,13 @@ async fn review_with_policy_cache(
         store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
         return Ok(true);
     }
+    // Migration safety: validate warning-count SQL before irreversible Telegram
+    // deletion. Do not silently substitute an old-schema count: it could ignore
+    // manual adjustments and change whether a user is automatically punished.
+    // The post-insert count remains authoritative if adjustments race this read.
+    if let Some(user_id) = user {
+        let _ = store::recent_strikes(env, chat_id, user_id).await?;
+    }
     tg::delete(env, chat_id, msg_id).await?;
 
     let mut notice = String::new();

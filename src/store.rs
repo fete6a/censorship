@@ -241,9 +241,18 @@ pub async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[js_i64(now()-14*86400)])?.run().await?;
     env.d1("DB")?.prepare("DELETE FROM violations WHERE created_at<?")
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
-    // Expired manual baselines must not linger indefinitely.
-    env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
-        .bind(&[js_i64(now()-7*86400)])?.run().await?;
+    // During an accidental old-schema rollout, never let a missing optional
+    // cleanup table prevent archived-message and pending-ban housekeeping.
+    // Suppress ONLY this exact missing-table error, not D1 outages or drift.
+    let warning_cleanup = env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
+        .bind(&[js_i64(now()-7*86400)])?.run().await;
+    if let Err(error) = warning_cleanup {
+        if error.to_string().contains("no such table: warning_adjustments") {
+            worker::console_error!("warning_adjustments_missing: migrate production D1 before release");
+        } else {
+            return Err(error);
+        }
+    }
     let keep_days = crate::util::config(env,"ARCHIVE_DAYS").parse::<i64>().unwrap_or(0);
     if keep_days > 0 {
         env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")
