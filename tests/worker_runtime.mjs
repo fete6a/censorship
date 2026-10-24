@@ -35,9 +35,9 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, actionChoice = null, categoryChoice = null, actionConfidence = null, categoryConfidence = 1, scores = null } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null } = {}) {
   const settings = new Map();
-  const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), errors = [], aiCalls = [];
+  const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
   class WorkerQueue {
     async send(body, options) {
@@ -60,6 +60,8 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
           if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
           if (sql.includes('pending_bans')) return null;
+          if (sql.includes('SELECT last_status,last_category,last_probability FROM archived_messages'))
+            return reviews.get(`${values[0]}:${values[1]}`) || null;
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
           if (sql.includes('managed_chats')) return { status: 'active', chat_type: 'supergroup' };
           throw new Error(`Unexpected D1 read: ${sql}`);
@@ -73,6 +75,10 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
           if (sql.includes('INSERT OR IGNORE INTO violations')) strikes.add(`${values[0]}:${values[2]}`);
+          if (sql.includes('INSERT INTO archived_messages'))
+            reviews.set(`${values[0]}:${values[1]}`, {last_status:'pending',last_category:'none',last_probability:0});
+          if (sql.includes('UPDATE archived_messages'))
+            reviews.set(`${values[4]}:${values[5]}`, {last_status:values[0],last_category:values[1],last_probability:values[2]});
           return { success: true, results: [], meta: { duration: 0, changes: 1, last_row_id: 0,
             changed_db: false, size_after: 0, rows_read: 0, rows_written: 1 } };
         },
@@ -82,9 +88,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
   class Ai {
     async run(model, input) {
       aiCalls.push({ model, input: JSON.parse(JSON.stringify(input)) });
-      const currentScore = scores?.[aiCalls.length - 1] ?? score;
+      const currentScore = remove ? (scores?.[aiCalls.length - 1] ?? score) : 0;
       return { answers: {
-        action: { type: 'choice', choice: actionChoice ?? (remove ? 'remove' : 'allow'), confidence: actionConfidence ?? (remove ? currentScore : 1), probabilities: { allow: remove ? 1-currentScore : 1, review: 0, remove: remove ? currentScore : 0 } },
+        violation: { type: 'noul', noul: currentScore },
         category: { type: 'choice', choice: categoryChoice ?? (remove ? 'spam' : 'none'), confidence: categoryConfidence, probabilities: { none: remove ? 0 : 1, spam: remove ? 1 : 0 } },
         severity: { type: 'choice', choice: 'none', confidence: 1, probabilities: { none: 1, critical: 0 } },
       } };
@@ -115,15 +121,24 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
   const env = { WEBHOOK_SECRET: secret, BOT_TOKEN: 'test-only-token', MODERATION_QUEUE: new WorkerQueue(),
     DB: new D1Database(), AI: new Ai(), DRY_RUN: 'true', BOT_USERNAME: 'example_bot' };
   const worker = new module.namespace.default({ waitUntil() {} }, env);
-  async function consume(update, { retry = false } = {}) {
-    let acked = false, retried = false;
-    await worker.queue({ queue: 'moderation', messages: [{ id: 'test-message', timestamp: new Date(),
-      body: update, attempts: 1, ack() { acked = true; }, retry() { retried = true; } }],
-      ackAll() { acked = true; }, retryAll() { retried = true; } });
-    assert.equal(retried, retry);
-    assert.equal(acked, !retry);
+  async function consumeBatch(updates) {
+    const outcomes=updates.map(()=>({acked:false,retried:false}));
+    await worker.queue({ queue: 'moderation', messages: updates.map((update,i)=>({
+      id: `test-message-${i}`, timestamp: new Date(), body:update, attempts:1,
+      ack(){outcomes[i].acked=true;},retry(){outcomes[i].retried=true;}
+    })),
+      ackAll(){ for(const o of outcomes)o.acked=true; },
+      retryAll(){for(const o of outcomes)o.retried=true;}
+    });
+    return outcomes;
   }
-  return { worker, deliveries, statements, telegram, completed, errors, aiCalls, settings, consume, env };
+  async function consume(update, { retry = false } = {}) {
+    const [outcome]=await consumeBatch([update]);
+    assert.equal(outcome.retried,retry);
+    assert.equal(outcome.acked,!retry);
+  }
+  return { worker, deliveries, statements, telegram, completed, errors, aiCalls,
+    settings, reviews, consume, consumeBatch, env };
 }
 
 await test('webhook preserves nested payload and IDs through JSON queue delivery', async () => {
@@ -171,8 +186,9 @@ await test('AI binding receives plain JSON state and nested questions for a grou
   const input = f.aiCalls[0].input;
   assert.equal(input.state?.group_description, 'Do not post advertisements');
   assert.equal(input.state?.message_text, 'A normal message');
-  assert.equal(input.questions?.action?.type, 'choice');
-  assert.deepEqual(Object.keys(input.questions.action.criteria).sort(), ['allow', 'remove', 'review']);
+  assert.equal(input.questions?.violation?.type, 'noul');
+  assert.equal(input.questions?.action, undefined, 'model never chooses allow/remove');
+  assert.deepEqual(Object.keys(input.questions.violation.criteria).sort(), ['false', 'true']);
   for (const field of ['images', 'audio', 'videos']) assert.deepEqual(input[field], []);
   const reviewed = f.statements.find(s => s.sql.includes('UPDATE archived_messages'));
   assert.equal(reviewed?.values[0], 'allow');
@@ -357,46 +373,44 @@ await test('invalid thresholds do not overwrite the last valid setting',async()=
  }
 });
 
-await test('remove probability above per-group threshold overrides contradictory action choice',async()=>{
- for(const action of ['allow','review','remove']){
-  const f=fixture({remove:true,score:0.916,actionChoice:action,actionConfidence:0.2,
-    categoryChoice:'harassment',categoryConfidence:0.2});
-  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
-  await f.consume(message(groupA,704));
-  assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[704]);
-  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'deleted');
-  assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
-  assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
- }
+await test('noul violation score drives automatic deletion without an allow choice',async()=>{
+ const f=fixture({remove:true,score:0.916,categoryChoice:'harassment',categoryConfidence:0.2});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+ await f.consume(message(groupA,704));
+ assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[704]);
+ assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'deleted');
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.aiCalls[0].input.questions.action,undefined);
+ assert.equal(f.aiCalls[0].input.questions.violation.type,'noul');
 });
-await test('remove threshold comparison is inclusive and default remains 0.93',async()=>{
+await test('violation score threshold is inclusive and default remains 0.93',async()=>{
  for(const [score,shouldDelete] of [[0.7999,false],[0.8,true],[0.916,true]]){
-  const f=fixture({remove:true,score,actionChoice:'allow',categoryChoice:'harassment'});
+  const f=fixture({remove:true,score,categoryChoice:'harassment'});
   f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
   await f.consume(message(groupA,705));
   assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),shouldDelete);
  }
- const f=fixture({remove:true,score:0.916,actionChoice:'allow',categoryChoice:'harassment'});
+ const f=fixture({remove:true,score:0.916,categoryChoice:'harassment'});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
  await f.consume(message(groupA,706));
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
 });
-await test('contradictory high score with category none is needs_review not allow',async()=>{
- const f=fixture({remove:true,score:0.99,actionChoice:'allow',categoryChoice:'none'});
+await test('high violation score with category none is needs_review instead of allow',async()=>{
+ const f=fixture({remove:true,score:0.99,categoryChoice:'none'});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
  await f.consume(message(groupA,707));
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
 });
-await test('model chooses remove below threshold is needs_review rather than allow',async()=>{
- const f=fixture({remove:true,score:0.6,actionChoice:'remove',categoryChoice:'harassment'});
+await test('score below threshold is allow as computed by Rust, not a model label',async()=>{
+ const f=fixture({remove:true,score:0.6,categoryChoice:'harassment'});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
  await f.consume(message(groupA,708));
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
- assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
+ assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'allow');
 });
-await test('edited message crosses threshold then receives only one strike and deletion',async()=>{
- const f=fixture({remove:true,scores:[0.75,0.916,0.99],actionChoice:'allow',categoryChoice:'harassment'});
+await test('edited message crossing threshold creates only one deletion and strike',async()=>{
+ const f=fixture({remove:true,scores:[0.75,0.916,0.99],categoryChoice:'harassment'});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
  const original=message(groupA,710);
  await f.consume(original);
