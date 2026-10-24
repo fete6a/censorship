@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -61,10 +61,23 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
           if (sql.includes('pending_bans')) return null;
           if (sql.includes('SELECT last_status,last_category,last_probability FROM archived_messages'))
-            return reviews.get(`${values[0]}:${values[1]}`) || null;
+            {if(digestFail && values[0]===groupA)throw new Error('digest read unavailable');return reviews.get(`${values[0]}:${values[1]}`) || null;}
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
           if (sql.includes('managed_chats')) return { status: 'active', chat_type: 'supergroup' };
           throw new Error(`Unexpected D1 read: ${sql}`);
+        },
+        async all() {
+          statements.push({sql,values,operation:'read'});
+          if(!sql.includes('FROM archived_messages'))throw new Error(`Unexpected D1 all: ${sql}`);
+          if(digestFail && values[0]===groupA)throw new Error('digest read unavailable');
+          const ids=JSON.parse(values[1]);
+          const results=[...new Set(ids)].sort((a,b)=>a-b).flatMap(message_id=>{
+            const row=reviews.get(`${values[0]}:${message_id}`);
+            return !row||row.last_status==='pending'?[]:[{message_id,status:row.last_status,
+              category:row.last_category,probability:row.last_probability}];
+          });
+          return {success:true,results,meta:{duration:0,changes:0,last_row_id:0,
+            changed_db:false,size_after:0,rows_read:results.length,rows_written:0}};
         },
         async run() {
           statements.push({ sql, values, operation: 'write' });
@@ -524,4 +537,37 @@ await test('failed public notification does not retry a completed deletion',asyn
 await test('dry-run does not announce deletion or ban in the group',async()=>{
  const f=fixture({remove:true});await f.consume(message(groupA,613));
  assert.equal(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id<0),false);
+});
+
+
+await test('20 reviewed updates use one final-status read per group',async()=>{
+ const f=fixture();const outcomes=await f.consumeBatch(Array.from({length:20},(_,i)=>message(groupA,1000+i)));
+ assert.ok(outcomes.every(x=>x.acked&&!x.retried));
+ const reads=f.statements.filter(s=>s.operation==='read'&&s.sql.includes('FROM archived_messages'));
+ assert.equal(reads.length,1,'read the final committed statuses together');
+ assert.equal(f.telegram.filter(c=>c.method==='sendMessage').length,1);
+ assert.match(f.telegram.find(c=>c.method==='sendMessage').args.text,/20 条/);
+});
+await test('logs off skips all passive status reads and admin lookups',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consumeBatch(Array.from({length:20},(_,i)=>message(groupA,1100+i)));
+ assert.equal(f.statements.filter(s=>s.operation==='read'&&s.sql.includes('FROM archived_messages')).length,0);
+ assert.equal(f.telegram.filter(c=>c.method==='getChatAdministrators').length,0);
+ assert.equal(f.aiCalls.length,20);
+});
+await test('multi-chunk digest fetches the current group administrators once',async()=>{
+ const f=fixture({adminsA:[11,12]});
+ await f.consumeBatch(Array.from({length:80},(_,i)=>message(groupA,1200+i)));
+ const sends=f.telegram.filter(c=>c.method==='sendMessage');
+ assert.ok(sends.filter(c=>c.args.chat_id===11).length>1,'test spans multiple chunks');
+ assert.equal(f.telegram.filter(c=>c.method==='getChatAdministrators').length,1);
+ for(const id of [11,12])assert.ok(sends.filter(c=>c.args.chat_id===id).every(c=>c.args.text.length<4096));
+ assert.ok(sends.every(c=>[11,12].includes(c.args.chat_id)));
+});
+await test('a failed digest read cannot retry completed reviews or suppress another group digest',async()=>{
+ const f=fixture({digestFail:true});
+ const outcomes=await f.consumeBatch([message(groupA,1400),message(groupB,1401)]);
+ assert.ok(outcomes.every(x=>x.acked&&!x.retried));
+ assert.equal(f.completed.size,2);
+ assert.deepEqual(f.telegram.filter(c=>c.method==='sendMessage').map(c=>c.args.chat_id),[21]);
 });

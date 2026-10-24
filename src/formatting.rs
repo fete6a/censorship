@@ -1,6 +1,6 @@
 //! Telegram MarkdownV2 presentation: untrusted text is always escaped.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct ReviewLine {
     pub message_id: i64,
     pub status: String,
@@ -84,6 +84,7 @@ pub fn review_digest(chat_id: i64, rows: &[ReviewLine]) -> Vec<String> {
     if rows.is_empty(){return vec![];}
     let mut result=Vec::new();
     let mut body=String::new();
+    let mut body_units=0;
     let mut count=0;
     let flush = |body: &mut String, count: &mut usize, result: &mut Vec<String>| {
         if *count>0 {
@@ -94,11 +95,14 @@ pub fn review_digest(chat_id: i64, rows: &[ReviewLine]) -> Vec<String> {
     };
     for item in rows {
         let line=row_markdown(chat_id,item);
-        if count>0 && body.encode_utf16().count()+line.encode_utf16().count()>3200 {
+        let line_units=line.encode_utf16().count()+1;
+        if count>0 && body_units+line_units>3200 {
             flush(&mut body,&mut count,&mut result);
+            body_units=0;
         }
         body.push_str(&line);
         body.push('\n');
+        body_units+=line_units;
         count+=1;
     }
     flush(&mut body,&mut count,&mut result);
@@ -153,3 +157,4 @@ mod tests {
         for chunk in &output {assert!(chunk.encode_utf16().count()<4096);}
     }
 }
+

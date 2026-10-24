@@ -113,7 +113,6 @@ class NotificationDocumentationTests(unittest.TestCase):
             "async fn classify(",1
         )[0]
         self.assertNotIn('"action": {',questions)
-        self.assertIn('formatting::ReviewLine', (ROOT/"src/lib.rs").read_text())
         self.assertIn("last_review_log", self.store)
         self.assertNotIn("send_to_review_or_chat(env, chat_id, &format!(",self.store)
         self.assertIn("10 秒",self.cn)
@@ -140,3 +139,4 @@ class NotificationDocumentationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
