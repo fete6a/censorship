@@ -8,7 +8,7 @@ mod store;
 mod tg;
 mod util;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use worker::{console_error, console_log, Context, Env, MessageBatch, MessageExt, Method, Request, Response, Result, ScheduleContext, ScheduledEvent};
 use crate::util::{safe_equal, secret};
@@ -67,24 +67,14 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
     // Queue delivers up to 20 messages accumulated for up to 10 seconds.
     // Punitive actions remain per-message and are acknowledged independently.
     // Passive admin DMs are grouped only after the individual D1 reviews commit.
-    let mut reviewed: BTreeMap<i64, BTreeMap<i64, formatting::ReviewLine>>=BTreeMap::new();
+    let mut reviewed: BTreeMap<i64, BTreeSet<i64>>=BTreeMap::new();
     for message in batch.messages()? {
         match moderation::process_queue_item(&env, message.body()).await {
             Ok(entry) => {
                 message.ack();
                 if let Some((chat_id,message_id))=entry {
                     if chat_id<0 {
-                        match store::last_review_log(&env,chat_id,message_id).await {
-                            Ok(Some(status)) => {
-                                reviewed.entry(chat_id).or_default().insert(message_id, formatting::ReviewLine{
-                                    message_id, status:status.last_status,
-                                    category:status.last_category, probability:status.last_probability
-                                });
-                            },
-                            Ok(None)=>{},
-                            Err(error)=>console_error!("review_digest_lookup_failed chat={} message={} error={}",
-                                chat_id,message_id,error)
-                        }
+                        reviewed.entry(chat_id).or_default().insert(message_id);
                     }
                 }
             },
@@ -94,10 +84,10 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
             }
         }
     }
-    // One admin lookup per group and digest chunk, not one private DM per
-    // allowed message. Never mix group recipients or retry completed actions.
-    for (chat_id,rows) in reviewed {
-        let entries=rows.into_values().collect::<Vec<_>>();
+    // Read final statuses together after all edits in this batch are committed.
+    // Logging-disabled groups skip these reads. Digest failures never retry actions.
+    for (chat_id,ids) in reviewed {
+        let entries=ids.into_iter().collect::<Vec<_>>();
         if let Err(error)=tg::send_review_digest(&env,chat_id,&entries).await {
             console_error!("review_digest_delivery_failed chat={} error={}",chat_id,error);
         }
@@ -121,3 +111,4 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         }
     }
 }
+

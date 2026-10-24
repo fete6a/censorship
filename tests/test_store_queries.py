@@ -31,6 +31,13 @@ class StoreQueryTests(unittest.TestCase):
         self.db.create_function('unixepoch', 0, lambda: timestamp)
         return self.db.execute(query_for('claim_due'), (-100, 42, 1042)).fetchone()
 
+    def test_digest_query_isolates_group_and_requested_final_statuses(self):
+        for chat,msg,status in [(-100,5,'allow'),(-100,6,'deleted'),(-100,7,'pending'),(-100,8,'needs_review'),(-200,5,'deleted')]:
+            self.db.execute("INSERT INTO archived_messages(chat_id,message_id,sent_at,updated_at,payload,last_status,last_category,last_probability) VALUES(?,?,100,100,'{}',?,'spam',0.95)",(chat,msg,status))
+        rows=self.db.execute(query_for('last_review_logs'),(-100,'[6,5,5,7,99]')).fetchall()
+        self.assertEqual(rows,[(5,'allow','spam',0.95),(6,'deleted','spam',0.95)])
+        self.assertEqual(self.db.execute(query_for('last_review_logs'),(-100,'[]')).fetchall(),[])
+
     def test_due_batch_does_not_repeat_one_poison_case(self):
         for user in range(1, 11):
             self.add_case(user, due=150 + user)
@@ -85,3 +92,4 @@ class GroupThresholdTests(unittest.TestCase):
         for value in (-0.1,1.01):
             with self.assertRaises(sqlite3.IntegrityError):
                 self.db.execute(query_for('set_group_threshold'),(-1001,value))
+

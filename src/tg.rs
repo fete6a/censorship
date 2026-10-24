@@ -97,7 +97,7 @@ pub async fn send_group_action_notice(
 }
 
 /// Fetch current human administrators for the exact group; no global DM target.
-async fn send_admin_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
+async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String]) -> Result<()> {
     if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
     let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
         Ok(value)=>value,
@@ -107,8 +107,10 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<
         for member in admins {
             if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
             if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
-                if post_markdown(env,user_id,markdown).await.is_err() {
-                    worker::console_error!("group_admin_log_dm_failed");
+                for markdown in markdowns {
+                    if post_markdown(env,user_id,markdown).await.is_err() {
+                        worker::console_error!("group_admin_log_dm_failed");
+                    }
                 }
             }
         }
@@ -120,17 +122,17 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<
 /// compact passive review digests.
 pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
     let display=format!("群组 {}\n{}",chat_id,text);
-    send_admin_markdown(env,chat_id,&formatting::plain_notice("管理员通知",&display)).await
+    send_admin_markdown(env,chat_id,&[formatting::plain_notice("管理员通知",&display)]).await
 }
 
 /// Queue batches group successful reviews by originating chat. A single admin
-/// lookup/DM is used per chunk, not per allowed message.
-pub async fn send_review_digest(env: &Env, chat_id: i64, rows: &[formatting::ReviewLine]) -> Result<()> {
+/// lookup is shared across all chunks, not repeated per allowed message.
+pub async fn send_review_digest(env: &Env, chat_id: i64, message_ids: &[i64]) -> Result<()> {
+    if chat_id>=0 || message_ids.is_empty() || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
+    let rows=crate::store::last_review_logs(env,chat_id,message_ids).await?;
     if rows.is_empty() {return Ok(());}
-    for markdown in formatting::review_digest(chat_id,rows) {
-        send_admin_markdown(env,chat_id,&markdown).await?;
-    }
-    Ok(())
+    // Recheck logs immediately before delivery; settings may change during D1 reads.
+    send_admin_markdown(env,chat_id,&formatting::review_digest(chat_id,&rows)).await
 }
 
 pub async fn delete(env: &Env, chat_id: i64, message_id: i64) -> Result<()> {
@@ -298,3 +300,4 @@ mod tests {
         assert_eq!(author(&msg),None);
     }
 }
+

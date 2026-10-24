@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use wasm_bindgen::JsValue;
 use worker::{Env, Result};
-use crate::tg;
+use crate::{formatting, tg};
 use crate::util::{fail, field_int, js_i64, js_str, now};
 
 #[derive(Debug, Deserialize)]
@@ -74,22 +74,16 @@ pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &st
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ReviewLogRow {
-    pub last_status: String,
-    pub last_category: String,
-    pub last_probability: f64,
-}
-
-/// Retrieve a committed review status for a successful Queue update.
-/// Pending/unknown rows are not announced.
-pub async fn last_review_log(env: &Env, chat_id: i64, message_id: i64) -> Result<Option<ReviewLogRow>> {
-    let row=env.d1("DB")?.prepare(
-        "SELECT last_status,last_category,last_probability FROM archived_messages \
-         WHERE chat_id=? AND message_id=? AND last_status!='pending'"
-    ).bind(&[js_i64(chat_id),js_i64(message_id)])?
-     .first::<ReviewLogRow>(None).await?;
-    Ok(row)
+/// One primary-key lookup set per group, restricted to successful Queue updates.
+/// Pending/unknown rows are excluded and the latest committed edit wins.
+pub async fn last_review_logs(env: &Env, chat_id: i64, message_ids: &[i64]) -> Result<Vec<formatting::ReviewLine>> {
+    if chat_id>=0 || message_ids.is_empty() {return Ok(Vec::new());}
+    let ids=serde_json::to_string(message_ids)?;
+    env.d1("DB")?.prepare(
+        "SELECT message_id,last_status AS status,last_category AS category,last_probability AS probability \
+         FROM archived_messages WHERE chat_id=? AND message_id IN (SELECT value FROM json_each(?)) \
+         AND last_status!='pending' ORDER BY message_id"
+    ).bind(&[js_i64(chat_id),js_str(&ids)])?.all().await?.results::<formatting::ReviewLine>()
 }
 
 pub async fn is_update_done(env: &Env, update_id: i64) -> Result<bool> {
@@ -426,3 +420,4 @@ pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: b
     }
     Ok(())
 }
+
