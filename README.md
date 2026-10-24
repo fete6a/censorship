@@ -6,7 +6,7 @@ A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it
 
 - **Group discovery:** `my_chat_member` updates and a first-message fallback. The Bot API cannot list every group the bot previously joined.
 - **Safe enforcement default:** `DRY_RUN=true` archives and classifies messages without deleting or banning; per-group `/dry-run off` enables enforcement.
-- **Per-group isolation:** each group has independent administrator authorization, dry-run, private-log and removal-threshold settings. Removal probability defaults to 93%.
+- **Per-group isolation:** each group has independent administrator authorization, dry-run, private-log and removal-threshold settings. Clef-omni's binary `violation.noul` score threshold defaults to 93%. Cloudflare Queues batches up to 20 events or 10 seconds (whichever comes first); each message is still classified and punished independently.
 - **History:** a Telegram Desktop JSON importer handles text-only history. The Bot API cannot retrieve unobserved old messages.
 
 **Chinese instructions:** [README_CN.md](README_CN.md).
@@ -16,14 +16,14 @@ A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it
 ### Private administrator review logs
 
 - **Private administrator logs are on by default.** For a group without saved settings, `src/store.rs` defaults `group_logs` to `true`; the D1 `group_settings.logs_enabled` column defaults to `1`.
-- The bot sends review-status messages **including allowed, flagged, audit and dry-run results**. It also attempts to send some enforcement, cancellation and scan-status messages. Routine review messages contain the group ID, message ID, status, category and score; action notices can additionally identify users. Operational errors logged to the Worker console are **not** guaranteed to be delivered by DM.
-- On each attempted delivery, `getChatAdministrators` fetches that **specific group's current human administrators**, excluding bot accounts. There is no fixed global recipient. Each intended recipient must first open a private chat with the bot (for example, send `/start`), must not have blocked it, and must be reachable through Telegram; otherwise the DM fails. Admin lookup failures also prevent delivery. Recipients are refreshed for later notifications.
+- The model only outputs a typed `violation.noul` probability, category and severity. **The bot's Rust code derives `allow`, `needs_review` and deletion**; Clef is never asked to output an allow/review/remove action. Routine reviewed-message statuses are combined into short per-group summaries within each Queue batch, with clickable links to still-existing supergroup messages. Enforcement, cancellations and historical scan completions remain separate best-effort notifications. Worker console errors are not guaranteed by DM.
+- On each attempted batch delivery, `getChatAdministrators` fetches that **specific group's current human administrators**, excluding bot accounts. There is no fixed global recipient. Each intended recipient must first open a private chat with the bot (for example, send `/start`), must not have blocked it, and must be reachable through Telegram; otherwise the DM fails. Admin lookup failures also prevent delivery. Recipients are refreshed for later notifications.
 - `/logs off` stops unsolicited **private review logs for that group only**; `/logs on` re-enables them. It **does not disable group action notices**, public `/threshold` replies, D1 archiving, Worker console logs, or replies to commands issued in a private chat. Turning logs off for one group does not affect another group.
 
 ### Public messages in the affected group
 
-- **After successful deletion**, the bot attempts a public notice naming the deleted message ID and category, with a warning or, when applicable, the user's strike count, 60-second mute, pending ban and `/cancel USER_ID` instructions. A failed mute is reported as such, not as a completed ban.
-- **Only after Telegram confirms a ban** does the bot send a separate completed-ban announcement. Notices are addressed only to the affected group and do not quote the deleted message's text.
+- **After successful deletion**, the bot immediately attempts a MarkdownV2 notice with the deleted message ID, category, clickable numeric user mention, and where applicable the strike count, 60-second mute, pending ban and `/cancel USER_ID` instructions. A failed mute is reported as such, not as a completed ban.
+- **Only after Telegram confirms a ban** does the bot send a separate completed-ban announcement. Notifications use escaped Telegram MarkdownV2 and generated numeric-ID links; links to deleted messages are deliberately omitted. Notices stay in the affected group and do not quote the deleted message's text.
 - Dry-run and audit reviews never claim that a deletion or ban happened. Posting is **best effort**: if Telegram rejects a group notice, the already-completed moderation action is not rolled back or repeated to retry the notice.
 - `/threshold` status and update commands issued in a group also send a **public** confirmation, even with `/logs off`. Other group administrator commands generally produce no group reply; their effects may still result in enforcement notices.
 
@@ -53,7 +53,7 @@ All management commands check the issuing user's `getChatMember` administrator/c
 
 Send `/start` or `/help` **privately** to see the command help. Omitting `on`/`off` queries the current logs/dry-run setting. In a group, `/threshold` confirms publicly; the other settings commands do not announce their result there.
 
-The default removal threshold is `0.93`; changing it affects subsequent reviews, not past decisions or existing pending bans. The model must select `remove`, with action confidence at least min(80%, group threshold) and non-`none` category confidence at least 75%. `/dry-run on` cancels that group's pending bans; `/logs off` does not affect enforcement.
+The default removal threshold is `0.93`; only future reviews are affected. The model answers a typed `noul` yes/no violation question with a numeric probability (`answers.violation.noul`), rather than producing an `allow` decision. Rust computes `allow` below threshold, `needs_review` when the score meets threshold but the category is `none`, and deletion when the score meets threshold with an actionable category. Dry-run, explicit group policy, Telegram permissions, deletion age and duplicate-punishment protections are unchanged. These model scores are not calibrated certainty estimates. `/dry-run on` cancels pending bans; `/logs off` does not affect punishment.
 
 ## Configuration and deployment
 

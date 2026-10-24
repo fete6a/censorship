@@ -67,11 +67,29 @@ pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &st
         js_str(status), js_str(category), JsValue::from_f64(probability), js_i64(now()),
         js_i64(chat_id), js_i64(message_id),
     ])?;
+    // Passive status notifications are emitted once per group Queue batch.
+    // This keeps write/notification semantics separate, avoiding one Telegram
+    // DM per allowed message. The Queue retry path remains per update.
     stmt.run().await?;
-    let _ = tg::send_to_review_or_chat(env, chat_id, &format!(
-        "message={message_id} status={status} category={category} probability={probability:.3}"
-    )).await;
     Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReviewLogRow {
+    pub last_status: String,
+    pub last_category: String,
+    pub last_probability: f64,
+}
+
+/// Retrieve a committed review status for a successful Queue update.
+/// Pending/unknown rows are not announced.
+pub async fn last_review_log(env: &Env, chat_id: i64, message_id: i64) -> Result<Option<ReviewLogRow>> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT last_status,last_category,last_probability FROM archived_messages \
+         WHERE chat_id=? AND message_id=? AND last_status!='pending'"
+    ).bind(&[js_i64(chat_id),js_i64(message_id)])?
+     .first::<ReviewLogRow>(None).await?;
+    Ok(row)
 }
 
 pub async fn is_update_done(env: &Env, update_id: i64) -> Result<bool> {
