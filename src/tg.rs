@@ -72,10 +72,18 @@ async fn post_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
 /// Commands reply where they were issued, including the originating forum topic.
 /// A failed confirmation must not replay a completed management operation.
 pub async fn reply_command(env: &Env, message: &Value, text: &str) -> Result<()> {
+    reply_command_titled(env,message,formatting::NoticeTone::Info,"机器人消息",text).await
+}
+
+/// Every command reply has a consistent tone, heading and MarkdownV2-escaped
+/// body, while retaining reply-to/topic targeting and best-effort delivery.
+pub async fn reply_command_titled(
+    env: &Env, message: &Value, tone: formatting::NoticeTone, title: &str, text: &str
+) -> Result<()> {
     let (chat_id, _) = ids(message).ok_or_else(|| fail("Invalid command chat"))?;
     let mut args = json!({
         "chat_id":chat_id,
-        "text":formatting::plain_notice("机器人管理",text),
+        "text":formatting::notice(tone,title,text),
         "parse_mode":"MarkdownV2",
         "link_preview_options":{"is_disabled":true}
     });
@@ -151,7 +159,13 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anch
 /// Enforcement, cancellation and scan notifications are independent of the
 /// compact passive review digests.
 pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
-    send_admin_markdown(env,chat_id,&[formatting::plain_notice("管理员通知",text)],None).await
+    send_to_review_or_chat_titled(env,chat_id,formatting::NoticeTone::Info,"管理员通知",text).await
+}
+
+pub async fn send_to_review_or_chat_titled(
+    env: &Env, chat_id: i64, tone: formatting::NoticeTone, title: &str, text: &str
+) -> Result<()> {
+    send_admin_markdown(env,chat_id,&[formatting::notice(tone,title,text)],None).await
 }
 
 /// Queue batches group successful reviews by originating chat. A single admin

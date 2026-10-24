@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use worker::{console_error, console_log, Env, Result};
 use crate::{media, store, tg};
+use crate::formatting::NoticeTone;
 use crate::util::{config, fail, field_int, field_str, flag, now};
 
 const DELETE_WINDOW: i64 = 48 * 3600;
@@ -291,7 +292,7 @@ async fn review_with_policy_cache(
     } else {
         notice.push_str("匿名/频道身份：无法归属具体用户，不封禁。");
     }
-    let notice=format!("{category}\n{notice}");
+    let notice=format!("违规类别：{category}\n处理结果：{notice}");
     tg::send_group_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
     store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
     // Notification failure must not erase the successful deletion.
@@ -320,59 +321,78 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let Some((cmd, words)) = command_parts(env,msg) else { return Ok(false); };
     let result=execute_admin_command(env,msg,cmd,words).await;
     if result.is_err() {
-        let _=tg::reply_command(env,msg,"命令暂未完成，服务暂不可用；系统将自动重试，请稍后查询状态。").await;
+        let _=reply_msg(env,msg,NoticeTone::Error,"命令处理失败",
+            "命令暂未完成，服务暂不可用；系统将自动重试，请稍后查询状态。").await;
     }
     result
 }
 
+/// Plain-text content only: the sender owns the sole MarkdownV2 escaping pass.
+async fn reply_msg(env: &Env, msg: &Value, tone: NoticeTone, title: &str, text: &str) -> Result<()> {
+    tg::reply_command_titled(env,msg,tone,title,text).await
+}
+
 async fn reply_rules(env: &Env, msg: &Value, chat_id: i64) -> Result<()> {
     let rules=tg::group_rules(env,chat_id).await?;
-    let reply=if rules.is_empty(){"群简介为空；尚未设置群规，自动处罚关闭。".into()}
-        else{format!("本群规则（来自群简介）：\n{rules}")};
-    tg::reply_command(env,msg,&reply).await
+    let body=if rules.is_empty() {
+        "群简介为空；尚未设置群规，自动处罚关闭。".to_owned()
+    } else {
+        format!("来源：群组简介\n\n本群规则（来自群简介）：\n{rules}")
+    };
+    reply_msg(env,msg,NoticeTone::Info,"群组规则",&body).await
 }
 
 async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&str>) -> Result<bool> {
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
     let private = field_str(&msg["chat"], "type") == "private";
     if matches!(cmd, "/start" | "/help") {
-        tg::reply_command(env,msg,concat!(
-            "Commands for group administrators:\n",
-            "/threshold GROUP_ID 0.75 (or 75%)\n/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
-            "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
-            "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
-            "Use a negative GROUP_ID, for example -1001234567890. ",
-            "Management commands require administrator rights in that specific group. Group /rules is available to all members. ",
-            "Inside a group, omit GROUP_ID; commands apply only to that group. ",
-            "All commands reply in the chat where they were issued, even with logs off."
+        reply_msg(env,msg,NoticeTone::Info,"命令帮助",concat!(
+            "群内公开命令（所有成员）：\n",
+            "/start、/help — 使用说明\n",
+            "/rules — 查看群简介中的规则\n\n",
+            "群组管理命令（仅管理员）：\n",
+            "/threshold 0.75（或 75%）— 设置删除阈值\n",
+            "/dry_run on|off — 模拟模式\n",
+            "/logs on|off — 管理员私聊日志\n",
+            "/scan — 回复消息后审核\n",
+            "/scan MESSAGE_ID [enforce] — 审核已归档消息\n",
+            "/scan_all [enforce] — 历史扫描\n",
+            "/scan_status、/scan_stop — 查看或停止扫描\n",
+            "/pending USER_ID、/cancel USER_ID — 封禁复核与取消\n\n",
+            "私聊管理员命令：在命令后加入负数 GROUP_ID，",
+            "例如 /rules GROUP_ID、/threshold GROUP_ID 0.75、",
+            "/scan GROUP_ID MESSAGE_ID、/scan_status GROUP_ID。\n",
+            "每条群命令只针对所在群组；/logs off 不影响群公告或命令回复。"
         )).await?;
-        // Group help text remains subject to moderation, including extra arguments.
+        // Group help and extra text remain subject to moderation.
         return Ok(private);
     }
-    // The description is already visible to group members. Reading it does not
-    // require administrator identity or an active moderation enrollment.
+    // Group /rules is public even when moderation is disabled.
     if cmd=="/rules" && !private {
         if !words.is_empty() {
-            tg::reply_command(env,msg,"群内用法：/rules（查询当前群规则，无需参数）。").await?;
+            reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                "群内用法：/rules（查询当前群规则，无需参数）。").await?;
             return Ok(false); // Extra text must still undergo ordinary moderation.
         }
         reply_rules(env,msg,origin_chat_id).await?;
         return Ok(true);
     }
     if !matches!(cmd, "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
-        tg::reply_command(env,msg,"未知命令，请使用 /help 查看支持的命令。").await?;
+        reply_msg(env,msg,NoticeTone::Warning,"未知命令",
+            "未知命令，请使用 /help 查看支持的命令。").await?;
         return Ok(private);
     }
     // Anonymous group senders must not bypass moderation with a command prefix.
     let Some(actor) = tg::author(msg) else {
-        tg::reply_command(env,msg,"无法验证匿名或频道身份，请使用个人管理员账号发送命令。").await?;
+        reply_msg(env,msg,NoticeTone::Warning,"权限不足",
+            "无法验证匿名或频道身份，请使用个人管理员账号发送命令。").await?;
         return Ok(private);
     };
     let (chat_id,args): (i64, Vec<&str>) = if private {
         let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
             let usage=if cmd=="/rules" {"私聊用法：/rules 群组ID，例如 /rules -1001234567890。"}
-                else {"请指定群组 ID。例如：/cancel -1001234567890 12345678"};
-            tg::reply_command(env,msg,usage).await?;
+                else {"请指定负数 GROUP_ID。例如：/cancel -1001234567890 12345678。"};
+            reply_msg(env,msg,NoticeTone::Warning,"参数错误",usage).await?;
             return Ok(true);
         };
         (group_id, words[1..].to_vec())
@@ -381,97 +401,129 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
     };
     // A denied group command is still an ordinary group message to moderate.
     if !tg::user_is_admin_for_command(env,chat_id,actor).await? {
-        tg::reply_command(env,msg,"无法验证你是目标群管理员，或机器人无法访问该群。").await?;
+        reply_msg(env,msg,NoticeTone::Warning,"权限不足",
+            "无法验证你是目标群管理员，或机器人无法访问该群。").await?;
         return Ok(private);
     }
     if cmd=="/rules" {
         if !args.is_empty() {
-            tg::reply_command(env,msg,"私聊用法：/rules 群组ID，不接受额外参数。").await?;
+            reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                "私聊用法：/rules 群组ID，不接受额外参数。").await?;
         } else {
             reply_rules(env,msg,chat_id).await?;
         }
         return Ok(true);
     }
     if !store::can_review(env,chat_id).await? {
-        tg::reply_command(env,msg,"该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
+        reply_msg(env,msg,NoticeTone::Warning,"群组审核不可用",
+            "该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
         return Ok(private);
     }
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/threshold" => {
-            if !args.is_empty() {
+            let changed=!args.is_empty();
+            if changed {
                 let value=if let [raw]=args.as_slice() {
                     let (number,divisor)=raw.strip_suffix('%').map(|n|(n,100.0)).unwrap_or((raw,1.0));
                     number.parse::<f64>().ok().map(|n|n/divisor)
                         .filter(|n|n.is_finite() && (0.0..=1.0).contains(n))
                 } else {None};
                 let Some(value)=value else {
-                    let usage="Use /threshold 0.75 or /threshold 75% (range 0 to 1 or 0% to 100%). In private chats specify GROUP_ID first.";
-                    tg::reply_command(env,msg,usage).await?;
+                    reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                        "用法：/threshold 0.75 或 /threshold 75%（范围：0–100%）。私聊请先指定 GROUP_ID。").await?;
                     return Ok(true);
                 };
                 store::set_group_threshold(env,chat_id,value).await?;
             }
             let value=store::group_threshold(env,chat_id).await?;
-            let reply=format!("删除阈值：{:.1}%（仅影响后续审核）",value*100.0);
-            tg::reply_command(env,msg,&reply).await?;
+            let reply=format!("群组：{chat_id}\n删除阈值：{:.1}%\n生效范围：仅影响后续审核。",value*100.0);
+            reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"删除阈值",&reply).await?;
         }
         "/dry-run" | "/dry_run" | "/logs" => {
             let dry_run=cmd!="/logs";
-            if !args.is_empty() {
+            let changed=!args.is_empty();
+            if changed {
                 let enabled=match args.as_slice() {
                     ["on"]=>true,["off"]=>false,
-                    _=>{tg::reply_command(env,msg,"Use on or off; in private chats specify GROUP_ID first.").await?;return Ok(true);}
+                    _=>{
+                        reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                            "请使用 on 或 off；私聊请先指定 GROUP_ID。").await?;
+                        return Ok(true);
+                    }
                 };
                 store::set_group_option(env,chat_id,dry_run,enabled).await?;
             }
             let enabled=if dry_run {store::group_dry_run(env,chat_id).await?} else {store::group_logs(env,chat_id).await?};
-            let label=if dry_run {"dry-run"} else {"logs"};
-            tg::reply_command(env,msg,&format!("Group {chat_id}: {label} {}",if enabled {"on"} else {"off"})).await?;
+            let name=if dry_run {"模拟审核（dry-run）"} else {"管理员私聊日志"};
+            let explanation=if dry_run {
+                if enabled {"仅审核和记录，不执行删除或封禁。"}
+                else {"允许按群规执行处罚，仍受权限及安全检查限制。"}
+            } else if enabled {
+                "按群发送管理员私聊审核日志。"
+            } else {
+                "仅关闭本群私人审核日志；群内处罚公告与命令回复仍会发送。"
+            };
+            let reply=format!("群组：{chat_id}\n功能：{name}\n当前状态：{}\n说明：{explanation}",if enabled {"开启"} else {"关闭"});
+            reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"群组设置",&reply).await?;
         }
         "/cancel" => {
             let target = args.first().and_then(|s|s.parse::<i64>().ok()).or_else(||
                 if private {None} else {msg.get("reply_to_message").and_then(tg::author)});
             let Some(target)=target else {
-                tg::reply_command(env,msg,"用法：/cancel [群组ID] 用户ID").await?;
+                reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                    "用法：/cancel USER_ID（私聊：/cancel GROUP_ID USER_ID）。").await?;
                 return Ok(true);
             };
-            let reply=if let Some(case)=store::cancel_pending(env,chat_id,target,actor,"admin_command").await? {
+            let canceled=store::cancel_pending(env,chat_id,target,actor,"admin_command").await?;
+            let (tone,reply)=if let Some(case)=canceled {
                 let restore = match tg::get_member(env,chat_id,target).await {
                     Ok(member) => field_str(&member,"status") == "restricted" &&
                         field_int(&member,"until_date") == Some(case.due_at),
                     Err(_)=>false,
                 };
                 if restore {let _=tg::unmute(env,chat_id,target).await;}
-                format!("已取消用户 {target} 的自动封禁；如仍被禁言，请管理员手动解除。")
-            } else {format!("用户 {target} 无有效待封禁任务。")};
-            tg::reply_command(env,msg,&reply).await?;
+                (NoticeTone::Success,format!("用户：{target}\n结果：已取消自动封禁。\n提醒：如仍被禁言，请管理员手动解除。"))
+            } else {
+                (NoticeTone::Info,format!("用户：{target}\n结果：无有效待封禁任务。"))
+            };
+            reply_msg(env,msg,tone,"封禁复核取消",&reply).await?;
         }
         "/pending" => {
             let Some(target)=args.first().and_then(|s|s.parse::<i64>().ok()) else {
-                tg::reply_command(env,msg,"用法：/pending [群组ID] 用户ID").await?;
+                reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                    "用法：/pending USER_ID（私聊：/pending GROUP_ID USER_ID）。").await?;
                 return Ok(true);
             };
             let reply=match store::current_pending(env,chat_id,target).await? {
-                Some(p)=>format!("用户 {target}: pending message={}, remaining {} sec",p.message_id,(p.due_at-now()).max(0)),
-                None=>format!("用户 {target}: no pending ban"),
+                Some(p)=>format!("用户：{target}\n消息：#{}\n状态：待封禁\n剩余复核时间：{} 秒\n取消命令：/cancel {target}",p.message_id,(p.due_at-now()).max(0)),
+                None=>format!("用户：{target}\n状态：无待封禁任务。"),
             };
-            tg::reply_command(env,msg,&reply).await?;
+            reply_msg(env,msg,NoticeTone::Info,"封禁复核状态",&reply).await?;
         }
         "/scan_all" => {
             let max=store::start_scan(env,chat_id,enforce).await?;
-            tg::reply_command(env,msg,&format!("历史审查任务已创建，截至消息 {max}，执行模式={enforce}。") ).await?;
+            let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{}",if enforce {"执行模式"} else {"仅审计"});
+            reply_msg(env,msg,NoticeTone::Success,"历史扫描",&reply).await?;
         }
         "/scan_status" => {
             let reply=match store::job_for_group(env,chat_id).await? {
-                Some(j)=>format!("扫描 {} | 已审 {} | 违规 {} | ID {} / {} | enforce={}",j.status,j.scanned,j.flagged,j.cursor_message_id,j.max_message_id,j.enforce),
+                Some(j)=>{
+                    let status=match j.status.as_str() {
+                        "running"=>"进行中", "done"=>"已完成", "stopped"=>"已停止", _=>j.status.as_str(),
+                    };
+                    format!("状态：{status}\n已审消息：{} 条\n标记消息：{} 条\n进度：#{} / #{}\n模式：{}",
+                        j.scanned,j.flagged,j.cursor_message_id,j.max_message_id,
+                        if j.enforce==1 {"执行模式"} else {"仅审计"})
+                },
                 None=>"当前无历史扫描任务。".into(),
             };
-            tg::reply_command(env,msg,&reply).await?;
+            reply_msg(env,msg,NoticeTone::Info,"历史扫描进度",&reply).await?;
         }
         "/scan_stop" => {
             store::stop_scan(env,chat_id).await?;
-            tg::reply_command(env,msg,"已停止历史扫描。" ).await?;
+            reply_msg(env,msg,NoticeTone::Success,"历史扫描",
+                "状态：已停止历史扫描。").await?;
         }
         "/scan" | "/scan_id" => {
             let reply = if private {None} else {msg.get("reply_to_message").cloned()};
@@ -483,22 +535,25 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                 }
             };
             let Some(target)=target else {
-                tg::reply_command(env,msg,"请回复原消息用 /scan，或指定已归档消息 ID。" ).await?;
+                reply_msg(env,msg,NoticeTone::Warning,"未找到消息",
+                    "请回复原消息用 /scan，或指定已归档消息 ID。").await?;
                 return Ok(true);
             };
             if !tg::is_eligible(&target,chat_id) || !tg::message_has_payload(&target) {
-                tg::reply_command(env,msg,"目标消息不适用审核。" ).await?;
+                reply_msg(env,msg,NoticeTone::Warning,"无法审核",
+                    "目标消息不适用审核。").await?;
                 return Ok(true);
             }
-            tg::reply_command(env,msg,&format!("正在审查消息 {}，完成后将在此回复结果。",target["message_id"])).await?;
+            let target_id=field_int(&target,"message_id").ok_or_else(||fail("Missing scan message ID"))?;
+            reply_msg(env,msg,NoticeTone::Info,"单条消息扫描",
+                &format!("正在审查消息 {target_id}，完成后将在此回复结果。\n模式：{}",if enforce {"执行模式"} else {"仅审计"})).await?;
             store::archive(env,&target).await?;
             let mode=if enforce {Mode::HistoricalEnforce} else {Mode::Audit};
             review(env,&target,mode).await?;
-            let message_id=field_int(&target,"message_id").ok_or_else(||fail("Missing scan message ID"))?;
-            let rows=store::last_review_logs(env,chat_id,&[message_id]).await?;
+            let rows=store::last_review_logs(env,chat_id,&[target_id]).await?;
             let reply=rows.first().map(crate::formatting::scan_result)
-                .unwrap_or_else(||format!("消息 {message_id}：审核结果暂不可用，请稍后重试。"));
-            tg::reply_command(env,msg,&reply).await?;
+                .unwrap_or_else(||format!("消息 {target_id}：审核结果暂不可用，请稍后重试。"));
+            reply_msg(env,msg,NoticeTone::Info,"单条消息审核结果",&reply).await?;
         }
         _=>{}
     }
@@ -604,7 +659,8 @@ async fn process_update_with_policy_cache(
         Ok(enrolled)=>enrolled,
         Err(error)=>{
             if command_parts(env,msg).is_some() {
-                let _=tg::reply_command(env,msg,"暂时无法确认机器人群组权限，系统将自动重试。").await;
+                let _=reply_msg(env,msg,NoticeTone::Error,"权限查询失败",
+                    "暂时无法确认机器人群组权限，系统将自动重试。").await;
             }
             return Err(error);
         }
@@ -717,9 +773,10 @@ async fn cancel_from_member_update(env:&Env, change:&Value)->Result<()> {
     if !unmuted {return Ok(());}
     if !tg::user_is_admin(env,chat_id,actor).await? {return Ok(());}
     if store::cancel_pending(env,chat_id,target,actor,"admin_unmuted_in_telegram").await?.is_some() {
-        let _=tg::send_to_review_or_chat(env,chat_id,&format!(
-            "管理员已通过 Telegram 手动解除用户 {target} 的禁言，自动封禁已取消。"
-        )).await;
+        let _=tg::send_to_review_or_chat_titled(env,chat_id,NoticeTone::Success,
+            "自动封禁已取消",&format!(
+                "用户：{target}\n操作：管理员通过 Telegram 手动解除禁言。\n结果：已取消待执行的自动封禁。"
+            )).await;
     }
     Ok(())
 }
@@ -733,10 +790,11 @@ pub async fn process_scan_tick(env: &Env) -> Result<()> {
     for _ in 0..MAX_ARCHIVE_PER_TICK {
         let Some(item) = store::next_archived(env,&job).await? else {
             store::finish_scan(env,job.chat_id).await?;
-            tg::send_to_review_or_chat(env,job.chat_id,&format!(
-                "历史审查完成：扫描 {} 条，标记 {} 条。{}",
-                job.scanned, job.flagged, if job.enforce == 1 { "执行模式" } else { "仅审计" }
-            )).await?;
+            tg::send_to_review_or_chat_titled(env,job.chat_id,NoticeTone::Success,
+                "历史审查完成",&format!(
+                    "已审消息：{} 条\n标记消息：{} 条\n模式：{}",
+                    job.scanned, job.flagged, if job.enforce == 1 { "执行模式" } else { "仅审计" }
+                )).await?;
             return Ok(());
         };
         let msg: Value = serde_json::from_str(&item.payload)?;

@@ -40,8 +40,30 @@ pub fn escape_md(text: &str) -> String {
     escaped
 }
 
+/// A single visual grammar for commands and independent administrator notices.
+/// Caller-provided titles/bodies are *plain text*, never preformatted Markdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoticeTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+pub fn notice(tone: NoticeTone, title: &str, text: &str) -> String {
+    let icon = match tone {
+        NoticeTone::Info => "ℹ️",
+        NoticeTone::Success => "✅",
+        NoticeTone::Warning => "⚠️",
+        NoticeTone::Error => "❌",
+    };
+    let heading = format!("{icon} *{}*", escape_md(title));
+    let body = text.trim();
+    if body.is_empty() { heading } else { format!("{heading}\n\n{}", escape_md(body)) }
+}
+
 pub fn plain_notice(title: &str, text: &str) -> String {
-    format!("🛡️ *{}*\n\n{}",escape_md(title),escape_md(text))
+    notice(NoticeTone::Info, title, text)
 }
 
 pub fn message_link(chat_id: i64, message_id: i64) -> Option<String> {
@@ -87,17 +109,21 @@ pub fn group_heading(chat_id: i64, title: &str, username: &str, invite: &str, an
     format!("👥 {label}\n🆔 `{chat_id}`\n\n")
 }
 
+/// Same hierarchy for group enforcement messages and private action logs.
+/// User-supplied names and description text are escaped exactly once.
 pub fn action_notice(title: &str, message_id: i64, user: Option<&ActionUser>, body: &str) -> String {
-    let mut out=format!("⚠️ *{}*\n",escape_md(title));
+    let mut out=format!("🚨 *{}*\n\n",escape_md(title));
     if message_id>0 {out.push_str(&format!("🔎 消息：`#{message_id}`\n"));}
     if let Some(user)=user {
-        if let Some(mention)=named_user(user.id,&user.name) {out.push_str(&format!("👤 {mention}\n"));}
+        if let Some(mention)=named_user(user.id,&user.name) {out.push_str(&format!("👤 用户：{mention}\n"));}
         if let Some(count)=user.warnings {
-            out.push_str(&format!("近 7 天警告：`{}/3` `{}`\n",count.max(0),progress_bar(count.max(0) as f64,3.0,3)));
+            out.push_str(&format!("📊 近 7 天警告：`{}/3` `{}`\n",count.max(0),progress_bar(count.max(0) as f64,3.0,3)));
         }
     }
-    out.push('\n');
-    out.push_str(&escape_md(body));
+    if !body.trim().is_empty() {
+        out.push_str("\n📋 *处理说明*\n");
+        out.push_str(&escape_md(body.trim()));
+    }
     out
 }
 
@@ -116,14 +142,19 @@ fn status_name(status: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Scan replies share status vocabulary, labels and score presentation
+/// with the administrator digest, but remain plain text for reply_command.
 pub fn scan_result(row: &ReviewLine) -> String {
-    let (_,label)=status_name(&row.status);
+    let (icon,label)=status_name(&row.status);
+    let header=format!("{icon} 消息 {}：{label}",row.message_id);
     if matches!(row.status.as_str(),"review_error"|"policy_unavailable"|"no_group_description") {
-        return format!("消息 {}：{label}。未获得有效审核结果，未执行处罚。",row.message_id);
+        return format!("{header}\n⚠️ 未获得有效审核结果，未执行处罚。");
     }
-    let category=if row.category=="none" {String::new()} else {format!(" · {}",category_name(&row.category))};
-    format!("消息 {}：{label}{category}\n违规概率 {} {:.1}%",
-        row.message_id,progress_bar(row.probability,1.0,10),100.0*row.probability.clamp(0.0,1.0))
+    let category=if matches!(row.category.as_str(),"none"|"other"|"adult") {
+        String::new()
+    } else {format!(" · {}",category_name(&row.category))};
+    format!("{header}{category}\n📊 违规概率：{} {:.1}%",
+        progress_bar(row.probability,1.0,10),100.0*row.probability.clamp(0.0,1.0))
 }
 
 pub fn category_name(category: &str) -> &str {
@@ -147,9 +178,9 @@ fn row_markdown(chat_id: i64, row: &ReviewLine) -> String {
     if matches!(row.status.as_str(),"review_error"|"policy_unavailable"|"no_group_description") {
         return format!("{icon} {target} · *{label}*");
     }
-    let cat=if row.category=="none" {String::new()} else {format!(" · {}",escape_md(category_name(&row.category)))};
+    let cat=if matches!(row.category.as_str(),"none"|"other"|"adult") {String::new()} else {format!(" · {}",escape_md(category_name(&row.category)))};
     let percent=escape_md(&format!("{:.1}%",100.0*row.probability.clamp(0.0,1.0)));
-    format!("{icon} {target} · *{label}*{cat}\n违规概率 `{}` *{percent}*",progress_bar(row.probability,1.0,10))
+    format!("{icon} {target} · *{label}*{cat}\n📊 违规概率：`{}` *{percent}*",progress_bar(row.probability,1.0,10))
 }
 
 /// Chunk to below Telegram's 4096 UTF-16 unit limit. The Queue may deliver
@@ -272,5 +303,39 @@ mod tests {
         assert_eq!(progress_bar(f64::NAN,1.0,10),"—");
         assert_eq!(progress_bar(0.5,0.0,10),"—");
     }
+
+    #[test]
+    fn notice_layout_is_consistent_and_escapes_untrusted_content() {
+        assert_eq!(notice(NoticeTone::Info,"群规 [x]","Hello *user*"),
+            "ℹ️ *群规 \\[x\\]*\n\nHello \\*user\\*");
+        assert_eq!(notice(NoticeTone::Success,"完成",""),"✅ *完成*");
+        assert!(notice(NoticeTone::Warning,"参数错误","/threshold 75%").starts_with("⚠️ *参数错误*\n\n"));
+        assert!(notice(NoticeTone::Error,"服务错误","").starts_with("❌ *服务错误*"));
+    }
+    #[test]
+    fn notice_labels_preserve_named_users_warning_bars_and_deleted_message_safety() {
+        let user=ActionUser{id:42,name:"A *[x]*".into(),warnings:Some(5)};
+        let output=action_notice("违规消息已删除",90,Some(&user),"违规类别：广告\n处理结果：删除");
+        assert!(output.starts_with("🚨 *违规消息已删除*\n\n"));
+        assert!(output.contains("🔎 消息：`#90`"));
+        assert!(output.contains("👤 用户：[A \\*\\[x\\]\\*](tg://user?id=42)"));
+        assert!(output.contains("近 7 天警告：`5/3` `▰▰▰`"));
+        assert!(output.contains("📋 *处理说明*"));
+        assert!(!output.contains("t.me/c/"));
+    }
+    #[test]
+    fn scan_layout_uses_same_labels_and_never_fabricates_error_scores() {
+        let ok=ReviewLine{message_id:8,status:"audit_flag".into(),category:"spam".into(),probability:0.95};
+        assert!(scan_result(&ok).contains("📊 违规概率："));
+        assert!(scan_result(&ok).contains("审计命中 · 广告"));
+        for kind in ["none","other","adult"] {
+            let clean=ReviewLine{category:kind.into(),..ok.clone()};
+            assert!(!scan_result(&clean).contains(" · "));
+        }
+        let error=ReviewLine{message_id:8,status:"review_error".into(),category:"none".into(),probability:0.0};
+        assert!(!scan_result(&error).contains("违规概率"));
+        assert!(scan_result(&error).contains("未获得有效审核结果"));
+    }
+
 }
 
