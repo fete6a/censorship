@@ -343,6 +343,7 @@ await test('unsupported or malformed media never falls back to flash caption-onl
   for(const media of [
     {document:{file_id:'pdf',mime_type:'application/pdf'}},
     {photo:[]},
+    {photo:{file_id:'malformed-photo-array'}},
     {sticker:{file_id:'animated',is_animated:true}},
     {voice:{file_id:'voice',mime_type:'audio/ogg'}},
     {photo:[{file_id:'large',file_size:5*1024*1024}]},

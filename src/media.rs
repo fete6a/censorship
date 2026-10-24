@@ -32,7 +32,8 @@ struct SelectedMedia {
 }
 
 fn choose(msg: &Value) -> Result<Option<SelectedMedia>> {
-    let (obj, kind, assumed_mime): (&Value, MediaKind, &str) = if let Some(photos) = msg["photo"].as_array() {
+    let (obj, kind, assumed_mime): (&Value, MediaKind, &str) = if !msg["photo"].is_null() {
+        let photos=msg["photo"].as_array().ok_or_else(||fail("Invalid photo metadata"))?;
         match photos.last() {
             Some(photo) => (photo, MediaKind::Image, "image/jpeg"),
             None => return Err(fail("Empty photo metadata")),
