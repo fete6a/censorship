@@ -69,6 +69,9 @@ fn parse_decision(raw: Value) -> Result<Decision> {
     let remove_probability=probability(&violation["noul"])?;
     let (category, _, _) = parse_choice(body, "category",
         &["none", "spam", "fraud", "harassment", "hate", "adult", "threat", "other"])?;
+    // "other" is not an actionable category. Normalize it at the model boundary
+    // so status selection, persisted reviews, and notifications match "none".
+    let category = if category == "other" { "none" } else { category };
     let (_, _, severity_probs) = parse_choice(body, "severity", &["none", "minor", "major", "critical"])?;
     let critical_probability = probability(&severity_probs["critical"])?;
     Ok(Decision { remove_probability, category: category.to_owned(), critical_probability })
@@ -746,6 +749,20 @@ mod tests {
         d.remove_probability=0.7999;
         assert!(!d.clear_violation(0.80));
         assert_eq!(d.status_without_removal(0.80),"allow");
+    }
+    #[test]
+    fn other_category_is_normalized_to_none() {
+        for category in ["none", "other"] {
+            let mut raw=model_response();
+            raw["answers"]["category"]["choice"]=json!(category);
+            let mut decision=parse_decision(raw).unwrap();
+            assert_eq!(decision.category, "none");
+            assert!(!decision.clear_violation(0.80));
+            assert_eq!(decision.status_without_removal(0.80), "needs_review");
+            decision.remove_probability=0.60;
+            assert!(!decision.clear_violation(0.80));
+            assert_eq!(decision.status_without_removal(0.80), "allow");
+        }
     }
     #[test]
     fn rejects_invalid_or_missing_noul_probability() {
