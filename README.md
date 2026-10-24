@@ -66,6 +66,14 @@ Use `/warnings USER_ID` to see that user's effective warning count **in the curr
 
 Use `/threshold` to query or set the removal threshold (default `0.93`); only future reviews are affected. The model answers a typed `noul` yes/no violation question with a numeric probability (`answers.violation.noul`), rather than producing an `allow` decision. Rust computes `allow` below threshold, `needs_review` when the score meets threshold but the category is `none`, and deletion when the score meets threshold with an actionable category. Clef categories `other` and `adult` are normalized to `none` before decisions and storage, so neither can cause deletions, warnings or bans; both follow the same `allow`/`needs_review` threshold behavior as `none`. Dry-run, explicit group policy, Telegram permissions, deletion age and duplicate-punishment protections are unchanged. These model scores are not calibrated certainty estimates. `/dry-run on` cancels pending bans; `/logs off` does not affect punishment.
 
+### Scan generation and cancellation semantics
+
+Bulk scans use a monotonic `generation` and a per-Cron `lease_id`, checked in SQLite before progress changes, historical review status writes and completion. Stopping a scan invalidates its claims; restarting with `audit` does not inherit old enforcement results. A Cron claim expires after 20 minutes if the Worker disappears, and duplicate ticks cannot claim the same running job at once. The completion message includes its generation because Telegram delivery can be delayed after a subsequent restart.
+
+**Deployment prerequisite:** `schema/current.sql` creates the new columns on empty databases. On existing databases, first verify `scan_jobs` columns and apply `schema/ensure_scan_fencing.sql` **once** when those columns do not exist. Do not execute the bootstrap schema against existing databases. A build with scan fencing must not be deployed before its D1 columns exist; CI never migrates production D1.
+
+Cancellation fences future D1 scan progress, completion and ordinary historical review writes. It cannot atomically recall a Telegram request that has already been issued (including a pending deletion or restriction). A deletion confirmed after stopping the scan is still recorded for audit to avoid duplicate punishment. Scan errors are retried through a future Cron claim only after the current claim releases/expires; unexpected Worker termination may leave the job temporarily paused until lease expiry.
+
 ## Configuration and deployment
 
 - Set `BOT_TOKEN` and `WEBHOOK_SECRET` as **Cloudflare/Wrangler secrets**, not repository or YAML values. The webhook secret is distinct from the Telegram bot token.

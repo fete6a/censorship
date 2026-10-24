@@ -140,14 +140,14 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
 /// An AI failure, a missing group description, and unsupported media
 /// always result in zero punitive actions (fail open).
 pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
-    review_with_policy_cache(env, msg, mode, None).await
+    review_with_policy_cache(env, msg, mode, None, None).await
 }
 
 /// A Queue invocation may reuse a successfully fetched description for the same
 /// group. Never cache failures or share policies across groups or invocations.
 /// Commands and membership updates invalidate the caller's cache.
 async fn review_with_policy_cache(
-    env: &Env, msg: &Value, mode: Mode, mut policies: Option<&mut BTreeMap<i64, String>>
+    env: &Env, msg: &Value, mode: Mode, mut policies: Option<&mut BTreeMap<i64, String>>, scan: Option<&store::Job>
 ) -> Result<bool> {
     let (chat_id, msg_id) = tg::ids(msg).ok_or_else(|| fail("Missing message ID"))?;
     let cached = policies.as_ref().and_then(|p| p.get(&chat_id).cloned());
@@ -161,11 +161,11 @@ async fn review_with_policy_cache(
     let rules = match rules_result {
         Ok(p) if !p.trim().is_empty() => p,
         Ok(_) => {
-            store::finish_review(env, chat_id, msg_id, "no_group_description", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "no_group_description", "none", 0.0,scan).await?;
             return Ok(false);
         }
         Err(error) => {
-            store::finish_review(env, chat_id, msg_id, "policy_unavailable", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "policy_unavailable", "none", 0.0,scan).await?;
             return Err(error);
         }
     };
@@ -173,7 +173,7 @@ async fn review_with_policy_cache(
     let decision = match classify(env, &rules, msg).await {
         Ok(d) => d,
         Err(error) => {
-            store::finish_review(env, chat_id, msg_id, "review_error", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "review_error", "none", 0.0,scan).await?;
             console_error!("review_unavailable chat={} message={} error={}", chat_id, msg_id, error);
             // Never retry unsupported files indefinitely. Queue retries on other errors.
             return Ok(false);
@@ -189,26 +189,26 @@ async fn review_with_policy_cache(
             console_log!("needs_review_missing_category chat={} message={} remove_probability={:.3} threshold={:.3}",
                 chat_id,msg_id,decision.remove_probability,threshold);
         }
-        store::finish_review(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability,scan).await?;
         return Ok(false);
     }
     let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
-        store::finish_review(env, chat_id, msg_id,
+        store::finish_review_scoped(env, chat_id, msg_id,
             if mode == Mode::Audit { "audit_flag" } else { "dry_run_flag" },
-            &decision.category, decision.remove_probability).await?;
+            &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
     let sent_at = field_int(msg, "date").unwrap_or(0);
     if sent_at <= 0 || now().saturating_sub(sent_at) >= DELETE_WINDOW {
-        store::finish_review(env, chat_id, msg_id, "too_old_to_delete", &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, "too_old_to_delete", &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
     // A repeated live update, edit, or historical rescan must not issue a second strike.
     if store::has_strike(env, chat_id, msg_id).await? {
-        store::finish_review(env, chat_id, msg_id, "previously_deleted", &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, "previously_deleted", &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
@@ -221,17 +221,23 @@ async fn review_with_policy_cache(
     };
     // Settings may change while Telegram lookups are in flight.
     if store::group_dry_run(env,chat_id).await? {
-        store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
+        store::finish_review_scoped(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability,scan).await?;
         return Ok(true);
+    }
+    if let Some(job)=scan {
+        if !store::scan_is_current(env,job).await? {return Ok(false);}
     }
     tg::delete(env, chat_id, msg_id).await?;
 
+    // Deletion is irreversible; complete its audit/strike bookkeeping even
+    // if the administrator stops this scan while Telegram is responding.
+    let scan=None;
     let mut notice = String::new();
     let mut notice_user=user.map(|id|crate::formatting::ActionUser {
         id,name:tg::display_name(&msg["from"]),warnings:None,
     });
     if let Some(user_id) = user {
-        store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability).await?;
+        store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability,scan).await?;
         let count = store::recent_strikes(env, chat_id, user_id).await?;
         if let Some(display)=notice_user.as_mut() {display.warnings=Some(count);}
         let very_severe = flag(env, "IMMEDIATE_BAN", false)
@@ -294,7 +300,7 @@ async fn review_with_policy_cache(
     }
     let notice=format!("违规类别：{category}\n处理结果：{notice}");
     tg::send_group_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
-    store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
+    store::finish_review_scoped(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability,scan).await?;
     // Notification failure must not erase the successful deletion.
     let _ = tg::send_admin_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
     Ok(true)
@@ -752,7 +758,7 @@ async fn process_update_with_policy_cache(
     }
     let reviewed=if tg::message_has_payload(msg) {
         store::archive(env,msg).await?;
-        review_with_policy_cache(env,msg,Mode::Live,Some(policies)).await?;
+        review_with_policy_cache(env,msg,Mode::Live,Some(policies),None).await?;
         tg::ids(msg)
     } else {None};
     store::mark_update_done(env,update_id).await?;
@@ -862,29 +868,48 @@ async fn cancel_from_member_update(env:&Env, change:&Value)->Result<()> {
     Ok(())
 }
 
+/// A claimed generation is never allowed to advance a successor scan.
 pub async fn process_scan_tick(env: &Env) -> Result<()> {
-    let Some(mut job) = store::active_job(env).await? else { return Ok(()); };
+    let Some(mut job)=store::claim_active_scan(env).await? else {return Ok(());};
+    let outcome=process_claimed_scan(env,&mut job).await;
+    // Release on both success and failure. On Worker termination, expiry
+    // eventually permits another Cron run without overlapping live claims.
+    let released=store::release_scan_claim(env,&job).await;
+    outcome?;
+    released
+}
+
+async fn process_claimed_scan(env:&Env, job:&mut store::Job) -> Result<()> {
     if !store::can_review(env,job.chat_id).await? {
-        store::stop_scan(env,job.chat_id).await?;
+        store::stop_scan_if_current(env,job).await?;
         return Ok(());
     }
     for _ in 0..MAX_ARCHIVE_PER_TICK {
-        let Some(item) = store::next_archived(env,&job).await? else {
-            store::finish_scan(env,job.chat_id).await?;
-            tg::send_to_review_or_chat_titled(env,job.chat_id,NoticeTone::Success,
-                "历史审查完成",&format!(
-                    "已审消息：{} 条\n标记消息：{} 条\n模式：{}",
-                    job.scanned, job.flagged, if job.enforce == 1 { "执行模式" } else { "仅审计" }
-                )).await?;
+        if !store::scan_is_current(env,job).await? {return Ok(());}
+        let Some(item)=store::next_archived(env,job).await? else {
+            if store::finish_scan(env,job).await? {
+                // The committed completion belongs only to this generation.
+                // Telegram notification is best effort and can still arrive
+                // after a later restart; it must identify the old generation.
+                let _=tg::send_to_review_or_chat_titled(env,job.chat_id,NoticeTone::Success,
+                    "历史审查完成",&format!(
+                        "任务代次：{}\\n已审消息：{} 条\\n标记消息：{} 条\\n模式：{}",
+                        job.generation,job.scanned,job.flagged,
+                        if job.enforce==1 {"执行模式"} else {"仅审计"}
+                    )).await;
+            }
             return Ok(());
         };
-        let msg: Value = serde_json::from_str(&item.payload)?;
-        let mode = if job.enforce == 1 { Mode::HistoricalEnforce } else { Mode::Audit };
-        let flagged = review(env,&msg,mode).await?;
-        store::advance_scan(env,&job,item.message_id,flagged).await?;
-        job.cursor_message_id = item.message_id;
-        job.scanned += 1;
-        job.flagged += i64::from(flagged);
+        if !store::scan_is_current(env,job).await? {return Ok(());}
+        let msg:Value=serde_json::from_str(&item.payload)?;
+        let mode=if job.enforce==1 {Mode::HistoricalEnforce} else {Mode::Audit};
+        let flagged=review_with_policy_cache(env,&msg,mode,None,Some(job)).await?;
+        if !store::advance_scan(env,job,item.message_id,flagged).await? {
+            return Ok(());
+        }
+        job.cursor_message_id=item.message_id;
+        job.scanned+=1;
+        job.flagged+=i64::from(flagged);
     }
     Ok(())
 }

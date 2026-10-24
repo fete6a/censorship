@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active' } = {}) {
+function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active' } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const warningAdjustments = new Map(), strikeEvents = [];
@@ -58,6 +58,14 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             if(flipAfterClaim && sql.startsWith('UPDATE')) settings.set(groupA,{dry_run:1,logs_enabled:0});
             return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
           }
+          if (sql.includes('SELECT message_id,payload FROM archived_messages')) {
+            const [chat,cursor,max]=values;
+            const next=[...archives.entries()].filter(([k])=>k.startsWith(chat+':'))
+              .map(([k,p])=>({message_id:Number(k.split(':')[1]),payload:JSON.stringify(p)}))
+              .filter(x=>x.message_id>cursor&&x.message_id<=max)
+              .sort((a,b)=>a.message_id-b.message_id)[0];
+            return next||null;
+          }
           if (sql.includes('SELECT payload FROM archived_messages')) {
             const item=archives.get(`${values[0]}:${values[1]}`);
             return item?{payload:JSON.stringify(item)}:null;
@@ -66,13 +74,36 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             const ids=[...archives.keys()].filter(key=>key.startsWith(`${values[0]}:`)).map(key=>Number(key.split(':')[1]));
             return {max_id:ids.length?Math.max(...ids):0};
           }
-          if (sql.includes('FROM scan_jobs')) {
+          if (sql.startsWith('UPDATE scan_jobs SET lease_id=lease_id+1')) {
+            const job=[...jobs.values()].find(x=>x.status==='running' && !x.claimed);
+            if(!job)return null;
+            job.claimed=true;job.lease_id=(job.lease_id||0)+1;
+            return {...job};
+          }
+          if (sql.startsWith('UPDATE scan_jobs SET cursor_message_id=')) {
+            const job=jobs.get(values[2]);
+            if(!job||job.generation!==values[3]||job.lease_id!==values[4]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[5])return null;
+            job.cursor_message_id=values[0];job.scanned++;job.flagged+=values[1];
+            return {chat_id:job.chat_id};
+          }
+          if (sql.startsWith("UPDATE scan_jobs SET status='done'")) {
+            const job=jobs.get(values[0]);
+            if(!job||job.generation!==values[1]||job.lease_id!==values[2]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[3])return null;
+            job.status='done';job.claimed=false;
+            return {chat_id:job.chat_id};
+          }
+          if (sql.includes('FROM scan_jobs') || sql.startsWith('SELECT COUNT(*) AS count FROM scan_jobs')) {
+            if(sql.includes('COUNT(*)')) {
+              const j=jobs.get(values[0]);
+              return {count:Number(Boolean(j&&j.generation===values[1]&&j.lease_id===values[2]&&j.status==='running'&&j.claimed))};
+            }
             if(sql.includes("status='running'")) return [...jobs.values()].find(j=>j.status==='running') || null;
             return jobs.get(values[0]) || null;
           }
           if (sql.includes('INSERT INTO scan_jobs') && sql.includes('RETURNING max_message_id')) {
             if(jobs.get(values[0])?.status==='running') return null;
-            const job={chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running'};
+            const prior=jobs.get(values[0]);
+            const job={chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running',generation:(prior?.generation||0)+1,lease_id:prior?.lease_id||0,claimed:false};
             jobs.set(values[0],job);
             return {max_id:job.max_message_id};
           }
@@ -118,7 +149,16 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             settings.set(values[0], row);
           }
           if (sql.includes('INSERT INTO scan_jobs')) throw new Error('Scan start must use atomic RETURNING');
-          if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[1])) jobs.get(values[1]).status='stopped';
+          if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[sql.includes('lease_id=?')?0:1])) {
+            const j=jobs.get(values[sql.includes('lease_id=?')?0:1]);
+            if(!sql.includes('lease_id=?')||(j.generation===values[1]&&j.lease_id===values[2])) {
+              j.status='stopped';j.generation++;j.claimed=false;
+            }
+          }
+          if (sql.startsWith('UPDATE scan_jobs SET lease_until=0')) {
+            const j=jobs.get(values[0]);
+            if(j&&j.generation===values[1]&&j.lease_id===values[2])j.claimed=false;
+          }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
           if (sql.includes('INSERT OR IGNORE INTO violations')) {
             const key=`${values[0]}:${values[2]}`;
@@ -131,7 +171,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             archives.set(`${values[0]}:${values[1]}`,JSON.parse(values[5]));
             reviews.set(`${values[0]}:${values[1]}`, {last_status:'pending',last_category:'none',last_probability:0});
           }
-          if (sql.includes('UPDATE archived_messages'))
+          if (sql.includes('UPDATE archived_messages') && (!sql.includes('EXISTS (') ||
+              (jobs.get(values[4])?.generation===values[6] && jobs.get(values[4])?.lease_id===values[7] &&
+               jobs.get(values[4])?.status==='running' && jobs.get(values[4])?.claimed)))
             reviews.set(`${values[4]}:${values[5]}`, {last_status:values[0],last_category:values[1],last_probability:values[2]});
           return { success: true, results: [], meta: { duration: 0, changes: 1, last_row_id: 0,
             changed_db: false, size_after: 0, rows_read: 0, rows_written: 1 } };
@@ -142,6 +184,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
   class Ai {
     async run(model, input) {
       aiCalls.push({ model, input: JSON.parse(JSON.stringify(input)) });
+      if(pauseAi)await pauseAi(aiCalls.length);
       if(aiFail) throw new Error('inference unavailable');
       const currentScore = remove ? (scores?.[aiCalls.length - 1] ?? score) : 0;
       return { answers: {
@@ -165,7 +208,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
       user: { id: args.user_id }, status: args.chat_id === groupA && args.user_id===11 ? 'administrator' : 'member',
     } });
     if (['restrictChatMember','banChatMember'].includes(method)) return Response.json({ok:true,result:true});
-    if (method === 'deleteMessage') return Response.json({ok:true,result:true});
+    if (method === 'deleteMessage') {if(pauseDelete)await pauseDelete();return Response.json({ok:true,result:true});}
     if (method === 'sendMessage' && ((dmFail && args.chat_id>0)||(noticeFail && args.chat_id<0))) return Response.json({ok:false},{status:403});
     if (method === 'sendMessage') return Response.json({ ok: true, result: { message_id: 1 } });
     if(method==='getChat' && policyFail) return Response.json({ok:false},{status:503});
@@ -194,7 +237,8 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     assert.equal(outcome.retried,retry);
     assert.equal(outcome.acked,!retry);
   }
-  return { worker, deliveries, statements, telegram, completed, errors, aiCalls,
+  async function tick(){await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()});}
+  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls,
     settings, reviews, archives, jobs, warningAdjustments, consume, consumeBatch, env };
 }
 
@@ -1154,4 +1198,72 @@ await test('bulk scan cannot operate on unauthorized target group',async()=>{
  await f.consume(command('/scan_all audit',{id:groupA,type:'supergroup'}));
  assert.equal(f.jobs.get(groupA).enforce,0);assert.equal(f.jobs.has(groupB),false);
  assert.ok(f.statements.filter(x=>x.sql.includes('INSERT INTO scan_jobs')).every(x=>x.values[0]===groupA));
+});
+
+await test('old enforcement result after stop and audit restart cannot alter new scan',async()=>{
+ let unblock,entered;
+ const begun=new Promise(resolve=>entered=resolve);
+ const held=new Promise(resolve=>unblock=resolve);
+ const f=fixture({remove:true,score:.99,pauseAi:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ const start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9100;
+ await f.consume(start);
+ const old=f.tick();await begun;
+ const stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=9101;
+ await f.consume(stop);
+ const restart=command('/scan_all audit',{id:groupA,type:'supergroup'});restart.update_id=9102;
+ await f.consume(restart);
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ const newer=f.jobs.get(groupA).generation;
+ unblock();await old;
+ assert.equal(f.jobs.get(groupA).generation,newer);
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ assert.equal(f.jobs.get(groupA).scanned,0);
+ assert.equal(f.jobs.get(groupA).flagged,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ assert.equal(f.reviews.get(groupA+':17')?.last_status,undefined);
+ const second=f.tick();await second;
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.jobs.get(groupA).scanned,1);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ await f.tick();
+ assert.equal(f.jobs.get(groupA).status,'done');
+ assert.equal(f.telegram.filter(x=>x.method==='sendMessage'&&x.args.text.includes('历史审查完成')).length,1);
+});
+await test('concurrent Cron claims do not process the same group and other groups remain runnable',async()=>{
+ let unblock,entered;
+ const held=new Promise(resolve=>unblock=resolve);
+ const begun=new Promise(resolve=>entered=resolve);
+ const f=fixture({pauseAi:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ f.settings.set(groupB,{dry_run:1,logs_enabled:0});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ f.archives.set(groupB+':27',message(groupB,27).message);
+ let one=command('/scan_all audit',{id:groupA,type:'supergroup'});one.update_id=9200;await f.consume(one);
+ let two=command('/scan_all audit',{id:groupB,type:'supergroup'});two.update_id=9201;two.message.from.id=21;await f.consume(two);
+ const first=f.tick();await begun;
+ const second=f.tick(); // separate group can claim, but it also pauses on AI
+ const third=f.tick();  // neither group has an available claim
+ await third;
+ assert.equal(f.aiCalls.length,2);
+ unblock();await Promise.all([first,second]);
+ assert.equal(f.jobs.get(groupA).scanned,1);
+ assert.equal(f.jobs.get(groupB).scanned,1);
+});
+await test('Telegram deletion already in flight is not represented as atomically cancellable',async()=>{
+ let unblock,entered;
+ const held=new Promise(resolve=>unblock=resolve),begun=new Promise(resolve=>entered=resolve);
+ const f=fixture({remove:true,score:.99,pauseDelete:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ let start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9300;await f.consume(start);
+ let old=f.tick();await begun;
+ let stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=9301;await f.consume(stop);
+ let restart=command('/scan_all audit',{id:groupA,type:'supergroup'});restart.update_id=9302;await f.consume(restart);
+ unblock();await old;
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
 });

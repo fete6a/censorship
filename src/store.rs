@@ -24,6 +24,8 @@ pub struct Job {
     pub flagged: i64,
     pub enforce: i64,
     pub status: String,
+    pub generation: i64,
+    pub lease_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,18 +61,29 @@ pub async fn archive(env: &Env, msg: &Value) -> Result<()> {
     Ok(())
 }
 
+/// For historical scans, the archive write is atomically scoped to the
+/// current run and Cron claim. Post-deletion bookkeeping is deliberately
+/// unscoped because Telegram may already have performed the external action.
 pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &str, category: &str, probability: f64) -> Result<()> {
-    let stmt = env.d1("DB")?.prepare(
-        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? \
-         WHERE chat_id=? AND message_id=?"
-    ).bind(&[
-        js_str(status), js_str(category), JsValue::from_f64(probability), js_i64(now()),
-        js_i64(chat_id), js_i64(message_id),
-    ])?;
-    // Passive status notifications are emitted once per group Queue batch.
-    // This keeps write/notification semantics separate, avoiding one Telegram
-    // DM per allowed message. The Queue retry path remains per update.
-    stmt.run().await?;
+    finish_review_scoped(env,chat_id,message_id,status,category,probability,None).await
+}
+
+pub async fn finish_review_scoped(
+    env: &Env, chat_id: i64, message_id: i64, status: &str,
+    category: &str, probability: f64, scan: Option<&Job>
+) -> Result<()> {
+    let mut args = vec![
+        js_str(status),js_str(category),JsValue::from_f64(probability),js_i64(now()),
+        js_i64(chat_id),js_i64(message_id),
+    ];
+    let sql = if let Some(job)=scan {
+        args.push(js_i64(job.generation));
+        args.push(js_i64(job.lease_id));
+        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? WHERE chat_id=? AND message_id=? AND EXISTS (SELECT 1 FROM scan_jobs WHERE scan_jobs.chat_id=archived_messages.chat_id AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch())"
+    } else {
+        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? WHERE chat_id=? AND message_id=?"
+    };
+    env.d1("DB")?.prepare(sql).bind(&args)?.run().await?;
     Ok(())
 }
 
@@ -173,41 +186,71 @@ pub async fn set_warning_count(
 
 /// Atomically start or restart a completed/stopped scan. A running job must
 /// never have its cursor or enforcement mode silently reset by another command.
+/// Restart is atomic; the monotonic generation prevents stop/restart ABA.
 pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<Option<i64>> {
-    let row = env.d1("DB")?.prepare(
+    let row=env.d1("DB")?.prepare(
         "SELECT COALESCE(MAX(message_id),0) AS max_id FROM archived_messages WHERE chat_id=?"
     ).bind(&[js_i64(chat_id)])?.first::<MaxRow>(None).await?;
-    let max_id = row.map(|r| r.max_id).unwrap_or(0);
-    // RETURNING makes the conflict result observable without a racing precheck.
-    // A running scan is left entirely unchanged by the conflict predicate.
+    let max_id=row.map(|r|r.max_id).unwrap_or(0);
     let started=env.d1("DB")?.prepare(
-        "INSERT INTO scan_jobs (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at) \
-         VALUES (?,0,?,0,0,?,'running',?,?) \
+        "INSERT INTO scan_jobs (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at,generation,lease_id,lease_until) \
+         VALUES (?,0,?,0,0,?,'running',?,?,1,0,0) \
          ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id=0,max_message_id=excluded.max_message_id, \
-         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at \
-         WHERE scan_jobs.status!='running' \
-         RETURNING max_message_id AS max_id"
-    ).bind(&[js_i64(chat_id), js_i64(max_id), js_i64(i64::from(enforce)), js_i64(now()), js_i64(now())])?
+         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at, \
+         generation=scan_jobs.generation+1,lease_until=0 \
+         WHERE scan_jobs.status!='running' RETURNING max_message_id AS max_id"
+    ).bind(&[js_i64(chat_id),js_i64(max_id),js_i64(i64::from(enforce)),js_i64(now()),js_i64(now())])?
         .first::<MaxRow>(None).await?;
     Ok(started.map(|r|r.max_id))
 }
 
+/// Admin stop invalidates any outstanding claim, even before a restart.
 pub async fn stop_scan(env: &Env, chat_id: i64) -> Result<()> {
-    env.d1("DB")?.prepare("UPDATE scan_jobs SET status='stopped',updated_at=? WHERE chat_id=?")
-        .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0,updated_at=? WHERE chat_id=?"
+    ).bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
     Ok(())
 }
 
 pub async fn job_for_group(env: &Env, chat_id: i64) -> Result<Option<Job>> {
-    env.d1("DB")?.prepare("SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status FROM scan_jobs WHERE chat_id=?")
-        .bind(&[js_i64(chat_id)])?.first::<Job>(None).await
+    env.d1("DB")?.prepare(
+        "SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,generation,lease_id FROM scan_jobs WHERE chat_id=?"
+    ).bind(&[js_i64(chat_id)])?.first::<Job>(None).await
 }
 
-pub async fn active_job(env: &Env) -> Result<Option<Job>> {
+/// A single atomic claim serializes Cron runs per group. An abandoned lease
+/// expires after 20 minutes; expired workers are barred from fenced writes.
+pub async fn claim_active_scan(env: &Env) -> Result<Option<Job>> {
     env.d1("DB")?.prepare(
-        "SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status \
-         FROM scan_jobs WHERE status='running' ORDER BY updated_at LIMIT 1"
+        "UPDATE scan_jobs SET lease_id=lease_id+1,lease_until=unixepoch()+1200,updated_at=unixepoch() \
+         WHERE chat_id=(SELECT chat_id FROM scan_jobs WHERE status='running' AND lease_until<=unixepoch() ORDER BY updated_at,chat_id LIMIT 1) \
+         AND status='running' AND lease_until<=unixepoch() \
+         RETURNING chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,generation,lease_id"
     ).first::<Job>(None).await
+}
+
+pub async fn scan_is_current(env: &Env, job: &Job) -> Result<bool> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT COUNT(*) AS count FROM scan_jobs WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch()"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?
+        .first::<CountRow>(None).await?;
+    Ok(row.is_some_and(|r|r.count==1))
+}
+
+/// A delayed permission check cannot stop a replacement run.
+pub async fn stop_scan_if_current(env: &Env, job: &Job) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0,updated_at=unixepoch() WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch()"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?.run().await?;
+    Ok(())
+}
+
+/// On normal returns release immediately; a crashed worker relies on expiry.
+pub async fn release_scan_claim(env: &Env, job: &Job) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET lease_until=0,updated_at=unixepoch() WHERE chat_id=? AND generation=? AND lease_id=? AND status='running'"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?.run().await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -225,21 +268,33 @@ pub async fn next_archived(env: &Env, job: &Job) -> Result<Option<ArchiveItem>> 
     ])?.first::<ArchiveItem>(None).await
 }
 
-pub async fn advance_scan(env: &Env, job: &Job, message_id: i64, flagged: bool) -> Result<()> {
-    env.d1("DB")?.prepare(
-        "UPDATE scan_jobs SET cursor_message_id=?,scanned=scanned+1,flagged=flagged+?,updated_at=? \
-         WHERE chat_id=? AND status='running' AND cursor_message_id=?"
+#[derive(Deserialize)]
+struct ScanUpdateRow { chat_id: i64 }
+
+/// CAS fences the scan generation, Cron claim and original cursor.
+pub async fn advance_scan(env: &Env, job: &Job, message_id: i64, flagged: bool) -> Result<bool> {
+    let updated=env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET cursor_message_id=?,scanned=scanned+1,flagged=flagged+?,updated_at=unixepoch() \
+         WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
+         AND cursor_message_id=? AND ?>cursor_message_id AND ?<=max_message_id RETURNING chat_id"
     ).bind(&[
-        js_i64(message_id),js_i64(i64::from(flagged)),js_i64(now()),
-        js_i64(job.chat_id),js_i64(job.cursor_message_id),
-    ])?.run().await?;
-    Ok(())
+        js_i64(message_id),js_i64(i64::from(flagged)),js_i64(job.chat_id),
+        js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
+        js_i64(message_id),js_i64(message_id),
+    ])?.first::<ScanUpdateRow>(None).await?;
+    Ok(updated.is_some())
 }
 
-pub async fn finish_scan(env: &Env, chat_id: i64) -> Result<()> {
-    env.d1("DB")?.prepare("UPDATE scan_jobs SET status='done',updated_at=? WHERE chat_id=? AND status='running'")
-        .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
-    Ok(())
+/// Exactly one claimed execution may complete and announce a given run.
+pub async fn finish_scan(env: &Env, job: &Job) -> Result<bool> {
+    let finished=env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='done',lease_until=0,updated_at=unixepoch() \
+         WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
+         AND cursor_message_id=? RETURNING chat_id"
+    ).bind(&[
+        js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
+    ])?.first::<ScanUpdateRow>(None).await?;
+    Ok(finished.is_some())
 }
 
 pub async fn cleanup(env: &Env) -> Result<()> {

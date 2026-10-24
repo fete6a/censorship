@@ -87,6 +87,90 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(start(-100,1),(10,))
         self.assertEqual(self.db.execute('SELECT cursor_message_id,scanned,enforce FROM scan_jobs WHERE chat_id=-100').fetchone(),(0,0,1))
 
+
+    def test_scan_generation_stop_restart_stale_claim_and_completion(self):
+        src=(ROOT / 'src/store.rs').read_text()
+        for name in ['claim_active_scan','scan_is_current','stop_scan_if_current','release_scan_claim']:
+            self.assertIn('fn '+name+'(',src)
+        self.assertIn('generation=scan_jobs.generation+1',src)
+        self.assertIn('generation=generation+1',src)
+        self.assertIn('AND lease_id=?',src)
+        self.assertIn('RETURNING chat_id',src)
+        self.assertIn('AND cursor_message_id=?',src)
+        self.assertIn('AND lease_until>unixepoch()',src)
+        self.assertIn('finish_review_scoped',src)
+        m=(ROOT/'src/moderation.rs').read_text()
+        self.assertIn('if !store::advance_scan(env,job,item.message_id,flagged).await?',m)
+        self.assertIn('if store::finish_scan(env,job).await?',m)
+        self.assertIn('scan_is_current(env,job)',m)
+        self.assertIn('review_with_policy_cache(env,&msg,mode,None,Some(job))',m)
+        # Exactly model the D1 SQL decisions on a real isolated SQLite connection.
+        def start(chat,enforce):
+            return self.db.execute("""INSERT INTO scan_jobs
+                (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,
+                 started_at,updated_at,generation,lease_id,lease_until)
+                VALUES (?,0,17,0,0,?,'running',100,100,1,0,0)
+                ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id=0,
+                max_message_id=excluded.max_message_id,scanned=0,flagged=0,
+                enforce=excluded.enforce,status='running',
+                started_at=excluded.started_at,updated_at=excluded.updated_at,
+                generation=scan_jobs.generation+1,lease_until=0
+                WHERE scan_jobs.status!='running'
+                RETURNING generation""",(chat,enforce)).fetchone()
+        def claim(chat):
+            return self.db.execute("""UPDATE scan_jobs SET lease_id=lease_id+1,
+                lease_until=unixepoch()+1200,updated_at=unixepoch()
+                WHERE chat_id=? AND status='running' AND lease_until<=unixepoch()
+                RETURNING generation,lease_id,cursor_message_id""",(chat,)).fetchone()
+        def advance(chat,job,msg,flagged):
+            return self.db.execute("""UPDATE scan_jobs SET cursor_message_id=?,
+                scanned=scanned+1,flagged=flagged+?,updated_at=unixepoch()
+                WHERE chat_id=? AND generation=? AND lease_id=? AND status='running'
+                AND lease_until>unixepoch() AND cursor_message_id=?
+                AND ?>cursor_message_id AND ?<=max_message_id
+                RETURNING chat_id""",(msg,flagged,chat,job[0],job[1],job[2],msg,msg)).fetchone()
+        def finish(chat,job):
+            return self.db.execute("""UPDATE scan_jobs SET status='done',
+                lease_until=0,updated_at=unixepoch() WHERE chat_id=? AND
+                generation=? AND lease_id=? AND status='running'
+                AND lease_until>unixepoch() AND cursor_message_id=?
+                RETURNING chat_id""",(chat,*job)).fetchone()
+        self.assertIsNotNone(start(-100,1))
+        old=claim(-100)
+        self.assertIsNotNone(old)
+        self.assertIsNone(claim(-100),'overlapping cron must not take a held lease')
+        self.db.execute("UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0 WHERE chat_id=-100")
+        self.assertIsNotNone(start(-100,0),'audit restart must work immediately')
+        new=claim(-100)
+        self.assertIsNotNone(new)
+        self.assertNotEqual(old[0],new[0])
+        self.assertIsNone(advance(-100,old,17,1))
+        self.assertIsNone(finish(-100,old))
+        self.assertEqual(self.db.execute('SELECT cursor_message_id,scanned,flagged,enforce,status FROM scan_jobs WHERE chat_id=-100').fetchone(),(0,0,0,0,'running'))
+        self.assertIsNotNone(start(-200,1))
+        other=claim(-200)
+        self.assertIsNotNone(other)
+        self.assertEqual(advance(-100,new,17,0),(-100,))
+        self.assertEqual(finish(-100,new),(-100,))
+        self.assertIsNone(finish(-100,new),'completion must be exactly once')
+        self.assertEqual(advance(-200,other,17,1),(-200,))
+        self.assertEqual(self.db.execute('SELECT scanned FROM scan_jobs WHERE chat_id=-200').fetchone(),(1,))
+
+    def test_historical_review_writes_are_fenced_after_stop(self):
+        self.db.execute("INSERT INTO archived_messages (chat_id,message_id,sent_at,updated_at,payload) VALUES (-100,17,100,100,'{}')")
+        self.db.execute("""INSERT INTO scan_jobs
+          (chat_id,max_message_id,started_at,updated_at,generation,lease_id,lease_until)
+          VALUES (-100,17,100,100,1,1,unixepoch()+1200)""")
+        sql="""UPDATE archived_messages SET last_status=? WHERE chat_id=? AND message_id=?
+        AND EXISTS(SELECT 1 FROM scan_jobs WHERE scan_jobs.chat_id=archived_messages.chat_id
+        AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch())"""
+        self.db.execute("UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0 WHERE chat_id=-100")
+        self.db.execute("UPDATE scan_jobs SET status='running',generation=generation+1,enforce=0,lease_id=2,lease_until=unixepoch()+1200 WHERE chat_id=-100")
+        self.db.execute(sql,('deleted',-100,17,1,1))
+        self.assertEqual(self.db.execute("SELECT last_status FROM archived_messages").fetchone(),('pending',))
+        self.db.execute(sql,('audit_flag',-100,17,3,2))
+        self.assertEqual(self.db.execute("SELECT last_status FROM archived_messages").fetchone(),('audit_flag',))
+
     def test_scan_defaults_match_help_and_bilingual_readmes(self):
         src=(ROOT/'src/moderation.rs').read_text()
         en=(ROOT/'README.md').read_text()

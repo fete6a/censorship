@@ -1,6 +1,6 @@
 -- Canonical D1 application schema, including group-scoped warning adjustments.
 -- Use ONLY on a newly created, empty D1 database.
--- Do not run against an existing database. Apply schema/ensure_warning_adjustments.sql to existing D1 databases instead.
+-- Do not run against an existing database. Apply the additive predeploy migrations to existing databases instead.
 -- The production D1 migration ledger is intentionally retained only in production.
 
 CREATE TABLE archived_messages (
@@ -56,7 +56,10 @@ CREATE TABLE scan_jobs (
   enforce INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'running',
   started_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+  lease_id INTEGER NOT NULL DEFAULT 0 CHECK (lease_id >= 0),
+  lease_until INTEGER NOT NULL DEFAULT 0
 );
 
 -- Additive, idempotent extension for existing D1 databases.
