@@ -131,19 +131,6 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
     parse_decision(raw)
 }
 
-fn category_name(category: &str) -> &'static str {
-    match category {
-        "spam" => "广告/刷屏",
-        "fraud" => "诈骗/钓鱼",
-        "harassment" => "骚扰/人身攻击",
-        "hate" => "仇恨攻击",
-        "adult" => "不当成人内容",
-        "threat" => "威胁",
-        "other" => "其他违反群规",
-        _ => "待核实",
-    }
-}
-
 /// Returns true if the message is an unambiguous model-flagged violation.
 /// An AI failure, a missing group description, and unsupported media
 /// always result in zero punitive actions (fail open).
@@ -190,7 +177,7 @@ async fn review_with_policy_cache(
 
     let threshold = store::group_threshold(env,chat_id).await?;
     let clear = decision.clear_violation(threshold);
-    let category = category_name(&decision.category);
+    let category = crate::formatting::category_name(&decision.category);
     if !clear {
         let kind = decision.status_without_removal(threshold);
         if decision.remove_probability >= threshold && decision.category == "none" {
@@ -235,19 +222,24 @@ async fn review_with_policy_cache(
     tg::delete(env, chat_id, msg_id).await?;
 
     let mut notice = String::new();
+    let mut notice_user=user.map(|id|crate::formatting::ActionUser {
+        id,name:tg::display_name(&msg["from"]),warnings:None,
+    });
     if let Some(user_id) = user {
         store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability).await?;
         let count = store::recent_strikes(env, chat_id, user_id).await?;
+        if let Some(display)=notice_user.as_mut() {display.warnings=Some(count);}
         let very_severe = flag(env, "IMMEDIATE_BAN", false)
             && decision.remove_probability >= 0.99
             && decision.critical_probability >= 0.99
             && ["fraud", "threat"].contains(&decision.category.as_str());
-        let ban_user = !is_admin && store::can_auto_ban(env,chat_id).await? && flag(env, "ENABLE_BAN", true) && (count >= 3 || very_severe);
+        let can_ban = !is_admin && store::can_auto_ban(env,chat_id).await? && flag(env, "ENABLE_BAN", true);
+        let ban_user = can_ban && (count >= 3 || very_severe);
         if ban_user {
             // Ban is *never* immediate. Give administrators 60 seconds to cancel.
-            if let Some(existing) = store::current_pending(env, chat_id, user_id).await? {
+            if store::current_pending(env, chat_id, user_id).await?.is_some() {
                 store::set_strike_action(env, chat_id, msg_id, "pending_existing").await?;
-                notice = format!("用户 {user_id} 已在 60 秒复核期内（原违规消息 {}），管理员可发送 /cancel {user_id} 取消封禁。", existing.message_id);
+                notice = format!("已在 60 秒复核期内。取消封禁：/cancel {user_id}");
             } else {
                 // Never shorten an existing longer/manual mute; doing so could
                 // accidentally undo a human administrator's restriction.
@@ -257,10 +249,10 @@ async fn review_with_policy_cache(
                      field_int(&member,"until_date").unwrap_or(0) > now() + 60);
                 if store::group_dry_run(env,chat_id).await? {
                     store::set_strike_action(env,chat_id,msg_id,"deleted_no_mute_dry_run").await?;
-                    notice="Dry-run enabled; further punishment stopped.".into();
+                    notice="已开启模拟模式，后续处罚停止。".into();
                 } else if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
                     store::set_strike_action(env,chat_id,msg_id,"existing_external_restriction").await?;
-                    notice = format!("用户 {user_id} 已有更长期的限制或不在群内，机器人不会覆盖原处罚或创建新封禁任务。 ");
+                    notice = "已有更长期的限制或不在群内，保留原处罚。".into();
                 } else {
                 match tg::mute_one_minute(env, chat_id, user_id).await {
                     Ok(deadline) => {
@@ -272,33 +264,34 @@ async fn review_with_policy_cache(
                         if let Err(error) = crate::queueing::send(env, "BAN_DELAY_QUEUE", &timer).await {
                             console_error!("ban_timer_enqueue_failed: {}",error);
                         }
-                        notice = format!("用户 {user_id} 因 {category} 已禁言 60 秒（近 7 天 {count} 次违规）。如管理员未取消，将在到期后封禁。取消命令：/cancel {user_id}");
+                        notice = format!("已禁言 60 秒，到期后封禁。取消命令：/cancel {user_id}");
                     }
                     Err(error) => {
                         store::set_strike_action(env, chat_id, msg_id, "mute_failed").await?;
                         console_error!("telegram_mute_failed for message {}: {}",msg_id,error);
-                        notice = format!("违规已删除，但禁言失败，未创建封禁任务；请管理员检查群组权限。用户 {user_id}");
+                        notice = "禁言失败，未创建封禁任务；请检查群组权限。".into();
                     }
                 }
                 }
             }
         } else {
             store::set_strike_action(env, chat_id, msg_id, "warned").await?;
-            notice.push_str(&format!("警告用户 {user_id}："));
             if is_admin {
                 notice.push_str("发送者为管理员，不会自动封禁。");
+            } else if can_ban {
+                notice.push_str("累计 3 次后禁言 60 秒，复核期结束后封禁。");
             } else {
-                notice.push_str(&format!("近 7 天第 {count} 次违规；达到 3 次将封禁。"));
+                notice.push_str("本群自动封禁未启用。");
             }
         }
     } else {
         notice.push_str("匿名/频道身份：无法归属具体用户，不封禁。");
     }
-    let notice=format!("违规消息 {msg_id} 已删除：{category}。\n{notice}");
-    tg::send_group_action_notice(env,chat_id,msg_id,user,"违规消息已删除",&notice).await;
+    let notice=format!("{category}\n{notice}");
+    tg::send_group_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
     store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
     // Notification failure must not erase the successful deletion.
-    let _ = tg::send_to_review_or_chat(env, chat_id, &notice).await;
+    let _ = tg::send_admin_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
     Ok(true)
 }
 
@@ -314,38 +307,49 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
             return None;
         }
     }
-    if !matches!(cmd, "/start" | "/help" | "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
-        return None;
-    }
     Some((cmd, words.collect()))
 }
 
-/// Commands authorize against the exact target group. Threshold commands reply
-/// in their origin group; other group commands retain silent responses.
+/// Commands authorize against the exact target group and reply in their origin chat.
+/// Transient execution errors remain retryable, with visible feedback to the caller.
 async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let Some((cmd, words)) = command_parts(env,msg) else { return Ok(false); };
+    let result=execute_admin_command(env,msg,cmd,words).await;
+    if result.is_err() {
+        let _=tg::reply_command(env,msg,"命令暂未完成，服务暂不可用；系统将自动重试，请稍后查询状态。").await;
+    }
+    result
+}
+
+async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&str>) -> Result<bool> {
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
     let private = field_str(&msg["chat"], "type") == "private";
     if matches!(cmd, "/start" | "/help") {
-        // These commands only operate privately; group text must be moderated.
-        if !private { return Ok(false); }
-        tg::send(env,origin_chat_id,concat!(
-            "Commands for group administrators (private chat):\n",
+        tg::reply_command(env,msg,concat!(
+            "Commands for group administrators:\n",
             "/threshold GROUP_ID 0.75 (or 75%)\n/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
             "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
             "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
             "Use a negative GROUP_ID, for example -1001234567890. ",
             "You must be an administrator of that specific group. ",
             "Inside a group, omit GROUP_ID; commands apply only to that group. ",
-            "Threshold commands confirm in the group; moderation actions are announced there."
+            "All commands reply in the chat where they were issued, even with logs off."
         )).await?;
-        return Ok(true);
+        // Group help text remains subject to moderation, including extra arguments.
+        return Ok(private);
+    }
+    if !matches!(cmd, "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+        tg::reply_command(env,msg,"未知命令，请使用 /help 查看支持的命令。").await?;
+        return Ok(private);
     }
     // Anonymous group senders must not bypass moderation with a command prefix.
-    let Some(actor) = tg::author(msg) else { return Ok(private); };
+    let Some(actor) = tg::author(msg) else {
+        tg::reply_command(env,msg,"无法验证匿名或频道身份，请使用个人管理员账号发送命令。").await?;
+        return Ok(private);
+    };
     let (chat_id,args): (i64, Vec<&str>) = if private {
         let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
-            tg::send(env,origin_chat_id,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
+            tg::reply_command(env,msg,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
             return Ok(true);
         };
         (group_id, words[1..].to_vec())
@@ -353,9 +357,14 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
         (origin_chat_id,words)
     };
     // A denied group command is still an ordinary group message to moderate.
-    // Private denials stay silent and acknowledge the update.
-    if !tg::user_is_admin_for_command(env,chat_id,actor).await? {return Ok(private);}
-    if !store::can_review(env,chat_id).await? {return Ok(private);}
+    if !tg::user_is_admin_for_command(env,chat_id,actor).await? {
+        tg::reply_command(env,msg,"无法验证你是目标群管理员，或机器人无法访问该群。").await?;
+        return Ok(private);
+    }
+    if !store::can_review(env,chat_id).await? {
+        tg::reply_command(env,msg,"该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
+        return Ok(private);
+    }
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/threshold" => {
@@ -367,33 +376,33 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
                 } else {None};
                 let Some(value)=value else {
                     let usage="Use /threshold 0.75 or /threshold 75% (range 0 to 1 or 0% to 100%). In private chats specify GROUP_ID first.";
-                    if private {tg::send(env,origin_chat_id,usage).await?;} else {tg::send_group_notice(env,chat_id,usage).await;}
+                    tg::reply_command(env,msg,usage).await?;
                     return Ok(true);
                 };
                 store::set_group_threshold(env,chat_id,value).await?;
             }
             let value=store::group_threshold(env,chat_id).await?;
-            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; the bot computes the status from Clef's violation probability and the category, with no model-selected allow action.",value,value*100.0);
-            if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice(env,chat_id,&reply).await;}
+            let reply=format!("删除阈值：{:.1}%（仅影响后续审核）",value*100.0);
+            tg::reply_command(env,msg,&reply).await?;
         }
         "/dry-run" | "/dry_run" | "/logs" => {
             let dry_run=cmd!="/logs";
             if !args.is_empty() {
                 let enabled=match args.as_slice() {
                     ["on"]=>true,["off"]=>false,
-                    _=>{tg::send(env,origin_chat_id,"Use on or off; in private chats specify GROUP_ID first.").await?;return Ok(true);}
+                    _=>{tg::reply_command(env,msg,"Use on or off; in private chats specify GROUP_ID first.").await?;return Ok(true);}
                 };
                 store::set_group_option(env,chat_id,dry_run,enabled).await?;
             }
             let enabled=if dry_run {store::group_dry_run(env,chat_id).await?} else {store::group_logs(env,chat_id).await?};
             let label=if dry_run {"dry-run"} else {"logs"};
-            tg::send(env,origin_chat_id,&format!("Group {chat_id}: {label} {}",if enabled {"on"} else {"off"})).await?;
+            tg::reply_command(env,msg,&format!("Group {chat_id}: {label} {}",if enabled {"on"} else {"off"})).await?;
         }
         "/cancel" => {
             let target = args.first().and_then(|s|s.parse::<i64>().ok()).or_else(||
                 if private {None} else {msg.get("reply_to_message").and_then(tg::author)});
             let Some(target)=target else {
-                tg::send(env,origin_chat_id,"用法：/cancel [群组ID] 用户ID").await?;
+                tg::reply_command(env,msg,"用法：/cancel [群组ID] 用户ID").await?;
                 return Ok(true);
             };
             let reply=if let Some(case)=store::cancel_pending(env,chat_id,target,actor,"admin_command").await? {
@@ -405,39 +414,39 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
                 if restore {let _=tg::unmute(env,chat_id,target).await;}
                 format!("已取消用户 {target} 的自动封禁；如仍被禁言，请管理员手动解除。")
             } else {format!("用户 {target} 无有效待封禁任务。")};
-            tg::send(env,origin_chat_id,&reply).await?;
+            tg::reply_command(env,msg,&reply).await?;
         }
         "/pending" => {
             let Some(target)=args.first().and_then(|s|s.parse::<i64>().ok()) else {
-                tg::send(env,origin_chat_id,"用法：/pending [群组ID] 用户ID").await?;
+                tg::reply_command(env,msg,"用法：/pending [群组ID] 用户ID").await?;
                 return Ok(true);
             };
             let reply=match store::current_pending(env,chat_id,target).await? {
                 Some(p)=>format!("用户 {target}: pending message={}, remaining {} sec",p.message_id,(p.due_at-now()).max(0)),
                 None=>format!("用户 {target}: no pending ban"),
             };
-            tg::send(env,origin_chat_id,&reply).await?;
+            tg::reply_command(env,msg,&reply).await?;
         }
         "/rules" => {
             let rules=tg::group_rules(env,chat_id).await?;
             let reply=if rules.is_empty(){"群简介为空；自动处罚关闭。".into()}
                 else{format!("本群处罚规则：\n{rules}")};
-            tg::send(env,origin_chat_id,&reply).await?;
+            tg::reply_command(env,msg,&reply).await?;
         }
         "/scan_all" => {
             let max=store::start_scan(env,chat_id,enforce).await?;
-            tg::send(env,origin_chat_id,&format!("历史审查任务已创建，截至消息 {max}，执行模式={enforce}。") ).await?;
+            tg::reply_command(env,msg,&format!("历史审查任务已创建，截至消息 {max}，执行模式={enforce}。") ).await?;
         }
         "/scan_status" => {
             let reply=match store::job_for_group(env,chat_id).await? {
                 Some(j)=>format!("扫描 {} | 已审 {} | 违规 {} | ID {} / {} | enforce={}",j.status,j.scanned,j.flagged,j.cursor_message_id,j.max_message_id,j.enforce),
                 None=>"当前无历史扫描任务。".into(),
             };
-            tg::send(env,origin_chat_id,&reply).await?;
+            tg::reply_command(env,msg,&reply).await?;
         }
         "/scan_stop" => {
             store::stop_scan(env,chat_id).await?;
-            tg::send(env,origin_chat_id,"已停止历史扫描。" ).await?;
+            tg::reply_command(env,msg,"已停止历史扫描。" ).await?;
         }
         "/scan" | "/scan_id" => {
             let reply = if private {None} else {msg.get("reply_to_message").cloned()};
@@ -449,17 +458,22 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
                 }
             };
             let Some(target)=target else {
-                tg::send(env,origin_chat_id,"请回复原消息用 /scan，或指定已归档消息 ID。" ).await?;
+                tg::reply_command(env,msg,"请回复原消息用 /scan，或指定已归档消息 ID。" ).await?;
                 return Ok(true);
             };
             if !tg::is_eligible(&target,chat_id) || !tg::message_has_payload(&target) {
-                tg::send(env,origin_chat_id,"目标消息不适用审核。" ).await?;
+                tg::reply_command(env,msg,"目标消息不适用审核。" ).await?;
                 return Ok(true);
             }
+            tg::reply_command(env,msg,&format!("正在审查消息 {}，完成后将在此回复结果。",target["message_id"])).await?;
             store::archive(env,&target).await?;
             let mode=if enforce {Mode::HistoricalEnforce} else {Mode::Audit};
-            let flagged=review(env,&target,mode).await?;
-            tg::send(env,origin_chat_id,&format!("消息 {}: flagged={flagged}, enforce={enforce}",target["message_id"])).await?;
+            review(env,&target,mode).await?;
+            let message_id=field_int(&target,"message_id").ok_or_else(||fail("Missing scan message ID"))?;
+            let rows=store::last_review_logs(env,chat_id,&[message_id]).await?;
+            let reply=rows.first().map(crate::formatting::scan_result)
+                .unwrap_or_else(||format!("消息 {message_id}：审核结果暂不可用，请稍后重试。"));
+            tg::reply_command(env,msg,&reply).await?;
         }
         _=>{}
     }
@@ -512,10 +526,6 @@ async fn ensure_group_enrolled(env: &Env, chat: &Value) -> Result<bool> {
     Ok(matches!(status,"active"|"delete_only"))
 }
 
-pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64)>> {
-    process_update_with_policy_cache(env, update, &mut BTreeMap::new()).await
-}
-
 async fn process_update_with_policy_cache(
     env: &Env, update: &Value, policies: &mut BTreeMap<i64, String>
 ) -> Result<Option<(i64,i64)>> {
@@ -554,11 +564,21 @@ async fn process_update_with_policy_cache(
         return Ok(None);
     }
     if tg::ids(msg).is_none() {return Ok(None);}
-    if !ensure_group_enrolled(env,&msg["chat"]).await? || !tg::is_eligible_group_message(msg) {
+    if !tg::is_eligible_group_message(msg) {
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }
-    if handle_admin_command(env,msg).await? {
+    // Even paused groups need command feedback explaining missing permissions.
+    let enrolled=match ensure_group_enrolled(env,&msg["chat"]).await {
+        Ok(enrolled)=>enrolled,
+        Err(error)=>{
+            if command_parts(env,msg).is_some() {
+                let _=tg::reply_command(env,msg,"暂时无法确认机器人群组权限，系统将自动重试。").await;
+            }
+            return Err(error);
+        }
+    };
+    if handle_admin_command(env,msg).await? || !enrolled {
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }
@@ -622,11 +642,13 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
         Ok(())=>{
             store::conclude_pending(env,chat_id,user_id,message_id,"banned").await?;
             store::set_strike_action(env,chat_id,message_id,"banned_after_review").await?;
-            let notice=format!(
-                "用户 {user_id} 在 60 秒管理员复核期内未被取消，现已执行封禁。"
-            );
-            tg::send_group_action_notice(env,chat_id,message_id,Some(user_id),"封禁已执行",&notice).await;
-            let _=tg::send_to_review_or_chat(env,chat_id,&notice).await;
+            let notice="60 秒复核期结束，封禁已执行。";
+            let user=crate::formatting::ActionUser {
+                id:user_id,name:tg::display_name(&member["user"]),
+                warnings:store::recent_strikes(env,chat_id,user_id).await.ok(),
+            };
+            tg::send_group_action_notice(env,chat_id,message_id,Some(&user),"封禁已执行",notice).await;
+            let _=tg::send_admin_action_notice(env,chat_id,message_id,Some(&user),"封禁已执行",notice).await;
             Ok(())
         },
         Err(e)=>{

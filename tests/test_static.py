@@ -62,14 +62,15 @@ class SmokeTests(unittest.TestCase):
         flagged=flagged+1 WHERE chat_id=-100 AND cursor_message_id=0''',(15,))
         self.assertEqual(self.db.execute('SELECT scanned,flagged FROM scan_jobs').fetchone(),(1,1))
 
-    def test_auto_onboard_and_silent_mode(self):
+    def test_auto_onboard_and_command_replies(self):
         src=(ROOT/'src/moderation.rs').read_text()
         tg=(ROOT/'src/tg.rs').read_text()
         util=(ROOT/'src/util.rs').read_text()
         self.assertIn('update.get("my_chat_member")',src)
         self.assertIn('ensure_group_enrolled(env,&msg["chat"])',src)
         self.assertIn('member_capabilities(&event["new_chat_member"]',src)
-        self.assertIn('if chat_id <= 0 { return Ok(()); }',tg)
+        self.assertIn('pub async fn reply_command(',tg)
+        self.assertIn('allow_sending_without_reply',tg)
         self.assertNotIn('GROUP_CHAT_ID',util)
         conf=json.loads((ROOT/'wrangler.jsonc').read_text())
         self.assertNotIn('GROUP_CHAT_ID',conf['vars'])
@@ -81,7 +82,7 @@ class SmokeTests(unittest.TestCase):
 
     def test_admin_exempt_from_ban(self):
         source=(ROOT / 'src/moderation.rs').read_text()
-        self.assertIn('let ban_user = !is_admin && store::can_auto_ban(env,chat_id).await?',source)
+        self.assertIn('let can_ban = !is_admin && store::can_auto_ban(env,chat_id).await?',source)
         self.assertIn('tg::user_is_admin(env, chat_id, user_id).await?',source)
         self.assertIn('IMMEDIATE_BAN", false',source)
 
