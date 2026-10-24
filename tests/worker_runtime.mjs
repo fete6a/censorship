@@ -71,7 +71,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')) {
             const key=`${values[0]}:${values[1]}`,entry=warningAdjustments.get(key);
             const newer=strikeEvents.filter((x,i)=>x.key===key && (!entry || i>=entry.start)).length;
-            return {count:(entry ? entry.count : strikeCount)+newer};
+            // Existing runtime fixtures supply strikeCount as the effective total.
+            // After a manual baseline, model genuinely new strikes separately.
+            return {count:entry ? entry.count+newer : Math.max(strikeCount,newer)};
           }
           if (sql.includes('violations') && sql.includes('COUNT'))
             return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
@@ -1049,7 +1051,7 @@ await test('manual warning adjustments count only subsequent violations without 
   await f.consume(message(groupA,2701));
   assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
   assert.equal(f.telegram.some(x=>x.method==='restrictChatMember'),false);
-  assert.match(f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA)?.args.text||'',/1\/3/);
+  assert.match(f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA&&x.args.text.includes('违规消息已删除'))?.args.text||'',/1\/3/);
   const set=command('/warnings 22 3',{id:groupA,type:'supergroup'});set.update_id=2702;
   await f.consume(set);
   assert.equal(f.telegram.filter(x=>x.method==='restrictChatMember').length,0,'setting 3 is not itself a penalty');
