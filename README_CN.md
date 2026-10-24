@@ -65,7 +65,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。手动 GitHub Actions 部署先执行 `wrangler d1 migrations apply DB --remote`，成功后才执行 `wrangler deploy`。Cloudflare API Token 必须有 D1 迁移/写入权限；普通 PR/push 构建不修改生产数据库。
+GitHub Workflow 可选手动触发部署，但只有在设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。现在只支持 `schema/current.sql` 对应的**当前数据库结构**，不再保留历史迁移链或自动升级旧数据库。手动 GitHub Actions 部署会先用只读 D1 查询核对必须的字段，结构不符则拒绝部署；不会自动迁移。Cloudflare API Token 必须有读取 D1 和部署 Worker 的权限；普通 PR/push 构建不访问生产 D1。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -74,10 +74,10 @@ npx wrangler d1 create telegram-clef-moderation
 npx wrangler queues create telegram-clef-moderation-events
 npx wrangler queues create telegram-clef-ban-timers
 npx wrangler queues create telegram-clef-moderation-dlq
-npx wrangler d1 migrations apply telegram-clef-moderation --remote
+npx wrangler d1 execute DB --remote --file schema/current.sql
 ```
 
-设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
+上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**；不要用于已存在数据的生产数据库，也不支持旧结构的就地升级。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
 
 ```sh
 read -r -s -p 'BOT_TOKEN: ' BOT_TOKEN; echo

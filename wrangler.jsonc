@@ -21,8 +21,7 @@
     {
       "binding": "DB",
       "database_name": "telegram-clef-moderation",
-      "database_id": "aca7a855-3657-4d2d-b1cf-7e7734ebda49",
-      "migrations_dir": "migrations"
+      "database_id": "aca7a855-3657-4d2d-b1cf-7e7734ebda49"
     }
   ],
   "ai": {
