@@ -25,7 +25,7 @@ A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it
 - **After successful deletion**, the bot immediately attempts a MarkdownV2 notice with the deleted message ID, category, a clickable user display name (numeric ID fallback), the seven-day warning count as a three-step Markdown bar, and, where applicable, the 60-second mute, pending ban and `/cancel USER_ID` instructions. A failed mute is reported as such, not as a completed ban.
 - **Only after Telegram confirms a ban** does the bot send a separate completed-ban announcement. Notifications use escaped Telegram MarkdownV2 and generated numeric-ID links; links to deleted messages are deliberately omitted. Notices stay in the affected group and do not quote the deleted message's text.
 - Dry-run and audit reviews never claim that a deletion or ban happened. Posting is **best effort**: if Telegram rejects a group notice, the already-completed moderation action is not rolled back or repeated to retry the notice.
-- All supported commands, including `/start` and `/help`, reply in their originating chat and forum topic, even with `/logs off`. Unknown commands, invalid arguments, permission denials and disabled groups receive feedback. Commands addressed to another bot are ignored. Help, unknown and denied group commands still undergo normal moderation.
+- All supported commands, including `/start` and `/help`, reply in their originating chat and forum topic, even with `/logs off`. Unknown commands, invalid arguments, permission denials and disabled groups receive feedback. Commands addressed to another bot are ignored. Help, unknown and denied group commands still undergo normal moderation; `/rules` with extra text is also moderated.
 
 ## Telegram permissions and delivery requirements
 
@@ -37,7 +37,9 @@ A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it
 
 ## Administrator commands
 
-All management commands check the issuing user's `getChatMember` administrator/creator status **in the exact target group** before accessing its data. Private commands require a **negative group ID**; group commands always target their originating group. Group settings apply only to that group.
+Group `/rules` is available to all members, including anonymous senders, and replies with the current group description even when moderation is disabled. It takes no group argument and stays in the originating topic; an empty description receives an explicit notice. Private `/rules GROUP_ID` still requires administrator authorization in that exact group.
+
+All other management commands check the issuing user's `getChatMember` administrator/creator status **in the exact target group** before accessing its data. Private commands require a **negative group ID**; group commands always target their originating group. Group settings apply only to that group.
 
 | Purpose | Command in the group | Command in a private chat |
 | --- | --- | --- |
