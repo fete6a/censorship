@@ -7,34 +7,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeploymentReviewTests(unittest.TestCase):
-    def test_deployment_checks_schema_before_publish_without_migration(self):
+    def test_ci_builds_artifacts_without_production_access(self):
         workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn("github.event_name == 'push'", workflow)
-        self.assertIn('needs: build', workflow)
-        script=(ROOT/'scripts/deploy-ci.sh').read_text()
-        self.assertIn('set -euo pipefail', script)
-        queries = (
-            'SELECT next_attempt_at,attempt_count FROM pending_bans LIMIT 0',
-            'SELECT logs_enabled,remove_threshold FROM group_settings LIMIT 0',
-            'SELECT chat_type,status FROM managed_chats LIMIT 0',
-            'SELECT last_status,last_category FROM archived_messages LIMIT 0',
-        )
-        for q in queries:
-            self.assertIn(q, script)
-            self.assertLess(script.index(q), script.index('npx wrangler deploy'))
-        self.assertNotIn('d1 migrations apply', workflow+script)
-        self.assertFalse((ROOT / 'migrations').exists(),
-                         'Historical migration chain should not ship')
-        self.assertFalse((ROOT / '.github/workflows/deploy-once.yml').exists(),
-                         'One-off dispatcher must be removed')
-
-    def test_deployment_and_builds_use_independent_concurrency(self):
-        workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn('group: build-${{ github.workflow }}-', workflow)
-        self.assertIn('group: cloudflare-production', workflow)
-        self.assertIn('cancel-in-progress: false', workflow.split('  deploy:',1)[1])
-        self.assertIn('actions/download-artifact@v4', workflow)
+        self.assertIn('actions/upload-artifact@v4', workflow)
+        self.assertIn('sha256sum build/index.js build/index_bg.wasm', workflow)
+        self.assertIn('node --experimental-vm-modules tests/worker_runtime.mjs', workflow)
+        for removed in ('  deploy:', 'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID',
+                        'wrangler deploy', 'd1 execute', 'actions/download-artifact'):
+            self.assertNotIn(removed, workflow)
+        self.assertFalse((ROOT / 'scripts/deploy-ci.sh').exists())
+        self.assertFalse((ROOT / '.github/workflows/deploy-once.yml').exists())
+        self.assertFalse((ROOT / 'migrations').exists())
 
     def test_current_schema_can_bootstrap_one_empty_database(self):
         script = (ROOT / 'schema/current.sql').read_text()

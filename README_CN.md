@@ -73,7 +73,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-推送到 main 且构建、测试成功后，GitHub Workflow 自动部署同一次 CI 的构建产物，也支持 main 分支手动触发部署。需要设置 **GitHub Actions Secrets** `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`，并创建好 D1 和 Queues、把正确数据库 UUID 写入 `wrangler.jsonc` 后才能成功。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端通过 `wrangler secret put BOT_TOKEN` 与 `wrangler secret put WEBHOOK_SECRET` 保存。现在只支持 `schema/current.sql` 对应的**当前数据库结构**，不再保留历史迁移链或自动升级旧数据库。自动或手动 GitHub Actions 部署会先用只读 D1 查询核对必须的字段，结构不符则拒绝部署；不会自动迁移。Cloudflare API Token 必须有读取 D1 和部署 Worker 的权限；PR 构建不访问生产 D1 或部署密钥；main 的部署任务仅在构建成功后运行。
+GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。只支持 `schema/current.sql` 对应的当前数据库结构，不自动迁移生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -117,9 +117,9 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 被动审核摘要在每个 Queue 批次按群一次查询最终状态，不再逐消息读取；`/logs off` 时跳过这些查询。同群摘要的多个分段共用一次最新管理员查询。每条消息仍分别推理、归档、确认和重试。
 
-## 自动部署与群组导航
+## 通过 Cloudflare MCP 手动部署与群组导航
 
-main 每次成功构建都会上传包含 SHA-256 校验文件的 Worker 产物，由独立部署任务下载同一产物并发布到 Cloudflare。部署阶段不重新编译 Rust，也不重新打包 JavaScript：临时 Wrangler 配置移除自定义 build 命令，并使用 `--no-bundle`。发布前后校验产物，发布前确认仍是 main 最新提交；生产部署串行执行，过时提交跳过。保留现有变量和 Cloudflare 密钥，只读检查数据库结构，发布后验证健康端点。仅需现有 Actions secrets `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。
+下载 main 成功构建的 Worker 产物，核对 SHA-256 和源提交；通过已授权 Cloudflare MCP 先只读检查 D1 必需字段，再将原始 `index.js` 和二进制 `index_bg.wasm` 作为模块上传，不重新打包。保留现有绑定、变量、密钥、兼容性与可观测性配置，发布后核对活动版本和 `/healthz`。数据库内容、Queue 消费者、Cron 和 Telegram Webhook 配置保留。
 
 管理员私聊摘要和处罚日志增加当前群名、群 ID 与可点击链接：公开群使用用户名链接；私有群优先使用已存在的 Telegram 邀请链接，否则链接到仍存在的已审核消息，供群成员进入。不会新建邀请链接。元数据不可用时回退到群 ID 和可用消息链接。群名安全转义，收件人仍只限目标群当前人类管理员。
 
