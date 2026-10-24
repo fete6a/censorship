@@ -1205,7 +1205,7 @@ await test('old enforcement result after stop and audit restart cannot alter new
  const begun=new Promise(resolve=>entered=resolve);
  const held=new Promise(resolve=>unblock=resolve);
  const f=fixture({remove:true,score:.99,pauseAi:async()=>{entered();await held}});
- f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:1});
  f.archives.set(groupA+':17',message(groupA,17).message);
  const start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9100;
  await f.consume(start);
@@ -1232,25 +1232,28 @@ await test('old enforcement result after stop and audit restart cannot alter new
  assert.equal(f.jobs.get(groupA).status,'done');
  assert.equal(f.telegram.filter(x=>x.method==='sendMessage'&&x.args.text.includes('历史审查完成')).length,1);
 });
-await test('concurrent Cron claims do not process the same group and other groups remain runnable',async()=>{
+await test('concurrent Cron claims cannot process the same group twice',async()=>{
  let unblock,entered;
- const held=new Promise(resolve=>unblock=resolve);
- const begun=new Promise(resolve=>entered=resolve);
+ const held=new Promise(resolve=>unblock=resolve),begun=new Promise(resolve=>entered=resolve);
  const f=fixture({pauseAi:async()=>{entered();await held}});
  f.settings.set(groupA,{dry_run:1,logs_enabled:0});
- f.settings.set(groupB,{dry_run:1,logs_enabled:0});
  f.archives.set(groupA+':17',message(groupA,17).message);
- f.archives.set(groupB+':27',message(groupB,27).message);
- let one=command('/scan_all audit',{id:groupA,type:'supergroup'});one.update_id=9200;await f.consume(one);
- let two=command('/scan_all audit',{id:groupB,type:'supergroup'});two.update_id=9201;two.message.from.id=21;await f.consume(two);
+ let one=command('/scan_all audit',{id:groupA,type:'supergroup'});one.update_id=9200;
+ await f.consume(one);
  const first=f.tick();await begun;
- const second=f.tick(); // separate group can claim, but it also pauses on AI
- const third=f.tick();  // neither group has an available claim
- await third;
- assert.equal(f.aiCalls.length,2);
- unblock();await Promise.all([first,second]);
+ const second=f.tick();
+ await second;
+ assert.equal(f.aiCalls.length,1,'another Cron cannot claim an in-progress scan');
+ unblock();await first;
  assert.equal(f.jobs.get(groupA).scanned,1);
- assert.equal(f.jobs.get(groupB).scanned,1);
+ assert.equal(f.jobs.get(groupA).flagged,0);
+ // Other groups can be started and scanned independently after this one.
+ f.archives.set(groupB+':27',message(groupB,27).message);
+ let other=command('/scan_all audit',{id:groupB,type:'supergroup'});other.update_id=9201;other.message.from.id=21;
+ await f.consume(other);
+ await f.tick();
+ assert.equal(f.jobs.get(groupB)?.scanned,1);
+ assert.equal(f.jobs.get(groupA).scanned,1);
 });
 await test('Telegram deletion already in flight is not represented as atomically cancellable',async()=>{
  let unblock,entered;
