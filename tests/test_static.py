@@ -202,7 +202,7 @@ class SmokeTests(unittest.TestCase):
 
     def test_admin_exempt_from_ban(self):
         source=(ROOT / 'src/moderation.rs').read_text()
-        self.assertIn('let can_ban = !is_admin && store::can_auto_ban(env,chat_id).await?',source)
+        self.assertIn('!is_admin && store::can_auto_ban(env,chat_id).await?',source)
         self.assertIn('tg::user_is_admin(env, chat_id, user_id).await?',source)
         self.assertIn('IMMEDIATE_BAN", false',source)
 

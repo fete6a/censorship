@@ -51,12 +51,14 @@ All other management commands check the issuing user's `getChatMember` administr
 | Enforcement mode (query or set) | `/dry-run [on\|off]` (also `/dry_run`) | `/dry_run -100GROUP_ID [on\|off]` |
 | Private review logs (query or set) | `/logs [on\|off]` | `/logs -100GROUP_ID [on\|off]` |
 | Read group policy | `/rules` | `/rules -100GROUP_ID` |
-| Cancel pending ban | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
-| Inspect pending ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
+| Cancel pending ban (does not unmute) | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
+| Inspect pending/processing ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
 | Read or set a user's seven-day warnings | `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` |
 | Re-review and enforce an archived or replied-to message by default | Reply with `/scan [audit\|enforce]` or use `/scan MESSAGE_ID [audit\|enforce]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit\|enforce]` |
 | Scan archived messages (enforcement by default) | `/scan_all [audit\|enforce]` | `/scan_all -100GROUP_ID [audit\|enforce]` |
 | Scan progress / stop | `/scan_status` / `/scan_stop` | `/scan_status -100GROUP_ID` / `/scan_stop -100GROUP_ID` |
+
+`/cancel` only cancels a `pending` ban in D1 and never restores Telegram permissions. The bot's 60-second restriction expires automatically unless a human changes it. A `processing` case may already have submitted a Telegram request and cannot be atomically recalled. Warning adjustments fence subsequent retries of the old violation.
 
 Send `/start` or `/help` in a group or private chat to see command help. Omitting `on`/`off` queries the current logs/dry-run setting. Replies are independent of private-log settings; a failed reply does not replay the completed management action.
 
@@ -107,3 +109,12 @@ Private administrator digests and action logs include the current group name, nu
 Warning counts use the existing per-group, per-user seven-day strike records and show the full count even above three; the bar saturates at the three-warning threshold. Archived messages preserve user display names for later scans. Anonymous senders do not receive an attributed warning count.
 
 Within a Queue delivery, successful policy lookups are reused separately for each group. Commands and membership changes invalidate that delivery’s cache; failed lookups are never cached. A description edited externally during the same delivery may remain stale until the next invalidation or delivery. Inference, archive writes and ack/retry remain per message and sequential.
+
+
+## Mandatory D1 release preflight
+
+Before manually uploading any Worker built from PR #11 or later, follow [the production D1 schema release gate](docs/manual-d1-release.md). The read-only check `python3 tools/check_d1_schema.py --remote` must exit 0 after the additive migration and immediately before upload. Green GitHub Actions does not establish production migration status. Never run `schema/current.sql` against existing D1 data.
+
+The release check includes PR #13's `warning_edit_receipts` table and `apply_warning_edit_receipt` trigger. Its DDL is compared with the canonical schema and its behavior verified only against dummy in-memory data. Existing receipt tables without the trigger require manual reconciliation (not automatic migration).
+
+Release preflight also requires the scan-fencing columns. With `--pre-migration`, apply only the missing scan `ALTER` statements printed by the checker; do not blindly repeat the one-time scan migration. See [manual release gate](docs/manual-d1-release.md).

@@ -132,7 +132,8 @@ class PendingRetryTests(unittest.TestCase):
         self.assertIsNotNone(self.db.execute(reserve,(-100,7,other)).fetchone())
         self.assertIsNotNone(self.db.execute(query_for("claim_due"),(-100,7,other)).fetchone())
         self.assertIsNone(self.db.execute(query_for("claim_due"),(-100,7,other)).fetchone())
-        self.db.execute(query_for("create_pending"),(-200,7,mid+1,200,200))
+        self.db.execute("INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) VALUES(-200,7,?,200,'spam',1,'warned')", (mid+1,))
+        self.db.execute(query_for("create_pending_after_warning_check"),(-200,7,mid+1,200,200,None,None))
         self.assertEqual(self.state(-200,7),(mid+1,"pending",0,0))
         self.assertIsNone(self.db.execute(reserve,(-200,7,mid)).fetchone())
         self.assertIsNotNone(self.db.execute(reserve,(-200,7,mid+1)).fetchone())
@@ -154,6 +155,68 @@ class PendingRetryTests(unittest.TestCase):
             "SELECT cancellation_reason FROM pending_bans WHERE chat_id=-200 AND user_id=7"
         ).fetchone()[0],"timer_too_late")
         self.assertEqual(self.run_tick(),[])
+
+    def test_processing_reset_does_not_resurrect_failed_telegram_ban(self):
+        chat, user = -200, 7
+        mid = self.insert(chat, user)
+        self.db.execute(
+            "INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) "
+            "VALUES(?,?,?,100,'spam',0.99,'muted_pending')", (chat,user,mid)
+        )
+        self.assertIsNotNone(self.db.execute(query_for("claim_due"),(chat,user,mid)).fetchone())
+        # Warning receipt commits while the simulated Telegram API call is in flight.
+        self.db.execute(query_for("set_warning_count"),(801,chat,user,0,11,self.time))
+        self.assertEqual(self.state(chat,user)[1],"processing")
+        self.db.execute(query_for("retry_pending"),(chat,user,mid))
+        self.assertEqual(self.state(chat,user)[1],"canceled")
+        self.assertEqual(self.db.execute(
+            "SELECT cancellation_reason FROM pending_bans WHERE chat_id=? AND user_id=?",
+            (chat,user)).fetchone()[0],"warning_count_adjusted")
+        self.assertIsNone(self.db.execute(query_for("claim_due"),(chat,user,mid)).fetchone())
+
+    def test_retry_before_reset_then_receipt_cancels_pending(self):
+        chat,user=-200,7
+        mid=self.insert(chat,user)
+        self.db.execute(
+            "INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) "
+            "VALUES(?,?,?,100,'spam',0.99,'muted_pending')",(chat,user,mid))
+        self.db.execute(query_for("claim_due"),(chat,user,mid))
+        self.db.execute(query_for("retry_pending"),(chat,user,mid))
+        self.assertEqual(self.state(chat,user)[1],"pending")
+        self.db.execute(query_for("set_warning_count"),(802,chat,user,0,11,self.time))
+        self.assertEqual(self.state(chat,user)[1],"canceled")
+        self.assertIsNone(self.db.execute(query_for("claim_due"),(chat,user,mid)).fetchone())
+
+    def test_retry_not_fenced_without_adjustment_and_group_isolation(self):
+        mid=self.insert(-200,7)
+        other=self.insert(-100,7)
+        for chat,message in [(-200,mid),(-100,other)]:
+            self.db.execute(
+                "INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) "
+                "VALUES(?,?,?,100,'spam',0.99,'muted_pending')",(chat,7,message))
+            self.db.execute(query_for("claim_due"),(chat,7,message))
+        self.db.execute(query_for("set_warning_count"),(803,-200,7,0,11,self.time))
+        self.db.execute(query_for("retry_pending"),(-200,7,mid))
+        self.db.execute(query_for("retry_pending"),(-100,7,other))
+        self.assertEqual(self.state(-200,7)[1],"canceled")
+        self.assertEqual(self.state(-100,7)[1],"pending")
+
+    def test_cancel_after_claim_is_not_reported_as_pending_cancel(self):
+        mid=self.insert(-200,7)
+        self.db.execute(query_for("claim_due"),(-200,7,mid))
+        self.assertIsNone(self.db.execute(query_for("cancel_pending"),(11,"admin_command",200,-200,7)).fetchone())
+        row=self.db.execute(query_for("ban_case_status"),(-200,7)).fetchone()
+        self.assertEqual(row,("processing",))
+
+    def test_cancel_does_not_call_telegram_permission_api(self):
+        src=(ROOT/"src/moderation.rs").read_text()
+        cancel=src.split('"/cancel" => {',1)[1].split('"/pending" => {',1)[0]
+        self.assertIn("store::cancel_pending(",cancel)
+        self.assertNotIn("tg::unmute(",cancel)
+        self.assertNotIn("tg::get_member(",cancel)
+        self.assertNotIn("tg::api(",cancel)
+        tg=(ROOT/"src/tg.rs").read_text()
+        self.assertNotIn("pub async fn unmute(",tg)
 
     def test_rust_order_and_boundaries(self):
         src=(ROOT/"src/moderation.rs").read_text()

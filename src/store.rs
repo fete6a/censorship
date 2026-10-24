@@ -64,10 +64,6 @@ pub async fn archive(env: &Env, msg: &Value) -> Result<()> {
 /// For historical scans, the archive write is atomically scoped to the
 /// current run and Cron claim. Post-deletion bookkeeping is deliberately
 /// unscoped because Telegram may already have performed the external action.
-pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &str, category: &str, probability: f64) -> Result<()> {
-    finish_review_scoped(env,chat_id,message_id,status,category,probability,None).await
-}
-
 pub async fn finish_review_scoped(
     env: &Env, chat_id: i64, message_id: i64, status: &str,
     category: &str, probability: f64, scan: Option<&Job>
@@ -164,24 +160,47 @@ pub async fn recent_strikes(env: &Env, chat_id: i64, user_id: i64) -> Result<i64
     Ok(row.map(|x| x.count).unwrap_or(0))
 }
 
-/// Set the effective count without touching historical violations, which are
-/// still needed to prevent duplicate strikes and audit prior enforcement.
-/// One upsert atomically snapshots the latest existing violation rowid.
+/// Persist an idempotent administrator adjustment. A duplicate Telegram update
+/// never advances the baseline and therefore cannot erase later real strikes.
+/// The SQLite trigger atomically cancels any *pending* automatic ban.
 pub async fn set_warning_count(
-    env: &Env, chat_id: i64, user_id: i64, count: i64, actor_id: i64
-) -> Result<()> {
-    if chat_id>=0 || user_id<=0 || actor_id<=0 || !(0..=3).contains(&count) {
-        return Err(fail("Invalid warning adjustment scope, user or count"));
+    env: &Env, chat_id: i64, user_id: i64, count: i64, actor_id: i64, update_id: i64
+) -> Result<bool> {
+    if chat_id >= 0 || user_id <= 0 || actor_id <= 0 || update_id < 0 || !(0..=3).contains(&count) {
+        return Err(fail("Invalid warning adjustment scope, user, count or update"));
     }
-    env.d1("DB")?.prepare(
-        "INSERT INTO warning_adjustments(chat_id,user_id,base_count,adjusted_at,violation_rowid,actor_id) \
-         SELECT ?1,?2,?3,?4,COALESCE(MAX(rowid),0),?5 \
-         FROM violations WHERE chat_id=?1 AND user_id=?2 \
+    let inserted = env.d1("DB")?.prepare(
+        "INSERT INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) \
+         VALUES(?,?,?,?,?,?) ON CONFLICT(update_id) DO NOTHING RETURNING update_id AS count"
+    ).bind(&[js_i64(update_id),js_i64(chat_id),js_i64(user_id),
+        js_i64(count),js_i64(actor_id),js_i64(now())])?.first::<CountRow>(None).await?;
+    Ok(inserted.is_some())
+}
+
+/// A paused moderation request must not schedule an old ban after an
+/// administrator has already reset its underlying violation. A fresh genuine
+/// violation can still create a new pending task.
+pub async fn create_pending_after_warning_check(
+    env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64, scan: Option<&Job>
+) -> Result<bool> {
+    let inserted = env.d1("DB")?.prepare(
+        "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
+         SELECT ?1,?2,?3,?4,?5,'pending' WHERE EXISTS ( \
+           SELECT 1 FROM violations v WHERE v.chat_id=?1 AND v.user_id=?2 AND v.message_id=?3 \
+           AND NOT EXISTS (SELECT 1 FROM warning_adjustments a WHERE a.chat_id=?1 \
+             AND a.user_id=?2 AND a.violation_rowid>=v.rowid)) \
+         AND (?6 IS NULL OR EXISTS (SELECT 1 FROM scan_jobs WHERE chat_id=?1 \
+           AND generation=?6 AND lease_id=?7 AND status='running' AND lease_until>unixepoch())) \
          ON CONFLICT(chat_id,user_id) DO UPDATE SET \
-           base_count=excluded.base_count,adjusted_at=excluded.adjusted_at, \
-           violation_rowid=excluded.violation_rowid,actor_id=excluded.actor_id"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(count),js_i64(now()),js_i64(actor_id)])?.run().await?;
-    Ok(())
+           message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
+           status='pending',next_attempt_at=0,attempt_count=0, \
+           canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
+           WHERE pending_bans.status IN ('banned','canceled','failed') \
+         RETURNING chat_id AS count"
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),
+        js_i64(now()),js_i64(due_at),scan.map(|j|js_i64(j.generation)).unwrap_or(JsValue::NULL),
+        scan.map(|j|js_i64(j.lease_id)).unwrap_or(JsValue::NULL)])?.first::<CountRow>(None).await?;
+    Ok(inserted.is_some())
 }
 
 /// Atomically start or restart a completed/stopped scan. A running job must
@@ -302,9 +321,28 @@ pub async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[js_i64(now()-14*86400)])?.run().await?;
     env.d1("DB")?.prepare("DELETE FROM violations WHERE created_at<?")
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
-    // Expired manual baselines must not linger indefinitely.
-    env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
-        .bind(&[js_i64(now()-7*86400)])?.run().await?;
+    // Retain replay receipts longer than processed_updates (14 days) so a
+    // delayed duplicate cannot shift a manual warning baseline.
+    // An accidental old-schema rollout may omit either additive table.
+    // Ignore only its exact missing-table failure, never unrelated D1 errors.
+    let receipt_cleanup = env.d1("DB")?.prepare("DELETE FROM warning_edit_receipts WHERE created_at<?")
+        .bind(&[js_i64(now()-30*86400)])?.run().await;
+    if let Err(error) = receipt_cleanup {
+        if error.to_string().contains("no such table: warning_edit_receipts") {
+            worker::console_error!("warning_edit_receipts_missing: migrate D1 before release");
+        } else {
+            return Err(error);
+        }
+    }
+    let warning_cleanup = env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
+        .bind(&[js_i64(now()-7*86400)])?.run().await;
+    if let Err(error) = warning_cleanup {
+        if error.to_string().contains("no such table: warning_adjustments") {
+            worker::console_error!("warning_adjustments_missing: migrate D1 before release");
+        } else {
+            return Err(error);
+        }
+    }
     let keep_days = crate::util::config(env,"ARCHIVE_DAYS").parse::<i64>().unwrap_or(0);
     if keep_days > 0 {
         env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")
@@ -323,6 +361,18 @@ pub struct PendingBan {
     pub user_id: i64,
     pub message_id: i64,
     pub due_at: i64,
+}
+
+#[derive(Deserialize)]
+struct BanStatusRow { status: String }
+
+/// A status snapshot for honest command feedback, including in-flight claims.
+/// This does not authorize changing Telegram member permissions.
+pub async fn ban_case_status(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<String>> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT status FROM pending_bans WHERE chat_id=? AND user_id=?"
+    ).bind(&[js_i64(chat_id),js_i64(user_id)])?.first::<BanStatusRow>(None).await?;
+    Ok(row.map(|r|r.status))
 }
 
 pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<PendingBan>> {
@@ -357,18 +407,6 @@ pub async fn begin_pending_attempt(env: &Env, chat_id: i64, user_id: i64, messag
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
       .first::<PendingBan>(None).await?;
     Ok(attempted.is_some())
-}
-
-pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64) -> Result<()> {
-    env.d1("DB")?.prepare(
-        "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
-         VALUES(?,?,?,?,?,'pending') ON CONFLICT(chat_id,user_id) DO UPDATE SET \
-         message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
-         status='pending',next_attempt_at=0,attempt_count=0, \
-         canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
-         WHERE pending_bans.status IN ('banned','canceled','failed')"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),js_i64(due_at)])?.run().await?;
-    Ok(())
 }
 
 /// A transaction-like conditional transition.  Exactly one of cancel and
@@ -407,9 +445,30 @@ pub async fn conclude_pending(env: &Env, chat_id: i64, user_id: i64, message_id:
     Ok(())
 }
 
+/// Atomically recover an ambiguous Telegram ban failure only if no warning
+/// adjustment covered the originating violation. Otherwise cancel the case.
+/// This is one SQL update so a concurrent receipt and retry cannot resurrect it.
 pub async fn retry_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<()> {
     env.d1("DB")?.prepare(
-        "UPDATE pending_bans SET status='pending' WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
+        "UPDATE pending_bans SET status=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN 'canceled' ELSE 'pending' END, \
+         cancellation_reason=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN 'warning_count_adjusted' ELSE cancellation_reason END, \
+         resolved_at=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN unixepoch() ELSE resolved_at END \
+         WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
     Ok(())
 }
