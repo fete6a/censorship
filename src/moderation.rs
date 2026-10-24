@@ -140,14 +140,14 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
 /// An AI failure, a missing group description, and unsupported media
 /// always result in zero punitive actions (fail open).
 pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
-    review_with_policy_cache(env, msg, mode, None).await
+    review_with_policy_cache(env, msg, mode, None, None).await
 }
 
 /// A Queue invocation may reuse a successfully fetched description for the same
 /// group. Never cache failures or share policies across groups or invocations.
 /// Commands and membership updates invalidate the caller's cache.
 async fn review_with_policy_cache(
-    env: &Env, msg: &Value, mode: Mode, mut policies: Option<&mut BTreeMap<i64, String>>
+    env: &Env, msg: &Value, mode: Mode, mut policies: Option<&mut BTreeMap<i64, String>>, scan: Option<&store::Job>
 ) -> Result<bool> {
     let (chat_id, msg_id) = tg::ids(msg).ok_or_else(|| fail("Missing message ID"))?;
     let cached = policies.as_ref().and_then(|p| p.get(&chat_id).cloned());
@@ -161,11 +161,11 @@ async fn review_with_policy_cache(
     let rules = match rules_result {
         Ok(p) if !p.trim().is_empty() => p,
         Ok(_) => {
-            store::finish_review(env, chat_id, msg_id, "no_group_description", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "no_group_description", "none", 0.0,scan).await?;
             return Ok(false);
         }
         Err(error) => {
-            store::finish_review(env, chat_id, msg_id, "policy_unavailable", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "policy_unavailable", "none", 0.0,scan).await?;
             return Err(error);
         }
     };
@@ -173,7 +173,7 @@ async fn review_with_policy_cache(
     let decision = match classify(env, &rules, msg).await {
         Ok(d) => d,
         Err(error) => {
-            store::finish_review(env, chat_id, msg_id, "review_error", "none", 0.0).await?;
+            store::finish_review_scoped(env, chat_id, msg_id, "review_error", "none", 0.0,scan).await?;
             console_error!("review_unavailable chat={} message={} error={}", chat_id, msg_id, error);
             // Never retry unsupported files indefinitely. Queue retries on other errors.
             return Ok(false);
@@ -189,26 +189,26 @@ async fn review_with_policy_cache(
             console_log!("needs_review_missing_category chat={} message={} remove_probability={:.3} threshold={:.3}",
                 chat_id,msg_id,decision.remove_probability,threshold);
         }
-        store::finish_review(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability,scan).await?;
         return Ok(false);
     }
     let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
-        store::finish_review(env, chat_id, msg_id,
+        store::finish_review_scoped(env, chat_id, msg_id,
             if mode == Mode::Audit { "audit_flag" } else { "dry_run_flag" },
-            &decision.category, decision.remove_probability).await?;
+            &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
     let sent_at = field_int(msg, "date").unwrap_or(0);
     if sent_at <= 0 || now().saturating_sub(sent_at) >= DELETE_WINDOW {
-        store::finish_review(env, chat_id, msg_id, "too_old_to_delete", &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, "too_old_to_delete", &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
     // A repeated live update, edit, or historical rescan must not issue a second strike.
     if store::has_strike(env, chat_id, msg_id).await? {
-        store::finish_review(env, chat_id, msg_id, "previously_deleted", &decision.category, decision.remove_probability).await?;
+        store::finish_review_scoped(env, chat_id, msg_id, "previously_deleted", &decision.category, decision.remove_probability,scan).await?;
         return Ok(true);
     }
 
@@ -221,7 +221,7 @@ async fn review_with_policy_cache(
     };
     // Settings may change while Telegram lookups are in flight.
     if store::group_dry_run(env,chat_id).await? {
-        store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
+        store::finish_review_scoped(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability,scan).await?;
         return Ok(true);
     }
     // Fail closed on missing warning schema before irreversible Telegram deletion.
@@ -229,8 +229,13 @@ async fn review_with_policy_cache(
     if let Some(user_id) = user {
         let _ = store::recent_strikes(env, chat_id, user_id).await?;
     }
+    if let Some(job)=scan {
+        if !store::scan_is_current(env,job).await? {return Ok(false);}
+    }
     tg::delete(env, chat_id, msg_id).await?;
 
+    // Deletion is irreversible. Record the strike even if the scan stopped
+    // while Telegram was responding; further punishment needs a current claim.
     let mut notice = String::new();
     let mut notice_user=user.map(|id|crate::formatting::ActionUser {
         id,name:tg::display_name(&msg["from"]),warnings:None,
@@ -243,7 +248,11 @@ async fn review_with_policy_cache(
             && decision.remove_probability >= 0.99
             && decision.critical_probability >= 0.99
             && ["fraud", "threat"].contains(&decision.category.as_str());
-        let can_ban = !is_admin && store::can_auto_ban(env,chat_id).await? && flag(env, "ENABLE_BAN", true);
+        let scan_current=match scan {
+            Some(job)=>store::scan_is_current(env,job).await?,
+            None=>true,
+        };
+        let can_ban = scan_current && !is_admin && store::can_auto_ban(env,chat_id).await? && flag(env, "ENABLE_BAN", true);
         let ban_user = can_ban && (count >= 3 || very_severe);
         if ban_user {
             // Ban is *never* immediate. Give administrators 60 seconds to cancel.
@@ -251,15 +260,19 @@ async fn review_with_policy_cache(
                 store::set_strike_action(env, chat_id, msg_id, "pending_existing").await?;
                 notice = format!("已在 60 秒复核期内。取消封禁：/cancel {user_id}");
             } else {
-                // Never shorten an existing longer/manual mute; doing so could
-                // accidentally undo a human administrator's restriction.
+                // Preserve restrictions already observed. Telegram cannot make
+                // this check and the subsequent mute atomic against human edits.
                 let member = tg::get_member(env, chat_id, user_id).await?;
                 let already_restricted = field_str(&member,"status") == "restricted" &&
                     (field_int(&member,"until_date").unwrap_or(0) == 0 ||
                      field_int(&member,"until_date").unwrap_or(0) > now() + 60);
-                if store::group_dry_run(env,chat_id).await? {
+                let scan_current=match scan {
+                    Some(job)=>store::scan_is_current(env,job).await?,
+                    None=>true,
+                };
+                if !scan_current || store::group_dry_run(env,chat_id).await? {
                     store::set_strike_action(env,chat_id,msg_id,"deleted_no_mute_dry_run").await?;
-                    notice="已开启模拟模式，后续处罚停止。".into();
+                    notice="扫描已停止或模拟模式已开启，后续处罚停止。".into();
                 } else if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
                     store::set_strike_action(env,chat_id,msg_id,"existing_external_restriction").await?;
                     notice = "已有更长期的限制或不在群内，保留原处罚。".into();
@@ -267,10 +280,10 @@ async fn review_with_policy_cache(
                 match tg::mute_one_minute(env, chat_id, user_id).await {
                     Ok(deadline) => {
                         // D1 is authoritative; Cron recovers if delayed Queue delivery fails.
-                        let created=store::create_pending_after_warning_check(env, chat_id, user_id, msg_id, deadline).await?;
+                        let created=store::create_pending_after_warning_check(env, chat_id, user_id, msg_id, deadline,scan).await?;
                         if !created {
                             store::set_strike_action(env,chat_id,msg_id,"warning_adjusted_no_pending").await?;
-                            notice="管理员已调整警告，旧违规不再创建待封禁任务；临时禁言会自行到期。".into();
+                            notice="未创建新的待封禁任务：警告已调整、扫描已停止或已有任务；临时禁言会自行到期。".into();
                         } else {
                         store::set_strike_action(env, chat_id, msg_id, "muted_pending").await?;
                         let timer = json!({"kind":"ban_check","chat_id":chat_id,
@@ -304,7 +317,7 @@ async fn review_with_policy_cache(
     }
     let notice=format!("违规类别：{category}\n处理结果：{notice}");
     tg::send_group_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
-    store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
+    store::finish_review_scoped(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability,None).await?;
     // Notification failure must not erase the successful deletion.
     let _ = tg::send_admin_action_notice(env,chat_id,msg_id,notice_user.as_ref(),"违规消息已删除",&notice).await;
     Ok(true)
@@ -364,10 +377,10 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "/threshold 0.75（或 75%）— 设置删除阈值\n",
             "/dry_run on|off — 模拟模式\n",
             "/logs on|off — 管理员私聊日志\n",
-            "/scan [audit] — 回复消息后审核，默认按规则执行处罚\n",
-            "/scan MESSAGE_ID [audit] — 审核已归档消息\n",
+            "/scan [audit|enforce] — 回复消息后审核，默认按规则执行处罚\n",
+            "/scan MESSAGE_ID [audit|enforce] — 审核已归档消息\n",
             "/warnings USER_ID [0-3] — 查询或设置近 7 天警告次数\n",
-            "/scan_all [enforce] — 历史扫描\n",
+            "/scan_all [audit|enforce] — 历史扫描，默认按规则执行处罚\n",
             "/scan_status、/scan_stop — 查看或停止扫描\n",
             "/pending USER_ID、/cancel USER_ID — 封禁复核与取消\n\n",
             "私聊管理员命令：在命令后加入负数 GROUP_ID，",
@@ -430,7 +443,6 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
         return Ok(private);
     }
-    let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/threshold" => {
             let changed=!args.is_empty();
@@ -575,8 +587,27 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                 "用户警告次数",&response).await?;
         }
         "/scan_all" => {
-            let max=store::start_scan(env,chat_id,enforce).await?;
-            let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{}",if enforce {"执行模式"} else {"仅审计"});
+            // All administrator-requested scans request enforcement by default.
+            // "audit" explicitly prevents punishment; "enforce" is accepted.
+            let enforce=match args.as_slice() {
+                [] | ["enforce"] => true,
+                ["audit"] => false,
+                _ => {
+                    reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                        "用法：/scan_all [audit|enforce]（私聊：/scan_all GROUP_ID [audit|enforce]）。\n默认按群规尝试执行处罚；audit 仅审计。").await?;
+                    return Ok(true);
+                }
+            };
+            let dry_run=enforce && store::group_dry_run(env,chat_id).await?;
+            let Some(max)=store::start_scan(env,chat_id,enforce).await? else {
+                reply_msg(env,msg,NoticeTone::Warning,"扫描进行中",
+                    "本群已有运行中的历史扫描，未重置进度或更改模式。使用 /scan_status 查看，或 /scan_stop 停止后重新启动。").await?;
+                return Ok(true);
+            };
+            let mode_label=if !enforce {"仅审计：不执行处罚"}
+                else if dry_run {"模拟模式：本群 dry-run 已开启，不执行处罚"}
+                else {"执行模式：依照群规及处罚限制"};
+            let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{mode_label}");
             reply_msg(env,msg,NoticeTone::Success,"历史扫描",&reply).await?;
         }
         "/scan_status" => {
@@ -614,7 +645,7 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             };
             if !target_args.is_empty() && message_id.is_none() {
                 reply_msg(env,msg,NoticeTone::Warning,"参数错误",
-                    "用法：回复消息 /scan [audit]，或 /scan MESSAGE_ID [audit]。\n默认按规则执行处罚，使用 audit 仅审计。私聊请先指定 GROUP_ID。").await?;
+                    "用法：回复消息 /scan [audit|enforce]，或 /scan MESSAGE_ID [audit|enforce]。\n默认按规则执行处罚，使用 audit 仅审计。私聊请先指定 GROUP_ID。").await?;
                 return Ok(true);
             }
             let target=if let Some(id)=message_id {
@@ -767,7 +798,7 @@ async fn process_update_with_policy_cache(
     }
     let reviewed=if tg::message_has_payload(msg) {
         store::archive(env,msg).await?;
-        review_with_policy_cache(env,msg,Mode::Live,Some(policies)).await?;
+        review_with_policy_cache(env,msg,Mode::Live,Some(policies),None).await?;
         tg::ids(msg)
     } else {None};
     store::mark_update_done(env,update_id).await?;
@@ -877,29 +908,48 @@ async fn cancel_from_member_update(env:&Env, change:&Value)->Result<()> {
     Ok(())
 }
 
+/// A claimed generation is never allowed to advance a successor scan.
 pub async fn process_scan_tick(env: &Env) -> Result<()> {
-    let Some(mut job) = store::active_job(env).await? else { return Ok(()); };
+    let Some(mut job)=store::claim_active_scan(env).await? else {return Ok(());};
+    let outcome=process_claimed_scan(env,&mut job).await;
+    // Release on both success and failure. On Worker termination, expiry
+    // eventually permits another Cron run without overlapping live claims.
+    let released=store::release_scan_claim(env,&job).await;
+    outcome?;
+    released
+}
+
+async fn process_claimed_scan(env:&Env, job:&mut store::Job) -> Result<()> {
     if !store::can_review(env,job.chat_id).await? {
-        store::stop_scan(env,job.chat_id).await?;
+        store::stop_scan_if_current(env,job).await?;
         return Ok(());
     }
     for _ in 0..MAX_ARCHIVE_PER_TICK {
-        let Some(item) = store::next_archived(env,&job).await? else {
-            store::finish_scan(env,job.chat_id).await?;
-            tg::send_to_review_or_chat_titled(env,job.chat_id,NoticeTone::Success,
-                "历史审查完成",&format!(
-                    "已审消息：{} 条\n标记消息：{} 条\n模式：{}",
-                    job.scanned, job.flagged, if job.enforce == 1 { "执行模式" } else { "仅审计" }
-                )).await?;
+        if !store::scan_is_current(env,job).await? {return Ok(());}
+        let Some(item)=store::next_archived(env,job).await? else {
+            if store::finish_scan(env,job).await? {
+                // The committed completion belongs only to this generation.
+                // Telegram notification is best effort and can still arrive
+                // after a later restart; it must identify the old generation.
+                let _=tg::send_to_review_or_chat_titled(env,job.chat_id,NoticeTone::Success,
+                    "历史审查完成",&format!(
+                        "任务代次：{}\n已审消息：{} 条\n标记消息：{} 条\n模式：{}",
+                        job.generation,job.scanned,job.flagged,
+                        if job.enforce==1 {"执行模式"} else {"仅审计"}
+                    )).await;
+            }
             return Ok(());
         };
-        let msg: Value = serde_json::from_str(&item.payload)?;
-        let mode = if job.enforce == 1 { Mode::HistoricalEnforce } else { Mode::Audit };
-        let flagged = review(env,&msg,mode).await?;
-        store::advance_scan(env,&job,item.message_id,flagged).await?;
-        job.cursor_message_id = item.message_id;
-        job.scanned += 1;
-        job.flagged += i64::from(flagged);
+        if !store::scan_is_current(env,job).await? {return Ok(());}
+        let msg:Value=serde_json::from_str(&item.payload)?;
+        let mode=if job.enforce==1 {Mode::HistoricalEnforce} else {Mode::Audit};
+        let flagged=review_with_policy_cache(env,&msg,mode,None,Some(job)).await?;
+        if !store::advance_scan(env,job,item.message_id,flagged).await? {
+            return Ok(());
+        }
+        job.cursor_message_id=item.message_id;
+        job.scanned+=1;
+        job.flagged+=i64::from(flagged);
     }
     Ok(())
 }

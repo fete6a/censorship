@@ -4,8 +4,9 @@ GitHub Actions builds and tests only. Green CI never proves that production D1 w
 
 1. Confirm production Cloudflare account and D1 DB binding against wrangler.jsonc. Back up D1 and record currently deployed Worker version. Do not apply schema/current.sql on existing data.
 2. On an authenticated operator machine, run: python3 tools/check_d1_schema.py --remote --pre-migration
-   Exit 0 = required tables and trigger ready; exit 3 = known additive migration needed (pre-PR11 or post-PR11); exit 2 = incompatible or ambiguous schema, STOP.
+   Exit 0 = required warning objects and scan-fencing columns ready; exit 3 = known additive migration needed; exit 2 = incompatible or ambiguous schema, STOP.
 3. Only after exit 3, run the additive idempotent schema/ensure_warning_adjustments.sql manually via authorized Cloudflare connector or: npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql
+   Also apply exactly the missing scan_jobs ALTER statements printed by the preflight. These come from schema/ensure_scan_fencing.sql. The full scan migration is one-time, not idempotent: do not repeat existing columns. A partially applied scan migration is resumable using only the remaining printed statements. Historical jobs and messages are preserved.
 4. Verify: python3 tools/check_d1_schema.py --remote ; exit 0 is MANDATORY. Recheck immediately before Worker upload. An existing wrong-shape table or trigger is not repaired by CREATE IF NOT EXISTS.
 5. Verify the exact main commit, green Rust/SQLite/Wasm tests, and downloaded artifact SHA-256. Manually upload unchanged modules with Cloudflare MCP. Keep bindings, Secrets, Queues, Cron, and webhook. Do not enable production deployment in GitHub Actions.
 6. Verify active version, /healthz, Queue errors and a harmless dry-run review. If rollout fails, return to previous Worker artifact, not a destructive database rollback.
@@ -37,4 +38,10 @@ Run python3 -m unittest discover -s tests -v and the existing Rust/Wasm CI. test
 
 If the receipt table exists without the trigger, adding the missing trigger does not apply historical receipt rows. Do not automatically classify this state as migratable or rerun Telegram commands to repair it. The read-only preflight intentionally cannot prove whether old receipt rows were processed.
 
-**Merge order:** PR #13 supplies the receipt semantics; PR #12's preflight must be tested against that exact version. Prefer a stacked PR #12 targeting PR #13, then merge PR #13 before PR #12 after joint CI passes. A successful standalone build of either PR does not establish the safety of their combination.
+The combined release also requires scan_jobs.generation, lease_id and lease_until. In pre-migration mode only missing known scan columns are migratable; existing wrong column types, defaults or constraints still block release. Normal mode requires every column. A ready warning schema with missing scan columns is not deployment-ready.
+
+## External-operation boundary
+
+`/cancel` never changes Telegram permissions. Warning adjustments cancel pending database work and fence retries; neither command can recall a ban already sent to Telegram. Historical scans fence writes by generation and Cron lease. After a stop, a successful deletion already in flight is recorded, but new mute/ban scheduling is suppressed. A mute already in flight may still complete; an obsolete scan cannot persist a new pending ban afterwards. Telegram offers no conditional transaction spanning D1, member permissions and administrator role changes, so last-moment human edits still require operational review.
+
+Violation insertion allocates an ID above both the remaining history and the user's warning baseline, so retention cannot hide a new strike by reusing an old SQLite rowid. Do not rebuild or VACUUM the violations table independently of its baselines: the implicit rowids are part of the application's warning ordering.

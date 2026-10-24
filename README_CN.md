@@ -47,13 +47,12 @@
 | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 仅取消尚未进入处理阶段的自动封禁任务；**不自动解禁** |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
 | `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` | 查询或设置指定用户在目标群近 7 天警告次数；仅目标群管理员可操作 |
-| 回复消息 `/scan [audit]` 或 `/scan MESSAGE_ID [audit]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
-| `/scan_all` | `/scan_all -100GROUP_ID` | 扫描机器人已归档的所有消息，默认仅审计 |
-| `/scan_all enforce` | `/scan_all -100GROUP_ID enforce` | 对仍在可删除期限内的违规消息尝试执行处罚 |
+| 回复消息 `/scan [audit\|enforce]` 或 `/scan MESSAGE_ID [audit\|enforce]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit\|enforce]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
+| `/scan_all [audit\|enforce]` | `/scan_all -100GROUP_ID [audit\|enforce]` | 扫描机器人已归档的消息，默认按规则尝试处罚；`audit` 仅审计，`enforce` 显式执行 |
 | `/scan_status` | `/scan_status -100GROUP_ID` | 查询进度 |
 | `/scan_stop` | `/scan_stop -100GROUP_ID` | 停止扫描 |
 
-`/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 仍默认仅审计**，只有显式追加 `enforce` 才可能处罚。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
+`/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 同样默认请求执行处罚**；追加 `audit` 才仅审计，`enforce` 仍可显式指定。若目标群开启 dry-run，则所有扫描都不会执行实际处罚。同群已有运行中的历史扫描时，再发 `/scan_all` 会收到冲突提示，不会重置原任务的模式和进度；可用 `/scan_status` 查询或 `/scan_stop` 停止后重启。不同群组的历史扫描任务相互独立。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
 
 `/warnings USER_ID` 仅查询当前群该用户近 7 天的有效警告次数；`/warnings USER_ID 2` 设为 2 次（允许 0–3），私聊需用 `/warnings -100GROUP_ID USER_ID 2`。**必须通过目标群实时管理员身份验证**，群内无法指定别的群，D1 所有读写均按 `(chat_id,user_id)` 隔离。调整不会删除原违规记录，也不会立刻禁言或封禁；调整后新违规继续累计，人工基数 7 天后过期。若存在该用户在该群尚处于 `pending` 的自动封禁，会通过原子数据库操作取消；若已经进入 `processing` 或已调用 Telegram，则无法原子撤销，回复会明确提示。`/cancel` 也只取消 `pending` 状态的任务：**不再调用 `getChatMember` 检查后自动解禁，也不会恢复群默认权限**。机器人本身设置的 60 秒禁言等待 Telegram 自行到期；如管理员另行延长或修改限制，应保留人工设置。若封禁 API 失败并准备重新排队，会再次检查是否已被警告调整覆盖，防止旧任务重新出现。
 
@@ -141,6 +140,16 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 生产 D1 发布前校验
 
-GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
 
 联合 PR #13 后，发布预检还要检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。
+
+### 历史扫描的代次隔离与取消边界
+
+历史扫描在 D1 中使用递增的 `generation` 与每次 Cron 原子领取的 `lease_id`。停止会使旧代次失效，立即以 `audit` 重启也不会接受旧执行模式任务的进度、普通历史审核结果或完成写入；重叠 Cron 无法领取同一任务。租约最长 20 分钟，异常中断后可自动恢复。完成通知包含代次，便于识别 Telegram 延迟送达的旧通知。
+
+现有数据库必须在发布对应 Worker 之前先检查 `scan_jobs` 列，缺少时**仅执行一次** `schema/ensure_scan_fencing.sql`。新数据库直接使用 `schema/current.sql`。不要在现有数据库上运行初始化脚本；CI 不修改生产 D1。
+
+停止无法原子取消已经发往 Telegram 的删除/禁言请求。发生在停止之后才返回成功的外部操作仍会写入处罚事实记录，以避免重复处罚；但旧任务不得修改新扫描代次的游标与统计。
+
+联合发布预检也要求扫描租约字段完整。`--pre-migration` 会打印尚缺少的扫描 `ALTER` 语句；只执行这些语句，不要重复运行已部分执行的扫描迁移。停止后已发出的禁言可能仍然完成，但过期扫描不能再创建待封禁任务。

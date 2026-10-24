@@ -69,12 +69,6 @@ async fn post_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
     Ok(())
 }
 
-/// Commands reply where they were issued, including the originating forum topic.
-/// A failed confirmation must not replay a completed management operation.
-pub async fn reply_command(env: &Env, message: &Value, text: &str) -> Result<()> {
-    reply_command_titled(env,message,formatting::NoticeTone::Info,"机器人消息",text).await
-}
-
 /// Every command reply has a consistent tone, heading and MarkdownV2-escaped
 /// body, while retaining reply-to/topic targeting and best-effort delivery.
 pub async fn reply_command_titled(
@@ -158,10 +152,6 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anch
 
 /// Enforcement, cancellation and scan notifications are independent of the
 /// compact passive review digests.
-pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
-    send_to_review_or_chat_titled(env,chat_id,formatting::NoticeTone::Info,"管理员通知",text).await
-}
-
 pub async fn send_to_review_or_chat_titled(
     env: &Env, chat_id: i64, tone: formatting::NoticeTone, title: &str, text: &str
 ) -> Result<()> {

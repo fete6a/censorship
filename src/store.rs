@@ -24,6 +24,8 @@ pub struct Job {
     pub flagged: i64,
     pub enforce: i64,
     pub status: String,
+    pub generation: i64,
+    pub lease_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,18 +61,25 @@ pub async fn archive(env: &Env, msg: &Value) -> Result<()> {
     Ok(())
 }
 
-pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &str, category: &str, probability: f64) -> Result<()> {
-    let stmt = env.d1("DB")?.prepare(
-        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? \
-         WHERE chat_id=? AND message_id=?"
-    ).bind(&[
-        js_str(status), js_str(category), JsValue::from_f64(probability), js_i64(now()),
-        js_i64(chat_id), js_i64(message_id),
-    ])?;
-    // Passive status notifications are emitted once per group Queue batch.
-    // This keeps write/notification semantics separate, avoiding one Telegram
-    // DM per allowed message. The Queue retry path remains per update.
-    stmt.run().await?;
+/// For historical scans, the archive write is atomically scoped to the
+/// current run and Cron claim. Post-deletion bookkeeping is deliberately
+/// unscoped because Telegram may already have performed the external action.
+pub async fn finish_review_scoped(
+    env: &Env, chat_id: i64, message_id: i64, status: &str,
+    category: &str, probability: f64, scan: Option<&Job>
+) -> Result<()> {
+    let mut args = vec![
+        js_str(status),js_str(category),JsValue::from_f64(probability),js_i64(now()),
+        js_i64(chat_id),js_i64(message_id),
+    ];
+    let sql = if let Some(job)=scan {
+        args.push(js_i64(job.generation));
+        args.push(js_i64(job.lease_id));
+        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? WHERE chat_id=? AND message_id=? AND EXISTS (SELECT 1 FROM scan_jobs WHERE scan_jobs.chat_id=archived_messages.chat_id AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch())"
+    } else {
+        "UPDATE archived_messages SET last_status=?,last_category=?,last_probability=?,last_reviewed_at=? WHERE chat_id=? AND message_id=?"
+    };
+    env.d1("DB")?.prepare(sql).bind(&args)?.run().await?;
     Ok(())
 }
 
@@ -118,9 +127,15 @@ pub async fn has_strike(env: &Env, chat_id: i64, message_id: i64) -> Result<bool
 }
 
 pub async fn add_strike(env: &Env, chat_id: i64, message_id: i64, user_id: i64, category: &str, probability: f64) -> Result<()> {
+    // SQLite may reuse rowids after retention deletes the last violation.
+    // Stay above this user's manual baseline even when that history is gone.
+    // The allocation and insert are one statement, serialized by SQLite.
     env.d1("DB")?.prepare(
-        "INSERT OR IGNORE INTO violations(chat_id,user_id,message_id,created_at,category,probability,severity,action) \
-         VALUES(?,?,?,?,?,?,0,'deleted')"
+        "INSERT INTO violations(rowid,chat_id,user_id,message_id,created_at,category,probability,severity,action) \
+         SELECT MAX(COALESCE((SELECT MAX(rowid) FROM violations),0), \
+           COALESCE((SELECT violation_rowid FROM warning_adjustments WHERE chat_id=?1 AND user_id=?2),0))+1, \
+           ?1,?2,?3,?4,?5,?6,0,'deleted' WHERE true \
+         ON CONFLICT(chat_id,message_id) DO NOTHING"
     ).bind(&[
         js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),
         js_str(category),JsValue::from_f64(probability),
@@ -172,7 +187,7 @@ pub async fn set_warning_count(
 /// administrator has already reset its underlying violation. A fresh genuine
 /// violation can still create a new pending task.
 pub async fn create_pending_after_warning_check(
-    env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64
+    env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64, scan: Option<&Job>
 ) -> Result<bool> {
     let inserted = env.d1("DB")?.prepare(
         "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
@@ -180,6 +195,8 @@ pub async fn create_pending_after_warning_check(
            SELECT 1 FROM violations v WHERE v.chat_id=?1 AND v.user_id=?2 AND v.message_id=?3 \
            AND NOT EXISTS (SELECT 1 FROM warning_adjustments a WHERE a.chat_id=?1 \
              AND a.user_id=?2 AND a.violation_rowid>=v.rowid)) \
+         AND (?6 IS NULL OR EXISTS (SELECT 1 FROM scan_jobs WHERE chat_id=?1 \
+           AND generation=?6 AND lease_id=?7 AND status='running' AND lease_until>unixepoch())) \
          ON CONFLICT(chat_id,user_id) DO UPDATE SET \
            message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
            status='pending',next_attempt_at=0,attempt_count=0, \
@@ -187,41 +204,78 @@ pub async fn create_pending_after_warning_check(
            WHERE pending_bans.status IN ('banned','canceled','failed') \
          RETURNING chat_id AS count"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),
-        js_i64(now()),js_i64(due_at)])?.first::<CountRow>(None).await?;
+        js_i64(now()),js_i64(due_at),scan.map(|j|js_i64(j.generation)).unwrap_or(JsValue::NULL),
+        scan.map(|j|js_i64(j.lease_id)).unwrap_or(JsValue::NULL)])?.first::<CountRow>(None).await?;
     Ok(inserted.is_some())
 }
 
-pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<i64> {
-    let row = env.d1("DB")?.prepare(
+/// Atomically start or restart a completed/stopped scan. A running job must
+/// never have its cursor or enforcement mode silently reset by another command.
+/// Restart is atomic; the monotonic generation prevents stop/restart ABA.
+pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<Option<i64>> {
+    let row=env.d1("DB")?.prepare(
         "SELECT COALESCE(MAX(message_id),0) AS max_id FROM archived_messages WHERE chat_id=?"
     ).bind(&[js_i64(chat_id)])?.first::<MaxRow>(None).await?;
-    let max_id = row.map(|r| r.max_id).unwrap_or(0);
-    env.d1("DB")?.prepare(
-        "INSERT INTO scan_jobs (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at) \
-         VALUES (?,0,?,0,0,?,'running',?,?) \
+    let max_id=row.map(|r|r.max_id).unwrap_or(0);
+    let started=env.d1("DB")?.prepare(
+        "INSERT INTO scan_jobs (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at,generation,lease_id,lease_until) \
+         VALUES (?,0,?,0,0,?,'running',?,?,1,0,0) \
          ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id=0,max_message_id=excluded.max_message_id, \
-         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at"
-    ).bind(&[js_i64(chat_id), js_i64(max_id), js_i64(i64::from(enforce)), js_i64(now()), js_i64(now())])?
-        .run().await?;
-    Ok(max_id)
+         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at, \
+         generation=scan_jobs.generation+1,lease_until=0 \
+         WHERE scan_jobs.status!='running' RETURNING max_message_id AS max_id"
+    ).bind(&[js_i64(chat_id),js_i64(max_id),js_i64(i64::from(enforce)),js_i64(now()),js_i64(now())])?
+        .first::<MaxRow>(None).await?;
+    Ok(started.map(|r|r.max_id))
 }
 
+/// Admin stop invalidates any outstanding claim, even before a restart.
 pub async fn stop_scan(env: &Env, chat_id: i64) -> Result<()> {
-    env.d1("DB")?.prepare("UPDATE scan_jobs SET status='stopped',updated_at=? WHERE chat_id=?")
-        .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0,updated_at=? WHERE chat_id=?"
+    ).bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
     Ok(())
 }
 
 pub async fn job_for_group(env: &Env, chat_id: i64) -> Result<Option<Job>> {
-    env.d1("DB")?.prepare("SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status FROM scan_jobs WHERE chat_id=?")
-        .bind(&[js_i64(chat_id)])?.first::<Job>(None).await
+    env.d1("DB")?.prepare(
+        "SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,generation,lease_id FROM scan_jobs WHERE chat_id=?"
+    ).bind(&[js_i64(chat_id)])?.first::<Job>(None).await
 }
 
-pub async fn active_job(env: &Env) -> Result<Option<Job>> {
+/// A single atomic claim serializes Cron runs per group. An abandoned lease
+/// expires after 20 minutes; expired workers are barred from fenced writes.
+pub async fn claim_active_scan(env: &Env) -> Result<Option<Job>> {
     env.d1("DB")?.prepare(
-        "SELECT chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status \
-         FROM scan_jobs WHERE status='running' ORDER BY updated_at LIMIT 1"
+        "UPDATE scan_jobs SET lease_id=lease_id+1,lease_until=unixepoch()+1200,updated_at=unixepoch() \
+         WHERE chat_id=(SELECT chat_id FROM scan_jobs WHERE status='running' AND lease_until<=unixepoch() ORDER BY updated_at,chat_id LIMIT 1) \
+         AND status='running' AND lease_until<=unixepoch() \
+         RETURNING chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,generation,lease_id"
     ).first::<Job>(None).await
+}
+
+pub async fn scan_is_current(env: &Env, job: &Job) -> Result<bool> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT COUNT(*) AS count FROM scan_jobs WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch()"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?
+        .first::<CountRow>(None).await?;
+    Ok(row.is_some_and(|r|r.count==1))
+}
+
+/// A delayed permission check cannot stop a replacement run.
+pub async fn stop_scan_if_current(env: &Env, job: &Job) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='stopped',generation=generation+1,lease_until=0,updated_at=unixepoch() WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch()"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?.run().await?;
+    Ok(())
+}
+
+/// On normal returns release immediately; a crashed worker relies on expiry.
+pub async fn release_scan_claim(env: &Env, job: &Job) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET lease_until=0,updated_at=unixepoch() WHERE chat_id=? AND generation=? AND lease_id=? AND status='running'"
+    ).bind(&[js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id)])?.run().await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -239,21 +293,30 @@ pub async fn next_archived(env: &Env, job: &Job) -> Result<Option<ArchiveItem>> 
     ])?.first::<ArchiveItem>(None).await
 }
 
-pub async fn advance_scan(env: &Env, job: &Job, message_id: i64, flagged: bool) -> Result<()> {
-    env.d1("DB")?.prepare(
-        "UPDATE scan_jobs SET cursor_message_id=?,scanned=scanned+1,flagged=flagged+?,updated_at=? \
-         WHERE chat_id=? AND status='running' AND cursor_message_id=?"
+/// CAS fences the scan generation, Cron claim and original cursor.
+pub async fn advance_scan(env: &Env, job: &Job, message_id: i64, flagged: bool) -> Result<bool> {
+    let updated=env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET cursor_message_id=?,scanned=scanned+1,flagged=flagged+?,updated_at=unixepoch() \
+         WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
+         AND cursor_message_id=? AND ?>cursor_message_id AND ?<=max_message_id RETURNING chat_id AS count"
     ).bind(&[
-        js_i64(message_id),js_i64(i64::from(flagged)),js_i64(now()),
-        js_i64(job.chat_id),js_i64(job.cursor_message_id),
-    ])?.run().await?;
-    Ok(())
+        js_i64(message_id),js_i64(i64::from(flagged)),js_i64(job.chat_id),
+        js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
+        js_i64(message_id),js_i64(message_id),
+    ])?.first::<CountRow>(None).await?;
+    Ok(updated.is_some())
 }
 
-pub async fn finish_scan(env: &Env, chat_id: i64) -> Result<()> {
-    env.d1("DB")?.prepare("UPDATE scan_jobs SET status='done',updated_at=? WHERE chat_id=? AND status='running'")
-        .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
-    Ok(())
+/// Exactly one claimed execution may complete and announce a given run.
+pub async fn finish_scan(env: &Env, job: &Job) -> Result<bool> {
+    let finished=env.d1("DB")?.prepare(
+        "UPDATE scan_jobs SET status='done',lease_until=0,updated_at=unixepoch() \
+         WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
+         AND cursor_message_id=? RETURNING chat_id AS count"
+    ).bind(&[
+        js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
+    ])?.first::<CountRow>(None).await?;
+    Ok(finished.is_some())
 }
 
 pub async fn cleanup(env: &Env) -> Result<()> {
@@ -347,18 +410,6 @@ pub async fn begin_pending_attempt(env: &Env, chat_id: i64, user_id: i64, messag
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
       .first::<PendingBan>(None).await?;
     Ok(attempted.is_some())
-}
-
-pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64) -> Result<()> {
-    env.d1("DB")?.prepare(
-        "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
-         VALUES(?,?,?,?,?,'pending') ON CONFLICT(chat_id,user_id) DO UPDATE SET \
-         message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
-         status='pending',next_attempt_at=0,attempt_count=0, \
-         canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
-         WHERE pending_bans.status IN ('banned','canceled','failed')"
-    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),js_i64(due_at)])?.run().await?;
-    Ok(())
 }
 
 /// A transaction-like conditional transition.  Exactly one of cancel and

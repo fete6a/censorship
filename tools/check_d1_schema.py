@@ -78,7 +78,11 @@ def parse_d1_json(text):
 def normalized_ddl(value):
     # sqlite_master strips IF NOT EXISTS on CREATE. Whitespace, case, and
     # harmless identifier quote differences should not change comparisons.
-    return re.sub(r"\s+", "", (value or "").upper()).replace('"', "").replace(chr(96), "")
+    # String values are case/whitespace sensitive even though SQL keywords
+    # are not. In particular, status='PENDING' must not match 'pending'.
+    parts = re.split(r"('(?:''|[^'])*')", value or "")
+    return "".join(part if i % 2 else re.sub(r"\s+", "", part.upper()).replace('"', "").replace(chr(96), "")
+                   for i, part in enumerate(parts))
 
 
 def objects(rows):
@@ -97,6 +101,20 @@ MIGRATABLE_OBJECTS = {
     ("table", "warning_edit_receipts"),
     ("trigger", "apply_warning_edit_receipt"),
 }
+SCAN_COLUMNS = {"generation", "lease_id", "lease_until"}
+
+
+def scan_migrations(rows):
+    """Return only missing, trusted ALTERs; never execute production SQL."""
+    columns = {row["column_name"] for row in rows
+               if row["object_type"] == "table" and row["object_name"] == "scan_jobs"}
+    statements = (ROOT / "schema/ensure_scan_fencing.sql").read_text(encoding="utf-8").splitlines()
+    return [sql for sql in statements if any(
+        sql.startswith(f"ALTER TABLE scan_jobs ADD COLUMN {column} ")
+        for column in SCAN_COLUMNS - columns
+    )]
+
+
 # A second trigger could sabotage atomicity even if the named trigger is correct.
 SENSITIVE_TRIGGER_TABLES = {
     "warning_edit_receipts", "warning_adjustments", "pending_bans"
@@ -197,6 +215,10 @@ def validate(actual_rows, allow_missing_warning=False):
             continue
         missing_columns = sorted(set(expected_columns) - set(observed_columns))
         extra_columns = sorted(set(observed_columns) - set(expected_columns))
+        if allow_missing_warning and name == "scan_jobs":
+            for column in set(missing_columns) & SCAN_COLUMNS:
+                missing.add(("column", f"scan_jobs.{column}"))
+                missing_columns.remove(column)
         if missing_columns or extra_columns:
             errors.append(f"table columns mismatch: {name} missing={missing_columns} extra={extra_columns}")
         for column in sorted(set(expected_columns) & set(observed_columns)):
@@ -257,7 +279,7 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--remote", action="store_true", help="Read production DB binding via Wrangler --remote")
     source.add_argument("--from-json", type=Path, metavar="FILE", help="Check saved --json response from an equivalent read-only D1 query")
-    parser.add_argument("--pre-migration", action="store_true", help="Recognize only safe, additive pre-PR11/post-PR11 warning-schema versions")
+    parser.add_argument("--pre-migration", action="store_true", help="Recognize known additive warning and scan-fencing migrations")
     args = parser.parse_args(argv)
     try:
         rows = remote_metadata() if args.remote else parse_d1_json(args.from_json.read_text(encoding="utf-8"))
@@ -271,8 +293,11 @@ def main(argv=None):
         print("STOP: investigate D1 schema; do not run full bootstrap or deploy Worker.", file=sys.stderr)
         return 2
     if status == "migration_required":
-        print("MIGRATION_REQUIRED: only safe, additive warning-schema objects are absent.")
-        print("Apply schema/ensure_warning_adjustments.sql manually, then rerun without --pre-migration.")
+        print("MIGRATION_REQUIRED: known additive warning objects or scan-fencing columns are absent.")
+        print("Apply schema/ensure_warning_adjustments.sql manually (idempotent).")
+        for statement in scan_migrations(rows):
+            print(statement)
+        print("Apply only the missing scan ALTERs printed above, then rerun without --pre-migration.")
         return 3
     print("SCHEMA_READY: canonical tables, indexes, receipt trigger DDL and isolated trigger behavior verified.")
     return 0

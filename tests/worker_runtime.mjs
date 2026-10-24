@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
+function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
@@ -69,9 +69,19 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
              const entry=warningAdjustments.get(`${values[0]}:${values[1]}`);
              const idx=strikeEvents.findIndex(x=>x.key===`${values[0]}:${values[1]}` && x.messageId===values[2]);
              if (idx<0 || (entry && idx<entry.start)) return null;
+             const job=jobs.get(values[0]);
+             if(values[5]!=null && (!job || job.generation!==values[5] || job.lease_id!==values[6] || job.status!=='running' || !job.claimed)) return null;
              return {count:values[0]};
            }
-           if (sql.includes('SELECT payload FROM archived_messages')) {
+          if (sql.includes('SELECT message_id,payload FROM archived_messages')) {
+            const [chat,cursor,max]=values;
+            const next=[...archives.entries()].filter(([k])=>k.startsWith(chat+':'))
+              .map(([k,p])=>({message_id:Number(k.split(':')[1]),payload:JSON.stringify(p)}))
+              .filter(x=>x.message_id>cursor&&x.message_id<=max)
+              .sort((a,b)=>a.message_id-b.message_id)[0];
+            return next||null;
+          }
+          if (sql.includes('SELECT payload FROM archived_messages')) {
             const item=archives.get(`${values[0]}:${values[1]}`);
             return item?{payload:JSON.stringify(item)}:null;
           }
@@ -79,7 +89,39 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             const ids=[...archives.keys()].filter(key=>key.startsWith(`${values[0]}:`)).map(key=>Number(key.split(':')[1]));
             return {max_id:ids.length?Math.max(...ids):0};
           }
-          if (sql.includes('FROM scan_jobs')) return jobs.get(values[0]) || null;
+          if (sql.startsWith('UPDATE scan_jobs SET lease_id=lease_id+1')) {
+            const job=[...jobs.values()].find(x=>x.status==='running' && !x.claimed);
+            if(!job)return null;
+            job.claimed=true;job.lease_id=(job.lease_id||0)+1;
+            return {...job};
+          }
+          if (sql.startsWith('UPDATE scan_jobs SET cursor_message_id=')) {
+            const job=jobs.get(values[2]);
+            if(!job||job.generation!==values[3]||job.lease_id!==values[4]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[5])return null;
+            job.cursor_message_id=values[0];job.scanned++;job.flagged+=values[1];
+            return {count:job.chat_id};
+          }
+          if (sql.startsWith("UPDATE scan_jobs SET status='done'")) {
+            const job=jobs.get(values[0]);
+            if(!job||job.generation!==values[1]||job.lease_id!==values[2]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[3])return null;
+            job.status='done';job.claimed=false;
+            return {count:job.chat_id};
+          }
+          if (sql.includes('FROM scan_jobs') || sql.startsWith('SELECT COUNT(*) AS count FROM scan_jobs')) {
+            if(sql.includes('COUNT(*)')) {
+              const j=jobs.get(values[0]);
+              return {count:Number(Boolean(j&&j.generation===values[1]&&j.lease_id===values[2]&&j.status==='running'&&j.claimed))};
+            }
+            if(sql.includes("status='running'")) return [...jobs.values()].find(j=>j.status==='running') || null;
+            return jobs.get(values[0]) || null;
+          }
+          if (sql.includes('INSERT INTO scan_jobs') && sql.includes('RETURNING max_message_id')) {
+            if(jobs.get(values[0])?.status==='running') return null;
+            const prior=jobs.get(values[0]);
+            const job={chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running',generation:(prior?.generation||0)+1,lease_id:prior?.lease_id||0,claimed:false};
+            jobs.set(values[0],job);
+            return {max_id:job.max_message_id};
+          }
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
           if (sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')) {
             if (missingWarningTable) throw new Error('D1_ERROR: no such table: warning_adjustments');
@@ -124,10 +166,19 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
             settings.set(values[0], row);
           }
-          if (sql.includes('INSERT INTO scan_jobs')) jobs.set(values[0],{chat_id:values[0],cursor_message_id:0,max_message_id:values[1],scanned:0,flagged:0,enforce:values[2],status:'running'});
-          if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[1])) jobs.get(values[1]).status='stopped';
+          if (sql.includes('INSERT INTO scan_jobs')) throw new Error('Scan start must use atomic RETURNING');
+          if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[sql.includes('lease_id=?')?0:1])) {
+            const j=jobs.get(values[sql.includes('lease_id=?')?0:1]);
+            if(!sql.includes('lease_id=?')||(j.generation===values[1]&&j.lease_id===values[2])) {
+              j.status='stopped';j.generation++;j.claimed=false;
+            }
+          }
+          if (sql.startsWith('UPDATE scan_jobs SET lease_until=0')) {
+            const j=jobs.get(values[0]);
+            if(j&&j.generation===values[1]&&j.lease_id===values[2])j.claimed=false;
+          }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
-          if (sql.includes('INSERT OR IGNORE INTO violations')) {
+          if (sql.includes('INSERT INTO violations')) {
             const key=`${values[0]}:${values[2]}`;
             if(!strikes.has(key))strikeEvents.push({key:`${values[0]}:${values[1]}`,messageId:values[2]});
             strikes.add(key);
@@ -138,7 +189,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             archives.set(`${values[0]}:${values[1]}`,JSON.parse(values[5]));
             reviews.set(`${values[0]}:${values[1]}`, {last_status:'pending',last_category:'none',last_probability:0});
           }
-          if (sql.includes('UPDATE archived_messages'))
+          if (sql.includes('UPDATE archived_messages') && (!sql.includes('EXISTS (') ||
+              (jobs.get(values[4])?.generation===values[6] && jobs.get(values[4])?.lease_id===values[7] &&
+               jobs.get(values[4])?.status==='running' && jobs.get(values[4])?.claimed)))
             reviews.set(`${values[4]}:${values[5]}`, {last_status:values[0],last_category:values[1],last_probability:values[2]});
           return { success: true, results: [], meta: { duration: 0, changes: 1, last_row_id: 0,
             changed_db: false, size_after: 0, rows_read: 0, rows_written: 1 } };
@@ -149,6 +202,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
   class Ai {
     async run(model, input) {
       aiCalls.push({ model, input: JSON.parse(JSON.stringify(input)) });
+      if(pauseAi)await pauseAi(aiCalls.length);
       if(aiFail) throw new Error('inference unavailable');
       const currentScore = remove ? (scores?.[aiCalls.length - 1] ?? score) : 0;
       return { answers: {
@@ -172,7 +226,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
       user: { id: args.user_id }, status: args.chat_id === groupA && args.user_id===11 ? 'administrator' : 'member',
     } });
     if (['restrictChatMember','banChatMember'].includes(method)) return Response.json({ok:true,result:true});
-    if (method === 'deleteMessage') return Response.json({ok:true,result:true});
+    if (method === 'deleteMessage') {if(pauseDelete)await pauseDelete();return Response.json({ok:true,result:true});}
     if (method === 'sendMessage' && ((dmFail && args.chat_id>0)||(noticeFail && args.chat_id<0))) return Response.json({ok:false},{status:403});
     if (method === 'sendMessage') return Response.json({ ok: true, result: { message_id: 1 } });
     if(method==='getChat' && policyFail) return Response.json({ok:false},{status:503});
@@ -201,7 +255,8 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     assert.equal(outcome.retried,retry);
     assert.equal(outcome.acked,!retry);
   }
-  return { worker, deliveries, statements, telegram, completed, errors, aiCalls,
+  async function tick(){await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()});}
+  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls,
     settings, reviews, archives, jobs, warningAdjustments, warningReceiptIds, consume, consumeBatch, env };
 }
 
@@ -426,6 +481,8 @@ await test('edits of the same message inside one window are deduplicated in the 
  assert.equal(summary.length,1);
  assert.match(summary[0].args.text,/1 条/);
  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+ assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
+ assert.equal(f.reviews.get(groupA+':870')?.last_status,'deleted');
 });
 
 await test('MarkdownV2 action notice uses numeric Telegram links without exposing deleted message link',async()=>{
@@ -529,7 +586,7 @@ await test('noul violation score drives automatic deletion without an allow choi
  await f.consume(message(groupA,704));
  assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[704]);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'deleted');
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.aiCalls[0].input.questions.action,undefined);
  assert.equal(f.aiCalls[0].input.questions.violation.type,'noul');
 });
@@ -560,7 +617,7 @@ await test('other and adult categories behave like none, without punishment or d
     assert.deepEqual(f.reviews.get(`${groupA}:1707`),
       {last_status:expected,last_category:'none',last_probability:score});
     assert.equal(f.telegram.some(c=>['deleteMessage','restrictChatMember','banChatMember'].includes(c.method)),false);
-    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,0);
+    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,0);
     const digest=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id>0)?.args.text||'';
     assert.ok(digest.includes(expected==='needs_review'?'人工复核':'通过'));
     assert.ok(!digest.includes('其他违反群规'));
@@ -587,7 +644,7 @@ await test('edited message crossing threshold creates only one deletion and stri
  await f.consume({update_id:712,edited_message:{...original.message,text:'Edited text again'}});
  assert.equal(f.aiCalls.length,3);
  assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.statements.filter(s=>s.sql.includes('UPDATE archived_messages')).at(-1)?.values[0],'previously_deleted');
 });
 
@@ -1003,7 +1060,7 @@ await test('single /scan enforces by default only in a group with enforcement en
   commandUpdate.message.reply_to_message=message(groupA,2201).message;
   await enforcing.consume(commandUpdate);
   assert.equal(enforcing.telegram.filter(x=>x.method==='deleteMessage').length,1);
-  assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT OR IGNORE INTO violations')));
+  assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT INTO violations')));
   assert.equal(enforcing.reviews.get(`${groupA}:2201`)?.last_status,'deleted');
   assert.match(enforcing.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/已删除/);
 
@@ -1151,7 +1208,7 @@ await test('missing warning table blocks deletion before Telegram or strike writ
  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
  await f.consume(message(groupA,3100),{retry:true});
  assert.equal(f.telegram.some(call=>call.method==='deleteMessage'),false);
- assert.equal(f.statements.some(s=>s.sql.includes('INSERT OR IGNORE INTO violations')),false);
+ assert.equal(f.statements.some(s=>s.sql.includes('INSERT INTO violations')),false);
  assert.equal(f.completed.has(3100),false);
  assert.equal(f.archives.has(String(groupA)+':3100'),true,'archival can precede the failed preflight');
  assert.ok(f.statements.some(s=>s.operation==='read' && s.sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')), 'pre-deletion warning-count D1 query must be attempted');
@@ -1174,12 +1231,135 @@ await test('post-delete count failure is a partial result, and retry avoids dupl
  const update=message(groupA,3102);
  await f.consume(update,{retry:true});
  assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.completed.has(3102),false);
  assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'pending');
  await f.consume(update);
  assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
- assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
  assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'previously_deleted');
  assert.equal(f.telegram.some(call=>call.method==='restrictChatMember'),false);
+});
+
+await test('bulk scan modes and rejected flags',async()=>{
+ for(const [line,enforce] of [['/scan_all',1],['/scan_all enforce',1],['/scan_all audit',0]]){
+  const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  f.archives.set(groupA+':3001',message(groupA,3001).message);
+  await f.consume(command(line,{id:groupA,type:'supergroup'}));
+  assert.equal(f.jobs.get(groupA)?.enforce,enforce,line);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',enforce?/执行模式/:/仅审计/,line);
+ }
+ for(const line of ['/scan_all invalid','/scan_all audit enforce','/scan_all enforce audit']){
+  const f=fixture();await f.consume(command(line,{id:groupA,type:'supergroup'}));
+  assert.equal(f.jobs.size,0,line);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/参数错误/,line);
+ }
+});
+
+await test('bulk scan respects group dry-run',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ await f.consume(command('/scan_all',{id:groupA,type:'supergroup'}));
+ assert.equal(f.jobs.get(groupA)?.enforce,1);
+ assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/模拟模式.*不执行处罚/);
+ assert.equal(f.telegram.some(x=>x.method==='deleteMessage'),false);
+});
+
+await test('duplicate bulk scan does not override active job and stop permits restart',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.archives.set(groupA+':3002',message(groupA,3002).message);
+ await f.consume(command('/scan_all audit',{id:groupA,type:'supergroup'}));
+ const job=f.jobs.get(groupA);job.cursor_message_id=100;job.scanned=3;
+ const second=command('/scan_all enforce',{id:groupA,type:'supergroup'});second.update_id=3003;
+ await f.consume(second);
+ assert.strictEqual(f.jobs.get(groupA),job);
+ assert.equal(job.cursor_message_id,100);assert.equal(job.scanned,3);assert.equal(job.enforce,0);
+ assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/扫描进行中/);
+ const stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=3004;await f.consume(stop);
+ assert.equal(job.status,'stopped');
+ const restart=command('/scan_all enforce',{id:groupA,type:'supergroup'});restart.update_id=3005;await f.consume(restart);
+ assert.equal(f.jobs.get(groupA).enforce,1);assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+});
+
+await test('bulk scan cannot operate on unauthorized target group',async()=>{
+ const denied=fixture();await denied.consume(command('/scan_all '+groupB+' enforce'));
+ assert.equal(denied.jobs.size,0);
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(command('/scan_all audit',{id:groupA,type:'supergroup'}));
+ assert.equal(f.jobs.get(groupA).enforce,0);assert.equal(f.jobs.has(groupB),false);
+ assert.ok(f.statements.filter(x=>x.sql.includes('INSERT INTO scan_jobs')).every(x=>x.values[0]===groupA));
+});
+
+await test('old enforcement result after stop and audit restart cannot alter new scan',async()=>{
+ let unblock,entered;
+ const begun=new Promise(resolve=>entered=resolve);
+ const held=new Promise(resolve=>unblock=resolve);
+ const f=fixture({remove:true,score:.99,pauseAi:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:1});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ const start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9100;
+ await f.consume(start);
+ const old=f.tick();await begun;
+ const stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=9101;
+ await f.consume(stop);
+ const restart=command('/scan_all audit',{id:groupA,type:'supergroup'});restart.update_id=9102;
+ await f.consume(restart);
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ const newer=f.jobs.get(groupA).generation;
+ unblock();await old;
+ assert.equal(f.jobs.get(groupA).generation,newer);
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ assert.equal(f.jobs.get(groupA).scanned,0);
+ assert.equal(f.jobs.get(groupA).flagged,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ assert.equal(f.reviews.get(groupA+':17')?.last_status,undefined);
+ const second=f.tick();await second;
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.jobs.get(groupA).scanned,1);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ await f.tick();
+ assert.equal(f.jobs.get(groupA).status,'done');
+ assert.equal(f.telegram.filter(x=>x.method==='sendMessage'&&x.args.text.includes('历史审查完成')).length,1);
+});
+await test('concurrent Cron claims cannot process the same group twice',async()=>{
+ let unblock,entered;
+ const held=new Promise(resolve=>unblock=resolve),begun=new Promise(resolve=>entered=resolve);
+ const f=fixture({pauseAi:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ let one=command('/scan_all audit',{id:groupA,type:'supergroup'});one.update_id=9200;
+ await f.consume(one);
+ const first=f.tick();await begun;
+ const second=f.tick();
+ await second;
+ assert.equal(f.aiCalls.length,1,'another Cron cannot claim an in-progress scan');
+ unblock();await first;
+ assert.equal(f.jobs.get(groupA).scanned,1);
+ assert.equal(f.jobs.get(groupA).flagged,0);
+ // Other groups can be started and scanned independently after this one.
+ f.archives.set(groupB+':27',message(groupB,27).message);
+ // Seed the second group's own database job directly; authorization of
+ // group-B commands is covered by separate group permission tests.
+ f.jobs.set(groupB,{chat_id:groupB,cursor_message_id:0,max_message_id:27,
+   scanned:0,flagged:0,enforce:0,status:'running',generation:1,lease_id:0,claimed:false});
+ await f.tick();
+ assert.equal(f.jobs.get(groupB)?.scanned,1);
+ assert.equal(f.jobs.get(groupA).scanned,1);
+});
+await test('Telegram deletion already in flight is not represented as atomically cancellable',async()=>{
+ let unblock,entered;
+ const held=new Promise(resolve=>unblock=resolve),begun=new Promise(resolve=>entered=resolve);
+ const f=fixture({remove:true,score:.99,strikeCount:2,pauseDelete:async()=>{entered();await held}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ f.archives.set(groupA+':17',message(groupA,17).message);
+ let start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9300;await f.consume(start);
+ let old=f.tick();await begun;
+ let stop=command('/scan_stop',{id:groupA,type:'supergroup'});stop.update_id=9301;await f.consume(stop);
+ let restart=command('/scan_all audit',{id:groupA,type:'supergroup'});restart.update_id=9302;await f.consume(restart);
+ unblock();await old;
+ assert.equal(f.jobs.get(groupA).cursor_message_id,0);
+ assert.equal(f.jobs.get(groupA).enforce,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+ assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
+ assert.equal(f.reviews.get(groupA+':17')?.last_status,'deleted');
 });

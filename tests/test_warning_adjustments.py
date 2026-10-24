@@ -94,15 +94,30 @@ class WarningAdjustmentSQLTests(unittest.TestCase):
         self.assertEqual(self.db.execute(
             "SELECT COUNT(*) FROM warning_edit_receipts").fetchone(),(1,))
 
+    def test_retention_cannot_reuse_a_rowid_below_a_live_warning_baseline(self):
+        # Old violations can be >30 days old while a new adjustment is active.
+        self.db.execute("INSERT INTO violations(rowid,chat_id,user_id,message_id,created_at,category,probability,action) VALUES(100,-100,22,1,1,'spam',1,'warned')")
+        self.set_count(-100,22,0,3_000_000)
+        self.db.execute("DELETE FROM violations WHERE created_at<100")
+        add = store_query('add_strike')
+        self.db.execute(add, (-100,22,2,3_000_000,'spam',1))
+        self.assertEqual(self.db.execute('SELECT rowid,chat_id,user_id,message_id FROM violations').fetchone(), (101,-100,22,2))
+        self.assertEqual(self.get_count(-100,22,2_900_000), 1)
+        # A duplicate must not move its ID or count, even after later inserts.
+        self.db.execute(add, (-200,33,3,3_000_000,'spam',1))
+        self.db.execute(add, (-100,22,2,3_000_001,'spam',1))
+        self.assertEqual(self.get_count(-100,22,2_900_000), 1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM violations').fetchone(), (2,))
+
     def test_reset_prevents_late_pending_creation_but_preserves_new_violation(self):
         when = 1_700_000_000
         for mid in [401,402,403]: self.violation(-100,22,mid,when)
         self.set_count(-100,22,0,when)
-        self.assertIsNone(self.db.execute(self.pending_sql,(-100,22,403,when+1,when+61)).fetchone())
+        self.assertIsNone(self.db.execute(self.pending_sql,(-100,22,403,when+1,when+61,None,None)).fetchone())
         self.assertIsNone(self.db.execute(
             "SELECT 1 FROM pending_bans WHERE chat_id=-100 AND user_id=22").fetchone())
         self.violation(-100,22,404,when+1)
-        self.assertIsNotNone(self.db.execute(self.pending_sql,(-100,22,404,when+1,when+61)).fetchone())
+        self.assertIsNotNone(self.db.execute(self.pending_sql,(-100,22,404,when+1,when+61,None,None)).fetchone())
 
     def test_reset_and_pending_cancel_are_atomic_group_scoped(self):
         when = 1_700_000_000
