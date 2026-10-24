@@ -53,7 +53,7 @@ All management commands check the issuing user's `getChatMember` administrator/c
 
 Send `/start` or `/help` **privately** to see the command help. Omitting `on`/`off` queries the current logs/dry-run setting. In a group, `/threshold` confirms publicly; the other settings commands do not announce their result there.
 
-The default removal threshold is `0.93`; changing it affects subsequent reviews, not past decisions or existing pending bans. The model must select `remove`, with action confidence at least min(80%, group threshold) and non-`none` category confidence at least 75%. `/dry-run on` cancels that group's pending bans; `/logs off` does not affect enforcement.
+The default removal threshold is `0.93`; changing it affects subsequent reviews, not past decisions or existing pending bans. A message is eligible for deletion when the model's `action.probabilities.remove` meets the group's threshold and the category is not `none`. The model's chosen action and separate action/category confidences are diagnostic, not additional deletion gates. A high remove score with category `none`, or a `remove` choice below threshold, is recorded as `needs_review` rather than `allow`. Dry-run, policy availability, Telegram rights and deletion-age checks still apply; model probabilities are not calibrated certainties. `/dry-run on` cancels that group's pending bans; `/logs off` does not affect enforcement.
 
 ## Configuration and deployment
 

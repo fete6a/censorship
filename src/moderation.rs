@@ -3,8 +3,6 @@ use worker::{console_error, console_log, Env, Result};
 use crate::{media, store, tg};
 use crate::util::{config, fail, field_int, field_str, flag, now};
 
-const ACTION_CONFIDENCE: f64 = 0.80;
-const CATEGORY_CONFIDENCE: f64 = 0.75;
 const DELETE_WINDOW: i64 = 48 * 3600;
 const MAX_ARCHIVE_PER_TICK: usize = 8;
 
@@ -21,11 +19,17 @@ pub struct Decision {
 
 impl Decision {
     fn clear_violation(&self, threshold: f64) -> bool {
-        self.action == "remove"
-            && self.remove_probability >= threshold
-            && self.action_confidence >= ACTION_CONFIDENCE.min(threshold)
-            && self.category != "none"
-            && self.category_confidence >= CATEGORY_CONFIDENCE
+        // /threshold is the sole score gate. Action choice and separate
+        // confidences are diagnostic; they must not veto the remove score.
+        // A missing actionable category still prevents automatic punishment.
+        self.remove_probability >= threshold && self.category != "none"
+    }
+    fn status_without_removal(&self, threshold: f64) -> &'static str {
+        if self.action != "allow" || self.remove_probability >= threshold {
+            "needs_review"
+        } else {
+            "allow"
+        }
     }
 }
 
@@ -172,12 +176,22 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
         }
     };
 
-    let clear = decision.clear_violation(store::group_threshold(env,chat_id).await?);
+    let threshold = store::group_threshold(env,chat_id).await?;
+    let clear = decision.clear_violation(threshold);
     let category = category_name(&decision.category);
     if !clear {
-        let kind = if decision.action == "review" { "needs_review" } else { "allow" };
+        let kind = decision.status_without_removal(threshold);
+        if decision.remove_probability >= threshold && decision.category == "none" {
+            console_log!("needs_review_missing_category chat={} message={} remove_probability={:.3} threshold={:.3}",
+                chat_id,msg_id,decision.remove_probability,threshold);
+        }
         store::finish_review(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability).await?;
         return Ok(false);
+    }
+    if decision.action != "remove" {
+        console_log!("threshold_override chat={} message={} chosen_action={} action_confidence={:.3} category_confidence={:.3} remove_probability={:.3} threshold={:.3}",
+            chat_id,msg_id,decision.action,decision.action_confidence,decision.category_confidence,
+            decision.remove_probability,threshold);
     }
 
     let safe_mode = store::group_dry_run(env,chat_id).await?;
@@ -353,7 +367,7 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
                 store::set_group_threshold(env,chat_id,value).await?;
             }
             let value=store::group_threshold(env,chat_id).await?;
-            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; model must choose remove and category confidence must be at least 75%.",value,value*100.0);
+            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; delete when remove probability meets the threshold and category is not none; chosen action and separate confidences are informational.",value,value*100.0);
             if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice(env,chat_id,&reply).await;}
         }
         "/dry-run" | "/dry_run" | "/logs" => {
@@ -708,7 +722,7 @@ mod tests {
         }
     }
     #[test]
-    fn threshold_requires_high_confidence_and_category() {
+    fn threshold_requires_remove_score_and_actionable_category() {
         let mut d=Decision{action:"remove".into(),action_confidence:0.99,remove_probability:0.98,
             category:"fraud".into(),category_confidence:0.95,severity:"critical".into(),critical_probability:0.99};
         assert!(d.clear_violation(0.93));
@@ -717,6 +731,42 @@ mod tests {
         d.category="fraud".into();
         d.remove_probability=0.50;
         assert!(!d.clear_violation(0.93));
+    }
+
+    #[test]
+    fn remove_probability_controls_deletion_even_if_action_choice_disagrees() {
+        let mut d=Decision{action:"allow".into(),action_confidence:0.1,remove_probability:0.916,
+            category:"harassment".into(),category_confidence:0.1,
+            severity:"minor".into(),critical_probability:0.0};
+        assert!(d.clear_violation(0.80));
+        assert!(!d.clear_violation(0.93));
+        assert_eq!(d.status_without_removal(0.93),"allow");
+        d.action="review".into();
+        assert!(d.clear_violation(0.80));
+        assert_eq!(d.status_without_removal(0.93),"needs_review");
+        d.action="remove".into();
+        d.remove_probability=0.80;
+        assert!(d.clear_violation(0.80),"threshold boundary is inclusive");
+        d.remove_probability=0.7999;
+        assert!(!d.clear_violation(0.80));
+        assert_eq!(d.status_without_removal(0.80),"needs_review");
+        d.remove_probability=0.99;
+        d.category="none".into();
+        assert!(!d.clear_violation(0.80),"do not punish without a violation category");
+        assert_eq!(d.status_without_removal(0.80),"needs_review");
+    }
+    #[test]
+    fn high_remove_score_is_not_vetoed_by_other_choice_confidences() {
+        let mut raw=model_response();
+        raw["answers"]["action"]["choice"]=json!("allow");
+        raw["answers"]["action"]["confidence"]=json!(0.2);
+        raw["answers"]["action"]["probabilities"]["remove"]=json!(0.916);
+        raw["answers"]["category"]["choice"]=json!("harassment");
+        raw["answers"]["category"]["confidence"]=json!(0.1);
+        let decision=parse_decision(raw).unwrap();
+        assert_eq!(decision.action,"allow");
+        assert!(decision.clear_violation(0.80));
+        assert!(!decision.clear_violation(0.93));
     }
     #[test]
     fn choice_result_has_to_match_schema() {

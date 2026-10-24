@@ -35,9 +35,9 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, actionChoice = null, categoryChoice = null, actionConfidence = null, categoryConfidence = 1, scores = null } = {}) {
   const settings = new Map();
-  const deliveries = [], statements = [], telegram = [], completed = new Set(), errors = [], aiCalls = [];
+  const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
   class WorkerQueue {
     async send(body, options) {
@@ -58,7 +58,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
           }
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
-          if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : 0};
+          if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : Number(strikes.has(`${values[0]}:${values[1]}`))};
           if (sql.includes('pending_bans')) return null;
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
           if (sql.includes('managed_chats')) return { status: 'active', chat_type: 'supergroup' };
@@ -72,6 +72,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             settings.set(values[0], row);
           }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
+          if (sql.includes('INSERT OR IGNORE INTO violations')) strikes.add(`${values[0]}:${values[2]}`);
           return { success: true, results: [], meta: { duration: 0, changes: 1, last_row_id: 0,
             changed_db: false, size_after: 0, rows_read: 0, rows_written: 1 } };
         },
@@ -81,9 +82,10 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
   class Ai {
     async run(model, input) {
       aiCalls.push({ model, input: JSON.parse(JSON.stringify(input)) });
+      const currentScore = scores?.[aiCalls.length - 1] ?? score;
       return { answers: {
-        action: { type: 'choice', choice: remove ? 'remove' : 'allow', confidence: remove ? score : 1, probabilities: { allow: remove ? 1-score : 1, review: 0, remove: remove ? score : 0 } },
-        category: { type: 'choice', choice: remove ? 'spam' : 'none', confidence: 1, probabilities: { none: remove ? 0 : 1, spam: remove ? 1 : 0 } },
+        action: { type: 'choice', choice: actionChoice ?? (remove ? 'remove' : 'allow'), confidence: actionConfidence ?? (remove ? currentScore : 1), probabilities: { allow: remove ? 1-currentScore : 1, review: 0, remove: remove ? currentScore : 0 } },
+        category: { type: 'choice', choice: categoryChoice ?? (remove ? 'spam' : 'none'), confidence: categoryConfidence, probabilities: { none: remove ? 0 : 1, spam: remove ? 1 : 0 } },
         severity: { type: 'choice', choice: 'none', confidence: 1, probabilities: { none: 1, critical: 0 } },
       } };
     }
@@ -354,6 +356,62 @@ await test('invalid thresholds do not overwrite the last valid setting',async()=
   assert.match(f.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/0.*1|%/);
  }
 });
+
+await test('remove probability above per-group threshold overrides contradictory action choice',async()=>{
+ for(const action of ['allow','review','remove']){
+  const f=fixture({remove:true,score:0.916,actionChoice:action,actionConfidence:0.2,
+    categoryChoice:'harassment',categoryConfidence:0.2});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+  await f.consume(message(groupA,704));
+  assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[704]);
+  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'deleted');
+  assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+  assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
+ }
+});
+await test('remove threshold comparison is inclusive and default remains 0.93',async()=>{
+ for(const [score,shouldDelete] of [[0.7999,false],[0.8,true],[0.916,true]]){
+  const f=fixture({remove:true,score,actionChoice:'allow',categoryChoice:'harassment'});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+  await f.consume(message(groupA,705));
+  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),shouldDelete);
+ }
+ const f=fixture({remove:true,score:0.916,actionChoice:'allow',categoryChoice:'harassment'});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,706));
+ assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+});
+await test('contradictory high score with category none is needs_review not allow',async()=>{
+ const f=fixture({remove:true,score:0.99,actionChoice:'allow',categoryChoice:'none'});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+ await f.consume(message(groupA,707));
+ assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+ assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
+});
+await test('model chooses remove below threshold is needs_review rather than allow',async()=>{
+ const f=fixture({remove:true,score:0.6,actionChoice:'remove',categoryChoice:'harassment'});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+ await f.consume(message(groupA,708));
+ assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+ assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
+});
+await test('edited message crosses threshold then receives only one strike and deletion',async()=>{
+ const f=fixture({remove:true,scores:[0.75,0.916,0.99],actionChoice:'allow',categoryChoice:'harassment'});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+ const original=message(groupA,710);
+ await f.consume(original);
+ assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'allow');
+ assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,0);
+ await f.consume({update_id:711,edited_message:{...original.message,text:'Edited text'}});
+ assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
+ assert.equal(f.telegram.find(c=>c.method==='deleteMessage').args.message_id,710);
+ await f.consume({update_id:712,edited_message:{...original.message,text:'Edited text again'}});
+ assert.equal(f.aiCalls.length,3);
+ assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('UPDATE archived_messages')).at(-1)?.values[0],'previously_deleted');
+});
+
 await test('a score below the default threshold is deleted only after an admin lowers that group threshold',async()=>{
  const f=fixture({remove:true,score:0.7956});f.env.DRY_RUN='false';
  await f.consume(message(groupA,600));
