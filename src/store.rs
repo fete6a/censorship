@@ -337,9 +337,10 @@ pub async fn can_auto_ban(env: &Env, chat_id: i64) -> Result<bool> {
 pub struct GroupSettings {
     pub dry_run: Option<i64>,
     pub logs_enabled: i64,
+    pub remove_threshold: Option<f64>,
 }
 pub async fn group_settings(env: &Env, chat_id: i64) -> Result<Option<GroupSettings>> {
-    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled FROM group_settings WHERE chat_id=?")
+    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled,remove_threshold FROM group_settings WHERE chat_id=?")
         .bind(&[js_i64(chat_id)])?.first::<GroupSettings>(None).await
 }
 pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
@@ -348,6 +349,18 @@ pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
 }
 pub async fn group_logs(env: &Env, chat_id: i64) -> Result<bool> {
     Ok(group_settings(env,chat_id).await?.map(|s|s.logs_enabled!=0).unwrap_or(true))
+}
+pub async fn group_threshold(env: &Env, chat_id: i64) -> Result<f64> {
+    Ok(group_settings(env,chat_id).await?.and_then(|s|s.remove_threshold).unwrap_or(0.93))
+}
+pub async fn set_group_threshold(env: &Env, chat_id: i64, threshold: f64) -> Result<()> {
+    if chat_id>=0 || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(fail("Invalid group ID or threshold"));
+    }
+    env.d1("DB")?.prepare(
+        "INSERT INTO group_settings(chat_id,remove_threshold) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET remove_threshold=excluded.remove_threshold"
+    ).bind(&[js_i64(chat_id),JsValue::from_f64(threshold)])?.run().await?;
+    Ok(())
 }
 pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: bool) -> Result<()> {
     if chat_id>=0 {return Err(fail("Invalid group ID"));}

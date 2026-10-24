@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -53,12 +53,13 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
         bind(...args) { values = args; return this; },
         async first() {
           statements.push({ sql, values, operation: 'read' });
-          if (flipAfterClaim && sql.includes('pending_bans')) {
-            if(sql.startsWith('UPDATE')) settings.set(groupA,{dry_run:1,logs_enabled:0});
+          if ((flipAfterClaim || timer) && sql.includes('pending_bans')) {
+            if(flipAfterClaim && sql.startsWith('UPDATE')) settings.set(groupA,{dry_run:1,logs_enabled:0});
             return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
           }
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
-          if (sql.includes('violations') && sql.includes('COUNT')) return {count:0};
+          if (sql.includes('violations') && sql.includes('COUNT')) return {count: sql.includes('user_id') ? strikeCount : 0};
+          if (sql.includes('pending_bans')) return null;
           if (sql.includes('group_settings')) return settings.get(values[0]) || null;
           if (sql.includes('managed_chats')) return { status: 'active', chat_type: 'supergroup' };
           throw new Error(`Unexpected D1 read: ${sql}`);
@@ -67,7 +68,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           statements.push({ sql, values, operation: 'write' });
           if (sql.includes('INSERT INTO group_settings')) {
             const row = settings.get(values[0]) || { dry_run: null, logs_enabled: 1 };
-            row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : 'logs_enabled'] = values[1];
+            row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
             settings.set(values[0], row);
           }
           if (sql.includes('INSERT OR IGNORE INTO processed_updates')) completed.add(values[0]);
@@ -81,7 +82,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     async run(model, input) {
       aiCalls.push({ model, input: JSON.parse(JSON.stringify(input)) });
       return { answers: {
-        action: { type: 'choice', choice: remove ? 'remove' : 'allow', confidence: 1, probabilities: { allow: remove ? 0 : 1, review: 0, remove: remove ? 1 : 0 } },
+        action: { type: 'choice', choice: remove ? 'remove' : 'allow', confidence: remove ? score : 1, probabilities: { allow: remove ? 1-score : 1, review: 0, remove: remove ? score : 0 } },
         category: { type: 'choice', choice: remove ? 'spam' : 'none', confidence: 1, probabilities: { none: remove ? 0 : 1, spam: remove ? 1 : 0 } },
         severity: { type: 'choice', choice: 'none', confidence: 1, probabilities: { none: 1, critical: 0 } },
       } };
@@ -97,10 +98,11 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     ] });
     if (method === 'getChatMember' && args.user_id===22 && pauseMember) await pauseMember();
     if (method === 'getChatMember') return Response.json({ ok: true, result: {
-      user: { id: args.user_id }, status: args.chat_id === groupA && !(flipAfterClaim && args.user_id===22) ? 'administrator' : 'member',
+      user: { id: args.user_id }, status: args.chat_id === groupA && args.user_id===11 ? 'administrator' : 'member',
     } });
+    if (['restrictChatMember','banChatMember'].includes(method)) return Response.json({ok:true,result:true});
     if (method === 'deleteMessage') return Response.json({ok:true,result:true});
-    if (method === 'sendMessage' && dmFail) return Response.json({ok:false},{status:403});
+    if (method === 'sendMessage' && ((dmFail && args.chat_id>0)||(noticeFail && args.chat_id<0))) return Response.json({ok:false},{status:403});
     if (method === 'sendMessage') return Response.json({ ok: true, result: { message_id: 1 } });
     if (method === 'getChat') return Response.json({ ok: true, result: {
       id: args.chat_id, type: 'supergroup', description: 'Do not post advertisements',
@@ -118,7 +120,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
     assert.equal(retried, retry);
     assert.equal(acked, !retry);
   }
-  return { worker, deliveries, statements, telegram, completed, errors, aiCalls, settings, consume };
+  return { worker, deliveries, statements, telegram, completed, errors, aiCalls, settings, consume, env };
 }
 
 await test('webhook preserves nested payload and IDs through JSON queue delivery', async () => {
@@ -289,4 +291,72 @@ await test('dry-run enabled after claim cancels processing case without banning 
  const done=f.statements.find(s=>s.sql.includes("status='processing'")&&s.operation==='write');
  assert.equal(done?.values[0],'canceled');
  assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
+});
+
+await test('threshold command is group scoped and cannot be used by another group administrator',async()=>{
+ const f=fixture();
+ await f.consume(command(`/threshold ${groupB} 0.75`));
+ assert.equal(f.settings.size,0);
+ assert.equal(f.statements.some(s=>s.sql.includes('group_settings')),false);
+ await f.consume({...command(`/threshold ${groupA} 0.75`),update_id:790});
+ assert.equal(f.settings.get(groupA)?.remove_threshold,0.75);
+ assert.equal(f.settings.has(groupB),false);
+});
+await test('threshold confirmation and updates in a group cannot retarget another group',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(command('/threshold 75%',{id:groupA,type:'supergroup'}));
+ assert.equal(f.settings.get(groupA)?.remove_threshold,0.75);
+ assert.equal(f.settings.get(groupA)?.dry_run,0);assert.equal(f.settings.get(groupA)?.logs_enabled,0);
+ assert.equal(f.telegram.find(c=>c.method==='sendMessage')?.args.chat_id,groupA);
+ await f.consume({...command(`/threshold ${groupB} 0.5`,{id:groupA,type:'supergroup'}),update_id:790});
+ assert.equal(f.settings.get(groupA)?.remove_threshold,0.75);assert.equal(f.settings.has(groupB),false);
+});
+await test('invalid thresholds do not overwrite the last valid setting',async()=>{
+ for(const arg of ['NaN','Infinity','-0.1','1.01','101%','75','0.75 extra']){
+  const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.85});
+  await f.consume(command(`/threshold ${groupA} ${arg}`));
+  assert.equal(f.settings.get(groupA)?.remove_threshold,0.85);
+  assert.match(f.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/0.*1|%/);
+ }
+});
+await test('a score below the default threshold is deleted only after an admin lowers that group threshold',async()=>{
+ const f=fixture({remove:true,score:0.7956});f.env.DRY_RUN='false';
+ await f.consume(message(groupA,600));
+ assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+ await f.consume(command(`/threshold ${groupA} 0.75`));
+ await f.consume(message(groupA,601));await f.consume(message(groupB,602));
+ assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>[c.args.chat_id,c.args.message_id]),[[groupA,601]]);
+});
+await test('deletion and warning are announced only in the affected group even with private logs off',async()=>{
+ const f=fixture({remove:true,strikeCount:1});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,610));
+ const sends=f.telegram.filter(c=>c.method==='sendMessage');
+ assert.ok(sends.length>0);assert.ok(sends.every(c=>c.args.chat_id===groupA));
+ assert.match(sends.map(c=>c.args.text).join(' '),/610.*已删除/);
+ assert.match(sends.map(c=>c.args.text).join(' '),/警告.*22|22.*警告/);
+ assert.ok(f.telegram.findIndex(c=>c.method==='deleteMessage')<f.telegram.findIndex(c=>c.method==='sendMessage'));
+});
+await test('third strike announces a cancellable pending ban without claiming the ban happened',async()=>{
+ const f=fixture({remove:true,strikeCount:3});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,611));
+ const text=f.telegram.filter(c=>c.method==='sendMessage').map(c=>c.args.text).join(' ');
+ assert.match(text,/611.*已删除/);assert.match(text,/60.*封禁/);assert.match(text,/\/cancel 22/);
+ assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
+});
+await test('completed ban sends a notice in the same group only',async()=>{
+ const f=fixture({timer:true});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume({kind:'ban_check',chat_id:groupA,user_id:22,message_id:42});
+ assert.equal(f.telegram.filter(c=>c.method==='banChatMember').length,1);
+ const sends=f.telegram.filter(c=>c.method==='sendMessage');assert.equal(sends.length,1);
+ assert.equal(sends[0].args.chat_id,groupA);assert.match(sends[0].args.text,/22.*封禁/);
+});
+await test('failed public notification does not retry a completed deletion',async()=>{
+ const f=fixture({remove:true,noticeFail:true,strikeCount:1});f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,612));assert.equal(f.completed.has(612),true);
+ assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
+ assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===groupA));
+});
+await test('dry-run does not announce deletion or ban in the group',async()=>{
+ const f=fixture({remove:true});await f.consume(message(groupA,613));
+ assert.equal(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id<0),false);
 });

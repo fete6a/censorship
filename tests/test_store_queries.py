@@ -63,7 +63,7 @@ class StoreQueryTests(unittest.TestCase):
     def test_group_setting_defaults_and_isolated_partial_updates(self):
         self.db.execute('INSERT INTO group_settings(chat_id) VALUES(-1002)')
         source=(ROOT/'src/store.rs').read_text()
-        dry,logs=re.findall(r'"(INSERT INTO group_settings[^"\n]+)"', source)
+        dry,logs=re.findall(r'"(INSERT INTO group_settings[^"\n]+)"', source.split('pub async fn set_group_option(',1)[1])
         self.db.execute(dry,(-1001,0))
         self.db.execute(logs,(-1001,0))
         self.assertEqual(self.db.execute('SELECT chat_id,dry_run,logs_enabled FROM group_settings ORDER BY chat_id DESC').fetchall(),[(-1001,0,0),(-1002,None,1)])
@@ -73,3 +73,16 @@ class StoreQueryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class GroupThresholdTests(unittest.TestCase):
+    setUp=StoreQueryTests.setUp
+    tearDown=StoreQueryTests.tearDown
+    def test_threshold_upsert_preserves_other_settings_and_other_groups(self):
+        self.db.execute('INSERT INTO group_settings(chat_id,dry_run,logs_enabled) VALUES(-1001,0,0)')
+        self.db.execute(query_for('set_group_threshold'),(-1001,0.75))
+        self.db.execute(query_for('set_group_threshold'),(-1002,0.9))
+        self.db.execute(query_for('set_group_threshold'),(-1001,0.8))
+        self.assertEqual(self.db.execute('SELECT chat_id,dry_run,logs_enabled,remove_threshold FROM group_settings ORDER BY chat_id DESC').fetchall(),[(-1001,0,0,0.8),(-1002,None,1,0.9)])
+        for value in (-0.1,1.01):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.db.execute(query_for('set_group_threshold'),(-1001,value))

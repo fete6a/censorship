@@ -41,13 +41,20 @@ pub async fn user_is_admin(env: &Env, chat_id: i64, user_id: i64) -> Result<bool
     Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
 }
 
-/// Silent mode: Telegram supergroup and group IDs are negative. Never attempt
-/// sendMessage to a group. For private commands the target is the human user's
-/// positive Telegram ID (only works after they started the bot themselves).
+/// Private command replies and admin logs only.
 pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
     if chat_id <= 0 { return Ok(()); }
     api(env, "sendMessage", json!({"chat_id": chat_id, "text": text})).await?;
     Ok(())
+}
+
+/// Public action notices must remain in the group where the action occurred.
+/// Independent of the private admin logs setting; delivery is best effort.
+pub async fn send_group_notice(env: &Env, chat_id: i64, text: &str) {
+    if chat_id>=0 {return;}
+    if api(env,"sendMessage",json!({"chat_id":chat_id,"text":text})).await.is_err() {
+        worker::console_error!("group_notice_delivery_failed");
+    }
 }
 
 /// Deliver only to current human administrators of this exact group. No global recipient.

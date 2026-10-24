@@ -3,7 +3,6 @@ use worker::{console_error, console_log, Env, Result};
 use crate::{media, store, tg};
 use crate::util::{config, fail, field_int, field_str, flag, now};
 
-const REMOVE_THRESHOLD: f64 = 0.93;
 const ACTION_CONFIDENCE: f64 = 0.80;
 const CATEGORY_CONFIDENCE: f64 = 0.75;
 const DELETE_WINDOW: i64 = 48 * 3600;
@@ -21,10 +20,10 @@ pub struct Decision {
 }
 
 impl Decision {
-    fn clear_violation(&self) -> bool {
+    fn clear_violation(&self, threshold: f64) -> bool {
         self.action == "remove"
-            && self.remove_probability >= REMOVE_THRESHOLD
-            && self.action_confidence >= ACTION_CONFIDENCE
+            && self.remove_probability >= threshold
+            && self.action_confidence >= ACTION_CONFIDENCE.min(threshold)
             && self.category != "none"
             && self.category_confidence >= CATEGORY_CONFIDENCE
     }
@@ -173,7 +172,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
         }
     };
 
-    let clear = decision.clear_violation();
+    let clear = decision.clear_violation(store::group_threshold(env,chat_id).await?);
     let category = category_name(&decision.category);
     if !clear {
         let kind = if decision.action == "review" { "needs_review" } else { "allow" };
@@ -215,7 +214,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
     }
     tg::delete(env, chat_id, msg_id).await?;
 
-    let mut notice = format!("违规消息 {msg_id} 已删除：{category}。");
+    let mut notice = String::new();
     if let Some(user_id) = user {
         store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability).await?;
         let count = store::recent_strikes(env, chat_id, user_id).await?;
@@ -265,6 +264,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
             }
         } else {
             store::set_strike_action(env, chat_id, msg_id, "warned").await?;
+            notice.push_str(&format!("警告用户 {user_id}："));
             if is_admin {
                 notice.push_str("发送者为管理员，不会自动封禁。");
             } else {
@@ -274,9 +274,10 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
     } else {
         notice.push_str("匿名/频道身份：无法归属具体用户，不封禁。");
     }
+    let notice=format!("违规消息 {msg_id} 已删除：{category}。\n{notice}");
+    tg::send_group_notice(env,chat_id,&notice).await;
     store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
     // Notification failure must not erase the successful deletion.
-    // No group messages. D1 remains the audit trail; optional private DM only.
     let _ = tg::send_to_review_or_chat(env, chat_id, &notice).await;
     Ok(true)
 }
@@ -293,14 +294,14 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
             return None;
         }
     }
-    if !matches!(cmd, "/start" | "/help" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+    if !matches!(cmd, "/start" | "/help" | "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
         return None;
     }
     Some((cmd, words.collect()))
 }
 
-/// Admin commands may be issued in a group (silently, no response) or privately
-/// as `/cancel -100GROUP_ID USER_ID`. The bot never sends messages to groups.
+/// Commands authorize against the exact target group. Threshold commands reply
+/// in their origin group; other group commands retain silent responses.
 async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let Some((cmd, words)) = command_parts(env,msg) else { return Ok(false); };
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
@@ -309,12 +310,13 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     if matches!(cmd, "/start" | "/help") {
         tg::send(env,origin_chat_id,concat!(
             "Commands for group administrators (private chat):\n",
-            "/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
+            "/threshold GROUP_ID 0.75 (or 75%)\n/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
             "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
             "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
             "Use a negative GROUP_ID, for example -1001234567890. ",
             "You must be an administrator of that specific group. ",
-            "Inside a group, omit GROUP_ID; commands apply only to that group and stay silent."
+            "Inside a group, omit GROUP_ID; commands apply only to that group. ",
+            "Threshold commands confirm in the group; moderation actions are announced there."
         )).await?;
         return Ok(true);
     }
@@ -332,6 +334,24 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     if !store::can_review(env,chat_id).await? {return Ok(true);}
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
+        "/threshold" => {
+            if !args.is_empty() {
+                let value=if let [raw]=args.as_slice() {
+                    let (number,divisor)=raw.strip_suffix('%').map(|n|(n,100.0)).unwrap_or((raw,1.0));
+                    number.parse::<f64>().ok().map(|n|n/divisor)
+                        .filter(|n|n.is_finite() && (0.0..=1.0).contains(n))
+                } else {None};
+                let Some(value)=value else {
+                    let usage="Use /threshold 0.75 or /threshold 75% (range 0 to 1 or 0% to 100%). In private chats specify GROUP_ID first.";
+                    if private {tg::send(env,origin_chat_id,usage).await?;} else {tg::send_group_notice(env,chat_id,usage).await;}
+                    return Ok(true);
+                };
+                store::set_group_threshold(env,chat_id,value).await?;
+            }
+            let value=store::group_threshold(env,chat_id).await?;
+            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; model must choose remove and category confidence must be at least 75%.",value,value*100.0);
+            if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice(env,chat_id,&reply).await;}
+        }
         "/dry-run" | "/dry_run" | "/logs" => {
             let dry_run=cmd!="/logs";
             if !args.is_empty() {
@@ -558,9 +578,11 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
         Ok(())=>{
             store::conclude_pending(env,chat_id,user_id,message_id,"banned").await?;
             store::set_strike_action(env,chat_id,message_id,"banned_after_review").await?;
-            let _=tg::send_to_review_or_chat(env,chat_id,&format!(
+            let notice=format!(
                 "用户 {user_id} 在 60 秒管理员复核期内未被取消，现已执行封禁。"
-            )).await;
+            );
+            tg::send_group_notice(env,chat_id,&notice).await;
+            let _=tg::send_to_review_or_chat(env,chat_id,&notice).await;
             Ok(())
         },
         Err(e)=>{
@@ -680,12 +702,12 @@ mod tests {
     fn threshold_requires_high_confidence_and_category() {
         let mut d=Decision{action:"remove".into(),action_confidence:0.99,remove_probability:0.98,
             category:"fraud".into(),category_confidence:0.95,severity:"critical".into(),critical_probability:0.99};
-        assert!(d.clear_violation());
+        assert!(d.clear_violation(0.93));
         d.category="none".into();
-        assert!(!d.clear_violation());
+        assert!(!d.clear_violation(0.93));
         d.category="fraud".into();
         d.remove_probability=0.50;
-        assert!(!d.clear_violation());
+        assert!(!d.clear_violation(0.93));
     }
     #[test]
     fn choice_result_has_to_match_schema() {
@@ -693,6 +715,6 @@ mod tests {
           "probabilities":{"remove":0.99}},
           "category":{"type":"choice","choice":"spam","confidence":0.9,"probabilities":{"spam":0.9}},
           "severity":{"type":"choice","choice":"major","confidence":0.9,"probabilities":{"critical":0.01}}}});
-        assert!(parse_decision(result).unwrap().clear_violation());
+        assert!(parse_decision(result).unwrap().clear_violation(0.93));
     }
 }
