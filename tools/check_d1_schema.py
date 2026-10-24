@@ -2,8 +2,8 @@
 """Read-only, fail-closed release check for the existing production D1 schema.
 
 No migration, data mutation, Worker deployment, or external HTTP call is made
-by this script. Remote mode only runs a single SQLite metadata SELECT through
-Wrangler against the configured DB binding.
+by this script. Remote mode runs a read-only metadata SELECT and literal
+table_info PRAGMAs through Wrangler against the configured DB binding.
 """
 import argparse
 import json
@@ -15,9 +15,14 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_SCHEMA = ROOT / "schema/current.sql"
+METADATA_SQL = (
+    "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition "
+    "FROM sqlite_master WHERE type IN ('table','index','trigger') "
+    "AND name NOT LIKE 'sqlite_%' ORDER BY type,name"
+)
 
-# SQLite's table-valued pragma lets the one read-only D1 query inspect every
-# application table and index without querying message/user contents.
+# Local SQLite adapter. D1 rejects this dynamic table-valued pragma join;
+# remote mode uses inspection_queries() to gather equivalent metadata.
 INSPECTION_SQL = (
     'SELECT m.type AS object_type, m.name AS object_name, '
     'm.tbl_name AS table_name, m.sql AS definition, '
@@ -33,7 +38,7 @@ INSPECTION_SQL = (
 
 
 def inspect_sqlite(db):
-    """Test/local adapter for exactly the same metadata query used in D1."""
+    """Local adapter for metadata equivalent to the D1 inspection batch."""
     previous = db.row_factory
     try:
         db.row_factory = sqlite3.Row
@@ -50,6 +55,46 @@ def expected_metadata():
         return inspect_sqlite(db)
     finally:
         db.close()
+
+
+def inspection_queries():
+    """D1 permits literal PRAGMAs, but rejects the dynamic pragma-table join.
+
+    Table identifiers come only from the trusted canonical schema. No remote
+    DDL is executed and no application rows are read.
+    """
+    names = sorted({row["object_name"] for row in expected_metadata()
+                    if row["object_type"] == "table"})
+    return [METADATA_SQL] + [f'PRAGMA table_info("{name}")' for name in names]
+
+
+def parse_inspection_json(text):
+    payload = json.loads(text)
+    if not isinstance(payload, list) or len(payload) == 1:
+        return parse_d1_json(text)  # Original normalized metadata format.
+    queries = inspection_queries()
+    if len(payload) != len(queries):
+        raise ValueError("incomplete D1 metadata/PRAGMA batch")
+    for statement in payload:
+        if not isinstance(statement, dict) or statement.get("success") is not True or not isinstance(statement.get("results"), list):
+            raise ValueError("D1 metadata/PRAGMA statement failed")
+    table_names = [query.split('"')[1] for query in queries[1:]]
+    columns = dict(zip(table_names, [item["results"] for item in payload[1:]]))
+    rows = []
+    for obj in payload[0]["results"]:
+        if not isinstance(obj, dict) or not all(key in obj for key in ("object_type", "object_name", "table_name", "definition")):
+            raise ValueError("malformed D1 schema object")
+        items = columns.get(obj["object_name"], []) if obj["object_type"] == "table" else []
+        for column in items or [None]:
+            if column is not None and (not isinstance(column, dict) or not all(key in column for key in ("name", "type", "notnull", "pk", "dflt_value"))):
+                raise ValueError("malformed D1 PRAGMA column")
+            column = column or {}
+            rows.append({**obj, "column_name": column.get("name"),
+                         "data_type": column.get("type"), "not_null": column.get("notnull"),
+                         "primary_key": column.get("pk"), "default_value": column.get("dflt_value")})
+    if not rows:
+        raise ValueError("missing D1 schema objects")
+    return rows
 
 
 def parse_d1_json(text):
@@ -264,14 +309,14 @@ def remote_metadata():
     command = [
         "npx", "--no-install", "wrangler", "d1", "execute", "DB", "--remote",
         "--config", str(ROOT / "wrangler.jsonc"),
-        "--command", INSPECTION_SQL, "--json",
+        "--command", ";\n".join(inspection_queries()), "--json",
     ]
     outcome = subprocess.run(
         command, cwd=ROOT, text=True, capture_output=True, check=False, timeout=60,
     )
     if outcome.returncode:
         raise RuntimeError(f"read-only Wrangler D1 query failed (exit {outcome.returncode})")
-    return parse_d1_json(outcome.stdout)
+    return parse_inspection_json(outcome.stdout)
 
 
 def main(argv=None):
@@ -279,10 +324,14 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--remote", action="store_true", help="Read production DB binding via Wrangler --remote")
     source.add_argument("--from-json", type=Path, metavar="FILE", help="Check saved --json response from an equivalent read-only D1 query")
+    source.add_argument("--print-inspection-sql", action="store_true", help="Print the read-only D1 metadata/PRAGMA batch for a connector")
     parser.add_argument("--pre-migration", action="store_true", help="Recognize known additive warning and scan-fencing migrations")
     args = parser.parse_args(argv)
+    if args.print_inspection_sql:
+        print(";\n".join(inspection_queries()) + ";")
+        return 0
     try:
-        rows = remote_metadata() if args.remote else parse_d1_json(args.from_json.read_text(encoding="utf-8"))
+        rows = remote_metadata() if args.remote else parse_inspection_json(args.from_json.read_text(encoding="utf-8"))
         status, problems = validate(rows, allow_missing_warning=args.pre_migration)
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as error:
         print(f"SCHEMA_CHECK_FAILED: {error}", file=sys.stderr)

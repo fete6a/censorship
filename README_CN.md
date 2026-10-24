@@ -22,7 +22,7 @@
 
 ## 统一消息格式
 
-机器人对外消息统一使用安全转义的 **Telegram MarkdownV2**：ℹ️ 查询/说明、✅ 设置成功、⚠️ 参数或权限问题、❌ 命令执行异常、🚨 删除与封禁公告、📋 分组审核摘要。命令回复统一中文字段（群组、状态、选项、消息 ID、模式、剩余时间、处置结果），不直接暴露内部 `on/off`、`pending`、`enforce` 等英文状态。审核摘要与单条扫描使用同一状态名称及分数进度条；审核失败不伪造分数。群规、用户名、群名均安全转义；被删除消息不生成无法访问的链接。命令回复保留原聊天及话题，管理员日志保留群组和群主上下文。本次只规范展示，不修改审核模型、群规、权限、阈值或数据库结构。
+机器人对外消息统一使用安全转义的 **Telegram MarkdownV2**：ℹ️ 查询/说明、✅ 设置成功、⚠️ 参数或权限问题、❌ 命令执行异常、🚨 删除与封禁公告、📋 分组审核摘要。命令回复统一中文字段（群组、状态、选项、消息 ID、模式、剩余时间、处置结果），不直接暴露内部 `on/off`、`pending`、`enforce` 等英文状态。审核摘要与单条扫描使用同一状态名称及分数进度条；审核失败不伪造分数。群规、用户名、群名均安全转义；被删除消息不生成无法访问的链接。命令回复保留原聊天及话题，管理员日志保留群组和群主上下文。
 
 ## 审核及处罚
 
@@ -81,7 +81,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。新建空 D1 仍用 `schema/current.sql` 一次性初始化；现有数据库需在部署前**手动、一次性**执行幂等的 `schema/ensure_warning_adjustments.sql`，只新增警告调整表，不改原始违规记录。GitHub Actions 不自动更改生产数据库。
+GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。新建空 D1 仍用 `schema/current.sql` 一次性初始化；现有数据库需在部署前**手动**执行幂等的 `schema/ensure_warning_adjustments.sql`，建立 `warning_adjustments`、`warning_edit_receipts` 及 `apply_warning_edit_receipt` 触发器，保留原始违规历史。收据触发器原子应用后续警告调整和待封禁取消。还需按预检输出补齐扫描租约字段；扫描 ALTER 不可重复执行。GitHub Actions 不自动更改生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -93,7 +93,7 @@ npx wrangler queues create telegram-clef-moderation-dlq
 npx wrangler d1 execute DB --remote --file schema/current.sql
 ```
 
-上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**，绝不能用于已有数据的数据库。已运行旧版本的 D1 应先执行 `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql` 或通过 Cloudflare MCP 执行其中的单条 `CREATE TABLE IF NOT EXISTS`；此增量补表不会迁移或清理旧记录。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
+上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**，绝不能用于已有数据的数据库。已运行旧版本的 D1 应先执行 `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql` 或通过 Cloudflare MCP 执行该文件中的完整增量 SQL（包含收据触发器），并仅补齐预检输出的扫描 ALTER；不能只建立一张表就部署。已有收据表却缺少触发器时必须先人工对账，禁止直接补建后重放处罚。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
 
 ```sh
 read -r -s -p 'BOT_TOKEN: ' BOT_TOKEN; echo
@@ -127,7 +127,7 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 通过 Cloudflare MCP 手动部署与群组导航
 
-下载 main 成功构建的 Worker 产物，核对 SHA-256 和源提交；通过已授权 Cloudflare MCP 先只读检查 D1 必需字段，再将原始 `index.js` 和二进制 `index_bg.wasm` 作为模块上传，不重新打包。保留现有绑定、变量、密钥、兼容性与可观测性配置，发布后核对活动版本和 `/healthz`。数据库内容、Queue 消费者、Cron 和 Telegram Webhook 配置保留。
+下载 main 成功构建的 Worker 产物，核对 SHA-256 和源提交；先记录当前 Worker 版本与 D1 Time Travel 恢复书签。通过已授权 Cloudflare MCP 执行 `python3 tools/check_d1_schema.py --print-inspection-sql` 打印的只读元数据及 PRAGMA 批次，将成功结果保存为 JSON，并用 `--from-json response.json --pre-migration` 校验。按输出补齐增量迁移，再去掉 `--pre-migration` 复查（必须退出 0），然后将原始 `index.js` 和二进制 `index_bg.wasm` 作为模块上传，不重新打包。保留现有绑定、变量、密钥、兼容性与可观测性配置，发布后核对活动版本和 `/healthz`。数据库内容、Queue 消费者、Cron 和 Telegram Webhook 配置保留。
 
 管理员私聊摘要和处罚日志增加当前群名、群 ID 与可点击链接：公开群使用用户名链接；私有群优先使用已存在的 Telegram 邀请链接，否则链接到仍存在的已审核消息，供群成员进入。不会新建邀请链接。元数据不可用时回退到群 ID 和可用消息链接。群名安全转义，收件人仍只限目标群当前人类管理员。
 
@@ -140,16 +140,18 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 生产 D1 发布前校验
 
-GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
 
-联合 PR #13 后，发布预检还要检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。
+发布预检同时检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。
 
 ### 历史扫描的代次隔离与取消边界
 
 历史扫描在 D1 中使用递增的 `generation` 与每次 Cron 原子领取的 `lease_id`。停止会使旧代次失效，立即以 `audit` 重启也不会接受旧执行模式任务的进度、普通历史审核结果或完成写入；重叠 Cron 无法领取同一任务。租约最长 20 分钟，异常中断后可自动恢复。完成通知包含代次，便于识别 Telegram 延迟送达的旧通知。
 
-现有数据库必须在发布对应 Worker 之前先检查 `scan_jobs` 列，缺少时**仅执行一次** `schema/ensure_scan_fencing.sql`。新数据库直接使用 `schema/current.sql`。不要在现有数据库上运行初始化脚本；CI 不修改生产 D1。
+现有数据库必须先检查 `scan_jobs` 列，只执行预检打印的缺失 ALTER。`schema/ensure_scan_fencing.sql` 不幂等；部分执行后不要从头重跑。新数据库直接使用 `schema/current.sql`。不要在现有数据库上运行初始化脚本；CI 不修改生产 D1。
 
 停止无法原子取消已经发往 Telegram 的删除/禁言请求。发生在停止之后才返回成功的外部操作仍会写入处罚事实记录，以避免重复处罚；但旧任务不得修改新扫描代次的游标与统计。
 
 联合发布预检也要求扫描租约字段完整。`--pre-migration` 会打印尚缺少的扫描 `ALTER` 语句；只执行这些语句，不要重复运行已部分执行的扫描迁移。停止后已发出的禁言可能仍然完成，但过期扫描不能再创建待封禁任务。
+
+警告编辑以 Telegram 更新 ID 去重。清理旧违规后，新违规 ID 仍高于有效人工基线，避免重用 rowid 导致漏计。不要独立重建或 VACUUM 违规表，除非同时保留其与警告基线的顺序关系。

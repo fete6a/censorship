@@ -174,6 +174,31 @@ class D1ReleaseSafetyTests(unittest.TestCase):
         self.assertNotIn("INSERT ", guard.INSPECTION_SQL.upper())
         self.assertNotIn("DELETE ", guard.INSPECTION_SQL.upper())
 
+    def test_d1_literal_pragma_batch_matches_local_metadata_and_rejects_partial_results(self):
+        def batch():
+            self.db.row_factory = sqlite3.Row
+            try:
+                return [{"success": True, "results": [dict(row) for row in self.db.execute(query)]}
+                        for query in guard.inspection_queries()]
+            finally:
+                self.db.row_factory = None
+        old = guard.parse_inspection_json(json.dumps(batch()))
+        self.assertEqual(guard.validate(old, allow_missing_warning=True), ("migration_required", []))
+        self.migrate()
+        results = batch()
+        rows = guard.parse_inspection_json(json.dumps(results))
+        self.assertEqual(guard.validate(rows), ("ready", []))
+        expected = guard.objects(guard.inspect_sqlite(self.db))
+        for key in guard.objects(guard.expected_metadata()):
+            self.assertEqual(guard.objects(rows)[key], expected[key])
+        self.assertTrue(all(query.startswith(('SELECT ', 'PRAGMA table_info("'))
+                            for query in guard.inspection_queries()))
+        with self.assertRaises(ValueError):
+            guard.parse_inspection_json(json.dumps(results[:-1]))
+        results[1]["success"] = False
+        with self.assertRaises(ValueError):
+            guard.parse_inspection_json(json.dumps(results))
+
 
     def test_post_pr11_database_needs_only_additive_receipt_migration(self):
         # PR #11 already created adjustments, but PR #13 has not yet run.
