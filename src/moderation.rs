@@ -69,9 +69,10 @@ fn parse_decision(raw: Value) -> Result<Decision> {
     let remove_probability=probability(&violation["noul"])?;
     let (category, _, _) = parse_choice(body, "category",
         &["none", "spam", "fraud", "harassment", "hate", "adult", "threat", "other"])?;
-    // "other" is not an actionable category. Normalize it at the model boundary
-    // so status selection, persisted reviews, and notifications match "none".
-    let category = if category == "other" { "none" } else { category };
+    // "other" and "adult" are not actionable categories. Normalize them at
+    // the model boundary so status selection, persisted reviews, and
+    // notifications match "none".
+    let category = if matches!(category, "other" | "adult") { "none" } else { category };
     let (_, _, severity_probs) = parse_choice(body, "severity", &["none", "minor", "major", "critical"])?;
     let critical_probability = probability(&severity_probs["critical"])?;
     Ok(Decision { remove_probability, category: category.to_owned(), critical_probability })
@@ -778,8 +779,8 @@ mod tests {
         assert_eq!(d.status_without_removal(0.80),"allow");
     }
     #[test]
-    fn other_category_is_normalized_to_none() {
-        for category in ["none", "other"] {
+    fn non_actionable_categories_are_normalized_to_none() {
+        for category in ["none", "other", "adult"] {
             let mut raw=model_response();
             raw["answers"]["category"]["choice"]=json!(category);
             let mut decision=parse_decision(raw).unwrap();
