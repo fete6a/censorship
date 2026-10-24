@@ -332,6 +332,33 @@ await test('20 event window groups private reviews by chat without leaking to ot
  assert.ok(messages.every(x=>x.args.link_preview_options?.is_disabled===true));
 });
 
+await test('Queue reuses group descriptions per group without changing per-item AI or D1 writes',async()=>{
+ const f=fixture();
+ const updates=[...Array.from({length:12},(_,i)=>message(groupA,1100+i)),
+                ...Array.from({length:8},(_,i)=>message(groupB,1200+i))];
+ const outcome=await f.consumeBatch(updates);
+ assert.ok(outcome.every(o=>o.acked&&!o.retried));
+ assert.equal(f.aiCalls.length,20,'model inference still happens per message');
+ assert.equal(f.telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===groupA).length,2,
+  'one policy read plus one metadata read for group A digest');
+ assert.equal(f.telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===groupB).length,2,
+  'no cross-group policy mixing');
+ assert.equal(f.statements.filter(s=>s.sql.includes('UPDATE archived_messages')).length,20);
+ assert.ok(f.aiCalls.every(call=>call.input.state.group_description==='Do not post advertisements'));
+});
+
+await test('policy snapshots are reset between Queue deliveries and when a command intervenes',async()=>{
+ const f=fixture();
+ await f.consumeBatch([message(groupA,1301),message(groupA,1302)]);
+ assert.equal(f.telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===groupA).length,2);
+ f.telegram.length=0;
+ const cmd={...command('/help',{id:groupA,type:'supergroup'}),update_id:1303};
+ cmd.message.message_id=1303;
+ await f.consumeBatch([message(groupA,1304),cmd,message(groupA,1305)]);
+ assert.equal(f.telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===groupA).length,3,
+  'command invalidates the cached description and digest requests metadata');
+});
+
 await test('a malformed update in the same batch retries independently of successful reviews',async()=>{
  const f=fixture();
  const result=await f.consumeBatch([message(groupA,880),{},message(groupB,881)]);
