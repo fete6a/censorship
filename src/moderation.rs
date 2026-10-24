@@ -195,7 +195,7 @@ async fn review_with_policy_cache(
     let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
         store::finish_review(env, chat_id, msg_id,
-            if safe_mode { "dry_run_flag" } else { "audit_flag" },
+            if mode == Mode::Audit { "audit_flag" } else { "dry_run_flag" },
             &decision.category, decision.remove_probability).await?;
         return Ok(true);
     }
@@ -354,14 +354,15 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "/threshold 0.75（或 75%）— 设置删除阈值\n",
             "/dry_run on|off — 模拟模式\n",
             "/logs on|off — 管理员私聊日志\n",
-            "/scan — 回复消息后审核\n",
-            "/scan MESSAGE_ID [enforce] — 审核已归档消息\n",
+            "/scan [audit] — 回复消息后审核，默认按规则执行处罚\n",
+            "/scan MESSAGE_ID [audit] — 审核已归档消息\n",
+            "/warnings USER_ID [0-3] — 查询或设置近 7 天警告次数\n",
             "/scan_all [enforce] — 历史扫描\n",
             "/scan_status、/scan_stop — 查看或停止扫描\n",
             "/pending USER_ID、/cancel USER_ID — 封禁复核与取消\n\n",
             "私聊管理员命令：在命令后加入负数 GROUP_ID，",
             "例如 /rules GROUP_ID、/threshold GROUP_ID 0.75、",
-            "/scan GROUP_ID MESSAGE_ID、/scan_status GROUP_ID。\n",
+            "/scan GROUP_ID MESSAGE_ID、/warnings GROUP_ID USER_ID 2。\n",
             "每条群命令只针对所在群组；/logs off 不影响群公告或命令回复。"
         )).await?;
         // Group help and extra text remain subject to moderation.
@@ -377,7 +378,7 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
         reply_rules(env,msg,origin_chat_id).await?;
         return Ok(true);
     }
-    if !matches!(cmd, "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+    if !matches!(cmd, "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending" | "/warnings") {
         reply_msg(env,msg,NoticeTone::Warning,"未知命令",
             "未知命令，请使用 /help 查看支持的命令。").await?;
         return Ok(private);
@@ -501,6 +502,49 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             };
             reply_msg(env,msg,NoticeTone::Info,"封禁复核状态",&reply).await?;
         }
+        "/warnings" => {
+            // The target group is always the private command's authorized
+            // GROUP_ID or the originating group; never a user-provided group
+            // ID inside a group. Keep user IDs positive and count bounded.
+            let target=args.first().and_then(|value|value.parse::<i64>().ok()).filter(|id|*id>0);
+            let desired=if args.len()==2 {
+                args[1].parse::<i64>().ok().filter(|n|(0..=3).contains(n))
+            } else {None};
+            let valid=args.len()==1 || (args.len()==2 && desired.is_some());
+            let Some(user_id)=target.filter(|_|valid) else {
+                reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                    "用法：/warnings USER_ID [0-3]（私聊：/warnings GROUP_ID USER_ID [0-3]）。\n只允许指定正整数用户 ID；警告次数为 0 至 3。").await?;
+                return Ok(true);
+            };
+            let mut pending_canceled=false;
+            if let Some(count)=desired {
+                store::set_warning_count(env,chat_id,user_id,count,actor).await?;
+                // A manual correction must not leave a stale automatic ban in
+                // flight. Only unmute when Telegram still shows our precise
+                // temporary restriction, never override a human restriction.
+                if let Some(case)=store::cancel_pending(env,chat_id,user_id,actor,"warning_count_adjusted").await? {
+                    pending_canceled=true;
+                    let restore=match tg::get_member(env,chat_id,user_id).await {
+                        Ok(member)=>field_str(&member,"status")=="restricted" &&
+                            field_int(&member,"until_date")==Some(case.due_at),
+                        Err(_)=>false,
+                    };
+                    if restore {let _=tg::unmute(env,chat_id,user_id).await;}
+                }
+            }
+            let count=store::recent_strikes(env,chat_id,user_id).await?;
+            let bar=crate::formatting::progress_bar(count as f64,3.0,3);
+            let detail=if desired.is_some() {
+                if pending_canceled {
+                    "结果：警告次数已更新；已取消尚未执行的自动封禁。"
+                } else {
+                    "结果：警告次数已更新；未触发新的处罚。"
+                }
+            } else {"结果：仅查询，未修改警告次数。"};
+            let response=format!("群组：{chat_id}\n用户：{user_id}\n近 7 天警告：{count}/3  {bar}\n{detail}\n说明：手动设置 7 天后到期；新违规会继续累计。");
+            reply_msg(env,msg,if desired.is_some() {NoticeTone::Success} else {NoticeTone::Info},
+                "用户警告次数",&response).await?;
+        }
         "/scan_all" => {
             let max=store::start_scan(env,chat_id,enforce).await?;
             let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{}",if enforce {"执行模式"} else {"仅审计"});
@@ -526,14 +570,29 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                 "状态：已停止历史扫描。").await?;
         }
         "/scan" | "/scan_id" => {
-            let reply = if private {None} else {msg.get("reply_to_message").cloned()};
-            let target=match reply {
-                Some(item) if tg::ids(&item).is_some()=>Some(item),
-                _=> match args.iter().find_map(|s|s.parse::<i64>().ok()) {
-                    Some(id)=>store::archived(env,chat_id,id).await?,
-                    None=>None,
-                }
+            // A single administrator-requested scan now enforces by default.
+            // Explicit "audit" is the safe non-punitive inspection mode;
+            // "enforce" remains accepted for backward compatibility.
+            let (audit_only,target_args)=match args.last().copied() {
+                Some("audit")=>(true,&args[..args.len()-1]),
+                Some("enforce")=>(false,&args[..args.len()-1]),
+                _=>(false,args.as_slice()),
             };
+            let message_id=match target_args {
+                []=>None,
+                [raw]=>raw.parse::<i64>().ok().filter(|id|*id>0),
+                _=>None,
+            };
+            if !target_args.is_empty() && message_id.is_none() {
+                reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                    "用法：回复消息 /scan [audit]，或 /scan MESSAGE_ID [audit]。\n默认按规则执行处罚，使用 audit 仅审计。私聊请先指定 GROUP_ID。").await?;
+                return Ok(true);
+            }
+            let target=if let Some(id)=message_id {
+                store::archived(env,chat_id,id).await?
+            } else if !private {
+                msg.get("reply_to_message").cloned()
+            } else {None};
             let Some(target)=target else {
                 reply_msg(env,msg,NoticeTone::Warning,"未找到消息",
                     "请回复原消息用 /scan，或指定已归档消息 ID。").await?;
@@ -541,14 +600,18 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             };
             if !tg::is_eligible(&target,chat_id) || !tg::message_has_payload(&target) {
                 reply_msg(env,msg,NoticeTone::Warning,"无法审核",
-                    "目标消息不适用审核。").await?;
+                    "目标消息不适用审核，或不属于已验证的目标群组。").await?;
                 return Ok(true);
             }
             let target_id=field_int(&target,"message_id").ok_or_else(||fail("Missing scan message ID"))?;
+            let dry_run=if audit_only {false} else {store::group_dry_run(env,chat_id).await?};
+            let mode_label=if audit_only {"仅审计，不处罚"}
+                else if dry_run {"模拟审核：本群 dry-run 已开启，暂不处罚"}
+                else {"执行模式：依照群规与处罚限制"};
             reply_msg(env,msg,NoticeTone::Info,"单条消息扫描",
-                &format!("正在审查消息 {target_id}，完成后将在此回复结果。\n模式：{}",if enforce {"执行模式"} else {"仅审计"})).await?;
+                &format!("正在审查消息 {target_id}，完成后将在此回复结果。\n模式：{mode_label}")).await?;
             store::archive(env,&target).await?;
-            let mode=if enforce {Mode::HistoricalEnforce} else {Mode::Audit};
+            let mode=if audit_only {Mode::Audit} else {Mode::HistoricalEnforce};
             review(env,&target,mode).await?;
             let rows=store::last_review_logs(env,chat_id,&[target_id]).await?;
             let reply=rows.first().map(crate::formatting::scan_result)

@@ -1,0 +1,107 @@
+"""Exact SQLite query and permission-scope contract for administrator warning adjustments."""
+from pathlib import Path
+import re
+import sqlite3
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA = (ROOT / "schema/current.sql").read_text()
+ENSURE = (ROOT / "schema/ensure_warning_adjustments.sql").read_text()
+
+
+def store_query(name):
+    source = (ROOT / "src/store.rs").read_text()
+    body = source.split(f"pub async fn {name}(", 1)[1]
+    literal = re.search(r'prepare\(\s*"((?:[^"\\]|\\.)*)"', body, re.S)[1]
+    return re.sub(r'\\\n\s*', '', literal)
+
+
+class WarningAdjustmentSQLTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.executescript(SCHEMA)
+        self.upsert = store_query("set_warning_count")
+        self.count = store_query("recent_strikes")
+
+    def tearDown(self):
+        self.db.close()
+
+    def violation(self, chat, user, message, when):
+        self.db.execute(
+            "INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) "
+            "VALUES(?,?,?,?,'spam',0.98,'warned')", (chat, user, message, when)
+        )
+
+    def get_count(self, chat, user, cutoff):
+        return self.db.execute(self.count, (chat, user, cutoff)).fetchone()[0]
+
+    def set_count(self, chat, user, count, when, actor=11):
+        self.db.execute(self.upsert, (chat, user, count, when, actor))
+
+    def test_existing_strikes_survive_reset_and_later_strike_counts_even_in_same_second(self):
+        timestamp = 1_700_000_000
+        self.violation(-100, 22, 401, timestamp - 100)
+        self.violation(-100, 22, 402, timestamp - 10)
+        self.assertEqual(self.get_count(-100, 22, timestamp - 7 * 86400), 2)
+        self.set_count(-100, 22, 0, timestamp)
+        self.assertEqual(self.get_count(-100, 22, timestamp - 7 * 86400), 0)
+        self.violation(-100, 22, 403, timestamp)
+        self.assertEqual(self.get_count(-100, 22, timestamp - 7 * 86400), 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM violations").fetchone()[0], 3)
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM violations WHERE chat_id=-100 AND message_id=401"
+        ).fetchone()[0], 1, "duplicate-punishment guard is unchanged")
+
+    def test_exact_group_and_user_isolation(self):
+        now = 1_700_000_000
+        for chat, user, message in [(-100, 22, 1), (-200, 22, 2), (-100, 33, 3)]:
+            self.violation(chat, user, message, now)
+        self.set_count(-100, 22, 3, now, 11)
+        self.assertEqual(self.get_count(-100, 22, now - 100), 3)
+        self.assertEqual(self.get_count(-200, 22, now - 100), 1)
+        self.assertEqual(self.get_count(-100, 33, now - 100), 1)
+        self.set_count(-200, 22, 0, now, 21)
+        self.assertEqual(self.get_count(-100, 22, now - 100), 3)
+        self.assertEqual(self.get_count(-200, 22, now - 100), 0)
+        self.assertEqual(self.db.execute(
+            "SELECT actor_id FROM warning_adjustments WHERE chat_id=-100 AND user_id=22"
+        ).fetchone(), (11,))
+
+    def test_adjustments_expire_and_new_real_violations_keep_rolling(self):
+        now = 1_700_000_000
+        self.violation(-100, 22, 1, now - 60)
+        self.set_count(-100, 22, 2, now)
+        self.violation(-100, 22, 2, now + 600)
+        self.assertEqual(self.get_count(-100, 22, now - 7 * 86400), 3)
+        self.assertEqual(self.get_count(-100, 22, now + 1), 1,
+                         "expired baseline must not mask newer genuine strikes")
+        self.set_count(-100, 22, 1, now + 601)
+        self.assertEqual(self.get_count(-100, 22, now + 1), 1)
+        self.violation(-100, 22, 3, now + 601)
+        self.assertEqual(self.get_count(-100, 22, now + 1), 2)
+
+    def test_schema_constraints_and_idempotent_existing_database_setup(self):
+        for chat, user, count, actor in [(1, 22, 2, 11), (-100, -22, 2, 11),
+                                         (-100, 22, 4, 11), (-100, 22, -1, 11),
+                                         (-100, 22, 2, -1)]:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.set_count(chat, user, count, 100, actor)
+        self.db.executescript(ENSURE)
+        self.db.executescript(ENSURE)
+        old = sqlite3.connect(":memory:")
+        try:
+            old.executescript(
+                "CREATE TABLE violations(chat_id INTEGER,user_id INTEGER,message_id INTEGER,"
+                "created_at INTEGER,category TEXT,probability REAL,action TEXT);"
+            )
+            old.executescript(ENSURE)
+            old.executescript(ENSURE)
+            self.assertIn("warning_adjustments", {
+                row[0] for row in old.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            })
+        finally:
+            old.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

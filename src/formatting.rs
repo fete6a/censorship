@@ -153,7 +153,12 @@ pub fn scan_result(row: &ReviewLine) -> String {
     let category=if matches!(row.category.as_str(),"none"|"other"|"adult") {
         String::new()
     } else {format!(" · {}",category_name(&row.category))};
-    format!("{header}{category}\n📊 违规概率：{} {:.1}%",
+    let suffix=match row.status.as_str() {
+        "audit_flag"=>"\n说明：仅审计，未执行处罚。",
+        "dry_run_flag"=>"\n说明：群组 dry-run 已开启，未执行处罚；管理员可使用 /dry_run off 开启处罚。",
+        _=>"",
+    };
+    format!("{header}{category}\n📊 违规概率：{} {:.1}%{suffix}",
         progress_bar(row.probability,1.0,10),100.0*row.probability.clamp(0.0,1.0))
 }
 

@@ -134,12 +134,41 @@ pub async fn set_strike_action(env: &Env, chat_id: i64, message_id: i64, action:
     Ok(())
 }
 
+/// Seven-day effective warning count, including an administrator's most
+/// recent explicit adjustment. The baseline is valid for seven days and
+/// later violations use their SQLite rowid (rather than second-resolution
+/// timestamps), so a strike in the same second is never counted twice.
 pub async fn recent_strikes(env: &Env, chat_id: i64, user_id: i64) -> Result<i64> {
+    if chat_id>=0 || user_id<=0 {return Err(fail("Invalid warning count scope"));}
     let cutoff = now() - (7 * 86400);
     let row = env.d1("DB")?.prepare(
-        "SELECT COUNT(*) AS count FROM violations WHERE chat_id=? AND user_id=? AND created_at>=?"
+        "SELECT COALESCE((SELECT base_count FROM warning_adjustments \
+          WHERE chat_id=?1 AND user_id=?2 AND adjusted_at>=?3),0) + \
+         (SELECT COUNT(*) FROM violations WHERE chat_id=?1 AND user_id=?2 AND created_at>=?3 \
+          AND rowid>COALESCE((SELECT violation_rowid FROM warning_adjustments \
+          WHERE chat_id=?1 AND user_id=?2 AND adjusted_at>=?3),0)) AS count"
     ).bind(&[js_i64(chat_id), js_i64(user_id), js_i64(cutoff)])?.first::<CountRow>(None).await?;
     Ok(row.map(|x| x.count).unwrap_or(0))
+}
+
+/// Set the effective count without touching historical violations, which are
+/// still needed to prevent duplicate strikes and audit prior enforcement.
+/// One upsert atomically snapshots the latest existing violation rowid.
+pub async fn set_warning_count(
+    env: &Env, chat_id: i64, user_id: i64, count: i64, actor_id: i64
+) -> Result<()> {
+    if chat_id>=0 || user_id<=0 || actor_id<=0 || !(0..=3).contains(&count) {
+        return Err(fail("Invalid warning adjustment scope, user or count"));
+    }
+    env.d1("DB")?.prepare(
+        "INSERT INTO warning_adjustments(chat_id,user_id,base_count,adjusted_at,violation_rowid,actor_id) \
+         SELECT ?1,?2,?3,?4,COALESCE(MAX(rowid),0),?5 \
+         FROM violations WHERE chat_id=?1 AND user_id=?2 \
+         ON CONFLICT(chat_id,user_id) DO UPDATE SET \
+           base_count=excluded.base_count,adjusted_at=excluded.adjusted_at, \
+           violation_rowid=excluded.violation_rowid,actor_id=excluded.actor_id"
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(count),js_i64(now()),js_i64(actor_id)])?.run().await?;
+    Ok(())
 }
 
 pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<i64> {
@@ -212,6 +241,9 @@ pub async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[js_i64(now()-14*86400)])?.run().await?;
     env.d1("DB")?.prepare("DELETE FROM violations WHERE created_at<?")
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
+    // Expired manual baselines must not linger indefinitely.
+    env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
+        .bind(&[js_i64(now()-7*86400)])?.run().await?;
     let keep_days = crate::util::config(env,"ARCHIVE_DAYS").parse::<i64>().unwrap_or(0);
     if keep_days > 0 {
         env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")
