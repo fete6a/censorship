@@ -321,6 +321,13 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     result
 }
 
+async fn reply_rules(env: &Env, msg: &Value, chat_id: i64) -> Result<()> {
+    let rules=tg::group_rules(env,chat_id).await?;
+    let reply=if rules.is_empty(){"群简介为空；尚未设置群规，自动处罚关闭。".into()}
+        else{format!("本群规则（来自群简介）：\n{rules}")};
+    tg::reply_command(env,msg,&reply).await
+}
+
 async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&str>) -> Result<bool> {
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
     let private = field_str(&msg["chat"], "type") == "private";
@@ -331,12 +338,22 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
             "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
             "Use a negative GROUP_ID, for example -1001234567890. ",
-            "You must be an administrator of that specific group. ",
+            "Management commands require administrator rights in that specific group. Group /rules is available to all members. ",
             "Inside a group, omit GROUP_ID; commands apply only to that group. ",
             "All commands reply in the chat where they were issued, even with logs off."
         )).await?;
         // Group help text remains subject to moderation, including extra arguments.
         return Ok(private);
+    }
+    // The description is already visible to group members. Reading it does not
+    // require administrator identity or an active moderation enrollment.
+    if cmd=="/rules" && !private {
+        if !words.is_empty() {
+            tg::reply_command(env,msg,"群内用法：/rules（查询当前群规则，无需参数）。").await?;
+            return Ok(false); // Extra text must still undergo ordinary moderation.
+        }
+        reply_rules(env,msg,origin_chat_id).await?;
+        return Ok(true);
     }
     if !matches!(cmd, "/threshold" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
         tg::reply_command(env,msg,"未知命令，请使用 /help 查看支持的命令。").await?;
@@ -349,7 +366,9 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
     };
     let (chat_id,args): (i64, Vec<&str>) = if private {
         let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
-            tg::reply_command(env,msg,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
+            let usage=if cmd=="/rules" {"私聊用法：/rules 群组ID，例如 /rules -1001234567890。"}
+                else {"请指定群组 ID。例如：/cancel -1001234567890 12345678"};
+            tg::reply_command(env,msg,usage).await?;
             return Ok(true);
         };
         (group_id, words[1..].to_vec())
@@ -360,6 +379,14 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
     if !tg::user_is_admin_for_command(env,chat_id,actor).await? {
         tg::reply_command(env,msg,"无法验证你是目标群管理员，或机器人无法访问该群。").await?;
         return Ok(private);
+    }
+    if cmd=="/rules" {
+        if !args.is_empty() {
+            tg::reply_command(env,msg,"私聊用法：/rules 群组ID，不接受额外参数。").await?;
+        } else {
+            reply_rules(env,msg,chat_id).await?;
+        }
+        return Ok(true);
     }
     if !store::can_review(env,chat_id).await? {
         tg::reply_command(env,msg,"该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
@@ -425,12 +452,6 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                 Some(p)=>format!("用户 {target}: pending message={}, remaining {} sec",p.message_id,(p.due_at-now()).max(0)),
                 None=>format!("用户 {target}: no pending ban"),
             };
-            tg::reply_command(env,msg,&reply).await?;
-        }
-        "/rules" => {
-            let rules=tg::group_rules(env,chat_id).await?;
-            let reply=if rules.is_empty(){"群简介为空；自动处罚关闭。".into()}
-                else{format!("本群处罚规则：\n{rules}")};
             tg::reply_command(env,msg,&reply).await?;
         }
         "/scan_all" => {
@@ -565,6 +586,12 @@ async fn process_update_with_policy_cache(
     }
     if tg::ids(msg).is_none() {return Ok(None);}
     if !tg::is_eligible_group_message(msg) {
+        store::mark_update_done(env,update_id).await?;
+        return Ok(None);
+    }
+    // /rules must also work before the bot has moderation permissions.
+    if command_parts(env,msg).is_some_and(|(cmd,words)|cmd=="/rules" && words.is_empty()) {
+        handle_admin_command(env,msg).await?;
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }

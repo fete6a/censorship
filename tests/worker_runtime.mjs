@@ -854,3 +854,46 @@ await test('warning text does not promise a ban when automatic banning is disabl
  assert.match(text,/自动封禁未启用/);assert.ok(text.includes('`2/3`'));
  assert.ok(!text.includes('复核期结束后封禁'));
 });
+
+await test('any group member can read rules in the same topic with logging and moderation disabled',async()=>{
+ for(const anonymous of [false,true]) {
+  const f=fixture({managedStatus:'disabled',rules:'No *spam* [links] (please)!'});
+  f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  const update=message(groupA,2000);update.message.text='/rules';update.message.message_thread_id=101;
+  if(anonymous)update.message.sender_chat={id:groupA};
+  await f.consume(update);
+  const sends=f.telegram.filter(c=>c.method==='sendMessage');assert.equal(sends.length,1);
+  assert.equal(sends[0].args.chat_id,groupA);assert.equal(sends[0].args.message_thread_id,101);
+  assert.ok(sends[0].args.text.includes('No \\*spam\\* \\[links\\] \\(please\\)\\!'));
+  assert.equal(f.telegram.some(c=>['getChatMember','getMe'].includes(c.method)),false);
+  assert.equal(f.aiCalls.length,0);assert.equal(f.archives.size,0);
+  assert.equal(f.statements.some(s=>s.sql.includes('managed_chats')),false);
+ }
+});
+
+await test('rules mentions reply once, empty descriptions are explicit, and repeated updates are deduplicated',async()=>{
+ const f=fixture({rules:''});const update=message(groupA,2001);update.message.text='/rules@EXAMPLE_BOT';
+ await f.consume(update);await f.consume(update);
+ const sends=f.telegram.filter(c=>c.method==='sendMessage');assert.equal(sends.length,1);
+ assert.match(sends[0].args.text,/尚未设置群规/);
+ assert.equal(f.telegram.some(c=>c.method==='getChatMember'),false);
+});
+
+await test('group rules cannot retarget another group or hide extra text from moderation',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ const update=message(groupA,2002);update.message.text=`/rules ${groupB} extra text`;
+ await f.consume(update);
+ assert.match(f.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/无需参数/);
+ assert.ok(f.telegram.every(c=>c.args.chat_id!==groupB));assert.equal(f.aiCalls.length,1);
+});
+
+await test('private rules keep exact-group authorization and provide rules-specific usage',async()=>{
+ const missing=fixture();await missing.consume(command('/rules'));
+ assert.match(missing.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/私聊用法.*\/rules/);
+ const denied=fixture();await denied.consume(command(`/rules ${groupB}`));
+ assert.equal(denied.telegram.some(c=>c.method==='getChat'),false);
+ assert.match(denied.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/管理员/);
+ const allowed=fixture({managedStatus:'disabled'});await allowed.consume(command(`/rules ${groupA}`));
+ assert.match(allowed.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/Do not post advertisements/);
+ assert.equal(allowed.statements.some(s=>s.sql.includes('managed_chats')),false);
+});
