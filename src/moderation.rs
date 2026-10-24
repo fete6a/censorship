@@ -479,36 +479,48 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"群组设置",&reply).await?;
         }
         "/cancel" => {
-            let target = args.first().and_then(|s|s.parse::<i64>().ok()).or_else(||
+            let target = args.first().and_then(|s|s.parse::<i64>().ok()).filter(|id|*id>0).or_else(||
                 if private {None} else {msg.get("reply_to_message").and_then(tg::author)});
             let Some(target)=target else {
                 reply_msg(env,msg,NoticeTone::Warning,"参数错误",
                     "用法：/cancel USER_ID（私聊：/cancel GROUP_ID USER_ID）。").await?;
                 return Ok(true);
             };
+            // Cancellation is an atomic D1 pending -> canceled transition.
+            // Never call getChatMember/unmute afterwards: Telegram cannot perform
+            // an atomic conditional permission restore, so a human restriction
+            // could be overwritten between observing it and changing it.
             let canceled=store::cancel_pending(env,chat_id,target,actor,"admin_command").await?;
-            let (tone,reply)=if let Some(case)=canceled {
-                let restore = match tg::get_member(env,chat_id,target).await {
-                    Ok(member) => field_str(&member,"status") == "restricted" &&
-                        field_int(&member,"until_date") == Some(case.due_at),
-                    Err(_)=>false,
-                };
-                if restore {let _=tg::unmute(env,chat_id,target).await;}
-                (NoticeTone::Success,format!("用户：{target}\n结果：已取消自动封禁。\n提醒：如仍被禁言，请管理员手动解除。"))
+            let (tone,reply)=if canceled.is_some() {
+                (NoticeTone::Success,format!(
+                    "用户：{target}\n结果：已取消数据库中尚未开始执行的自动封禁任务。\n禁言：不自动解禁；如无其他管理员限制，机器人原有的 60 秒禁言会在 Telegram 到期后解除。"))
             } else {
-                (NoticeTone::Info,format!("用户：{target}\n结果：无有效待封禁任务。"))
+                match store::ban_case_status(env,chat_id,target).await?.as_deref() {
+                    Some("processing") => (NoticeTone::Warning,format!(
+                        "用户：{target}\n结果：任务已进入封禁处理阶段，本次未取消。Telegram 封禁可能已发出，无法原子撤销；请人工核查成员状态。若失败后回到待执行状态，可再次取消。")),
+                    Some("banned") => (NoticeTone::Warning,format!(
+                        "用户：{target}\n结果：封禁已执行，/cancel 无法解除，请管理员人工核查处理。")),
+                    Some("pending") => (NoticeTone::Warning,format!(
+                        "用户：{target}\n结果：仍存在待执行任务，状态可能刚刚变化；请重试取消。")),
+                    _ => (NoticeTone::Info,format!(
+                        "用户：{target}\n结果：无可取消的待执行封禁任务。")),
+                }
             };
             reply_msg(env,msg,tone,"封禁复核取消",&reply).await?;
         }
         "/pending" => {
-            let Some(target)=args.first().and_then(|s|s.parse::<i64>().ok()) else {
+            let Some(target)=args.first().and_then(|s|s.parse::<i64>().ok()).filter(|id|*id>0) else {
                 reply_msg(env,msg,NoticeTone::Warning,"参数错误",
                     "用法：/pending USER_ID（私聊：/pending GROUP_ID USER_ID）。").await?;
                 return Ok(true);
             };
             let reply=match store::current_pending(env,chat_id,target).await? {
                 Some(p)=>format!("用户：{target}\n消息：#{}\n状态：待封禁\n剩余复核时间：{} 秒\n取消命令：/cancel {target}",p.message_id,(p.due_at-now()).max(0)),
-                None=>format!("用户：{target}\n状态：无待封禁任务。"),
+                None=>match store::ban_case_status(env,chat_id,target).await?.as_deref() {
+                    Some("processing")=>format!("用户：{target}\n状态：封禁处理中；无法保证 /cancel 仍能阻止 Telegram 操作。"),
+                    Some("banned")=>format!("用户：{target}\n状态：已封禁。"),
+                    _=>format!("用户：{target}\n状态：无待封禁任务。"),
+                }
             };
             reply_msg(env,msg,NoticeTone::Info,"封禁复核状态",&reply).await?;
         }
@@ -542,12 +554,23 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             let bar=crate::formatting::progress_bar(count as f64,3.0,3);
             let detail=if desired.is_some() {
                 if adjustment_applied {
-                    "结果：警告次数已更新；已取消尚未执行的待封禁任务。原临时禁言最多持续到到期时间。"
+                    "结果：警告次数已更新；仅取消写入时仍处于待执行状态的自动封禁（如有）。不会自动解除 Telegram 禁言。"
                 } else {
                     "结果：重复更新已忽略；不会覆盖之后产生的新违规。"
                 }
             } else {"结果：仅查询，未修改警告次数。"};
-            let response=format!("群组：{chat_id}\n用户：{user_id}\n近 7 天警告：{count}/3  {bar}\n{detail}\n说明：手动设置 7 天后到期；新违规会继续累计。");
+            // Reading this status is advisory. The atomic warning receipt
+            // cancels pending tasks, but cannot recall an already claimed ban.
+            let ban_note=if desired.is_some() {
+                match store::ban_case_status(env,chat_id,user_id).await?.as_deref() {
+                    Some("processing")=>"\n封禁状态：查询时已经在处理中；可能已调用 Telegram，无法承诺取消处罚，请人工核查。",
+                    Some("banned")=>"\n封禁状态：查询时已经封禁；调整警告不会自动解封。",
+                    Some("pending")=>"\n封禁状态：查询时仍有待执行任务（可能由后续违规创建），请再次核查。",
+                    Some("canceled")=>"\n封禁状态：查询时任务已取消；人工禁言不会被覆盖。",
+                    _=>"\n封禁状态：查询时无待执行任务；外部 Telegram 操作仍不能原子撤销。",
+                }
+            } else {""};
+            let response=format!("群组：{chat_id}\n用户：{user_id}\n近 7 天警告：{count}/3  {bar}\n{detail}{ban_note}\n说明：手动设置 7 天后到期；新违规会继续累计。");
             reply_msg(env,msg,if desired.is_some() {NoticeTone::Success} else {NoticeTone::Info},
                 "用户警告次数",&response).await?;
         }
