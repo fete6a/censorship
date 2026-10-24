@@ -239,8 +239,9 @@ await test('start command returns command usage privately', async () => {
   await f.consume(command('/start'));
   const response = f.telegram.find(c => c.method === 'sendMessage');
   assert.equal(response?.args.chat_id, 11);
-  assert.match(response?.args.text || '', /\/scan_status/);
-  assert.match(response?.args.text || '', /GROUP_ID/);
+  assert.match(response?.args.text || '', /\/scan\\_status/);
+  assert.match(response?.args.text || '', /GROUP\\_ID/);
+  assert.equal(response?.args.parse_mode,'MarkdownV2');
 });
 
 function message(group, id = 456) {
@@ -289,6 +290,63 @@ await test('administrator of A cannot change dry-run or logs for B', async () =>
  for (const cmd of ['dry-run', 'logs']) { const f = fixture();
  await f.consume(command(`/${cmd} ${groupB} off`)); assert.equal(f.settings.size, 0); }
 });
+await test('20 event window groups private reviews by chat without leaking to other admins',async()=>{
+ const f=fixture();
+ const inputs=[
+  ...Array.from({length:14},(_,i)=>message(groupA,800+i)),
+  ...Array.from({length:4},(_,i)=>message(groupB,900+i))
+ ];
+ const results=await f.consumeBatch(inputs);
+ assert.ok(results.every(x=>x.acked&&!x.retried));
+ assert.equal(f.aiCalls.length,inputs.length,'independent model inference per message');
+ assert.equal(f.telegram.filter(x=>x.method==='getChatAdministrators').length,2,
+  'one administrator lookup per group in each Queue batch');
+ const messages=f.telegram.filter(x=>x.method==='sendMessage');
+ assert.deepEqual(messages.map(x=>x.args.chat_id).sort((a,b)=>a-b),[11,21]);
+ const a=messages.find(x=>x.args.chat_id===11)?.args.text;
+ const b=messages.find(x=>x.args.chat_id===21)?.args.text;
+ assert.match(a,/审核摘要/);assert.match(a,/14 条/);
+ assert.match(a,/t\\.me\/c\/100\/800/);
+ assert.doesNotMatch(a,/t\\.me\/c\/200\/900/);
+ assert.match(b,/4 条/);assert.match(b,/t\\.me\/c\/200\/900/);
+ assert.doesNotMatch(b,/t\\.me\/c\/100\/800/);
+ assert.ok(messages.every(x=>x.args.parse_mode==='MarkdownV2'));
+ assert.ok(messages.every(x=>x.args.link_preview_options?.is_disabled===true));
+});
+
+await test('a malformed update in the same batch retries independently of successful reviews',async()=>{
+ const f=fixture();
+ const result=await f.consumeBatch([message(groupA,880),{},message(groupB,881)]);
+ assert.deepEqual(result.map(x=>[x.acked,x.retried]),[[true,false],[false,true],[true,false]]);
+ assert.equal(f.aiCalls.length,2);
+ assert.deepEqual(f.telegram.filter(x=>x.method==='sendMessage').map(x=>x.args.chat_id).sort(),[11,21]);
+});
+
+await test('edits of the same message inside one window are deduplicated in the digest',async()=>{
+ const f=fixture({remove:true,scores:[0.75,0.916],categoryChoice:'harassment'});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.8});
+ const original=message(groupA,870);
+ const edited={update_id:871,edited_message:{...original.message,text:'edited'}};
+ const outcomes=await f.consumeBatch([original,edited]);
+ assert.ok(outcomes.every(o=>o.acked));
+ const summary=f.telegram.filter(x=>x.method==='sendMessage'&&x.args.chat_id===11&&
+    x.args.text.includes('审核摘要'));
+ assert.equal(summary.length,1);
+ assert.match(summary[0].args.text,/1 条/);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+});
+
+await test('MarkdownV2 action notice uses numeric Telegram links without exposing deleted message link',async()=>{
+ const f=fixture({remove:true,score:0.99,strikeCount:1});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,889));
+ const notice=f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA)?.args;
+ assert.equal(notice?.parse_mode,'MarkdownV2');
+ assert.match(notice.text,/tg:\\/\\/user\\?id=22/);
+ assert.match(notice.text,/已删除/);
+ assert.doesNotMatch(notice.text,/t\\.me\\/c\\/100\\/889/,'deleted content is not linked');
+});
+
 await test('review logs default on and go only to the reviewed group human administrators', async () => {
  const f = fixture(); await f.consume(message(groupA));
  const sends = f.telegram.filter(c => c.method === 'sendMessage');
