@@ -167,11 +167,6 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
         Ok(d) => d,
         Err(error) => {
             store::finish_review(env, chat_id, msg_id, "review_error", "none", 0.0).await?;
-            if mode == Mode::Live && !config(env, "ADMIN_DM_CHAT_ID").is_empty() {
-                let _ = tg::send_to_review_or_chat(env, chat_id, &format!(
-                    "消息 {msg_id} 无法自动审核（可能是媒体过大/格式不支持/模型暂不可用），未执行处罚；需人工复核。"
-                )).await;
-            }
             console_error!("review_unavailable chat={} message={} error={}", chat_id, msg_id, error);
             // Never retry unsupported files indefinitely. Queue retries on other errors.
             return Ok(false);
@@ -180,21 +175,13 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
 
     let clear = decision.clear_violation();
     let category = category_name(&decision.category);
-    let detail = format!(
-        "消息 {msg_id} 审核：{} / {} / {}，删除概率 {:.3}，判定置信度 {:.3}",
-        decision.action, category, decision.severity,
-        decision.remove_probability, decision.action_confidence,
-    );
     if !clear {
         let kind = if decision.action == "review" { "needs_review" } else { "allow" };
         store::finish_review(env, chat_id, msg_id, kind, &decision.category, decision.remove_probability).await?;
-        if decision.action == "review" && !config(env, "ADMIN_DM_CHAT_ID").is_empty() {
-            let _ = tg::send_to_review_or_chat(env, chat_id, &detail).await;
-        }
         return Ok(false);
     }
 
-    let safe_mode = flag(env, "DRY_RUN", true);
+    let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
         store::finish_review(env, chat_id, msg_id,
             if safe_mode { "dry_run_flag" } else { "audit_flag" },
@@ -298,7 +285,7 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
             return None;
         }
     }
-    if !matches!(cmd, "/start" | "/help" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
+    if !matches!(cmd, "/start" | "/help" | "/dry-run" | "/dry_run" | "/logs" | "/scan" | "/scan_id" | "/scan_all" | "/scan_status" | "/scan_stop" | "/rules" | "/cancel" | "/pending") {
         return None;
     }
     Some((cmd, words.collect()))
@@ -314,7 +301,7 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     if matches!(cmd, "/start" | "/help") {
         tg::send(env,origin_chat_id,concat!(
             "Commands for group administrators (private chat):\n",
-            "/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
+            "/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
             "/scan_all GROUP_ID [enforce]\n/scan_status GROUP_ID\n/scan_stop GROUP_ID\n",
             "/pending GROUP_ID USER_ID\n/cancel GROUP_ID USER_ID\n\n",
             "Use a negative GROUP_ID, for example -1001234567890. ",
@@ -337,6 +324,19 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     if !store::can_review(env,chat_id).await? {return Ok(true);}
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
+        "/dry-run" | "/dry_run" | "/logs" => {
+            let dry_run=cmd!="/logs";
+            if !args.is_empty() {
+                let enabled=match args.as_slice() {
+                    ["on"]=>true,["off"]=>false,
+                    _=>{tg::send(env,origin_chat_id,"Use on or off; in private chats specify GROUP_ID first.").await?;return Ok(true);}
+                };
+                store::set_group_option(env,chat_id,dry_run,enabled).await?;
+            }
+            let enabled=if dry_run {store::group_dry_run(env,chat_id).await?} else {store::group_logs(env,chat_id).await?};
+            let label=if dry_run {"dry-run"} else {"logs"};
+            tg::send(env,origin_chat_id,&format!("Group {chat_id}: {label} {}",if enabled {"on"} else {"off"})).await?;
+        }
         "/cancel" => {
             let target = args.first().and_then(|s|s.parse::<i64>().ok()).or_else(||
                 if private {None} else {msg.get("reply_to_message").and_then(tg::author)});
@@ -526,7 +526,7 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
         store::cancel_pending_automatically(env,chat_id,user_id,message_id,"timer_too_late").await?;
         return Ok(());
     }
-    if !store::can_auto_ban(env,chat_id).await? || !flag(env,"ENABLE_BAN",true) || flag(env,"DRY_RUN",true) {
+    if !store::can_auto_ban(env,chat_id).await? || !flag(env,"ENABLE_BAN",true) || store::group_dry_run(env,chat_id).await? {
         store::cancel_pending_automatically(env,chat_id,user_id,message_id,"banning_disabled").await?;
         return Ok(());
     }

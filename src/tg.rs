@@ -50,13 +50,23 @@ pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Optional audit alerts ONLY to an explicitly configured private user chat.
-/// No fallback to the moderated group, even if a configuration is invalid.
-pub async fn send_to_review_or_chat(env: &Env, _chat_id: i64, text: &str) -> Result<()> {
-    let target = crate::util::config(env, "ADMIN_DM_CHAT_ID").parse::<i64>().unwrap_or(0);
-    if target <= 0 { return Ok(()); }
-    // Notifications are optional; Telegram forbids cold-start DMs to users.
-    let _ = send(env, target, text).await;
+/// Deliver only to current human administrators of this exact group. No global recipient.
+pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
+    if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
+    let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
+        Ok(value)=>value,
+        Err(_)=>{worker::console_error!("group_admin_logs_unavailable");return Ok(());}
+    };
+    if let Some(admins)=admins.as_array() {
+        for member in admins {
+            if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
+            if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
+                if send(env,user_id,&format!("Group {chat_id}\n{text}")).await.is_err() {
+                    worker::console_error!("group_admin_log_dm_failed");
+                }
+            }
+        }
+    }
     Ok(())
 }
 

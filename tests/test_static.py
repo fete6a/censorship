@@ -71,7 +71,6 @@ class SmokeTests(unittest.TestCase):
         self.assertIn('member_capabilities(&event["new_chat_member"]',src)
         self.assertIn('if chat_id <= 0 { return Ok(()); }',tg)
         self.assertNotIn('GROUP_CHAT_ID',util)
-        self.assertIn('ADMIN_DM_CHAT_ID',tg)
         conf=json.loads((ROOT/'wrangler.jsonc').read_text())
         self.assertNotIn('GROUP_CHAT_ID',conf['vars'])
         self.db.executescript((ROOT/'migrations/0002_pending_bans.sql').read_text())
@@ -92,7 +91,6 @@ class SmokeTests(unittest.TestCase):
         source=(ROOT / 'src/moderation.rs').read_text()
         self.assertIn('"no_group_description"',source)
         self.assertIn('"review_error"',source)
-        self.assertIn('mode == Mode::Live && !config(env, "ADMIN_DM_CHAT_ID").is_empty()',source)
         self.assertIn('"too_old_to_delete"',source)
         self.assertIn('store::has_strike(env, chat_id, msg_id).await?',source)
 

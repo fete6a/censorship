@@ -14,7 +14,7 @@
 
 - 全部 `sendMessage` 目标都必须是正数 Telegram 私聊 ID；程序对负数群组 ID 直接跳过通知。没有群内发言权限也能审核和删除。
 - 删除、警告、封禁的审计记录放到 Cloudflare D1 `violations`、`archived_messages` 和 `pending_bans`；不会给群成员发送公开警告信息。
-- 设置可选变量 `ADMIN_DM_CHAT_ID`（正数且管理员已私聊 `/start`）才会收到异常/处罚提醒；留空则不发送任何自动通知。
+- 管理员日志默认开启，仅私聊该群当前管理员；管理员须先私聊 `/start`。使用 `/logs off` 可按群关闭。
 - 管理员命令可以在群内发出（不会收到群内回复），**建议在机器人私聊执行命令**，例如：`/cancel -1001234567890 12345678`。机器人每次验证发送者是否为目标群管理员。
 
 ## 审核及处罚
@@ -89,5 +89,10 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 - 消息文字、caption 和 Telegram 媒体 `file_id` 将保存在 D1；媒体字节在审核时临时下载给 Workers AI，并不长期保存。`ARCHIVE_DAYS=0` 表示不自动清理归档，请根据隐私需求修改。
 - Bot Token 是管理员凭据，**必须通过 BotFather 轮换用户曾在聊天中贴出的密钥**，不可上传到 GitHub。Webhook secret 另用随机字符串。
-- `ADMIN_DM_CHAT_ID` 只能填写私聊 ID，机器人不能主动给从未发起过聊天的用户发送 DM。
 - 本项目没有内置 Telegram UI，它通过 Telegram Bot API 和 Cloudflare Rust Workers 运行；请先做真实端到端误判、权限、取消期测试。
+
+## 每群设置和管理员日志
+
+群内 `/dry-run off`（菜单别名 `/dry_run off`）仅为当前群开启实际处罚；`on` 恢复审计并取消该群待执行封禁。私聊使用 `/dry_run GROUP_ID off`。默认沿用安全的 DRY_RUN 设置；不会因一个群的设置影响其他群。
+
+日志默认开启，涵盖审核结果和异常。机器人每次只向该群当前人类管理员私聊发送日志；管理员须先私聊机器人 `/start`。群内 `/logs off` 关闭该群日志，`/logs on` 恢复；私聊使用 `/logs GROUP_ID off`。私聊发送失败不会撤销审核或导致重复处罚。全局 ADMIN_DM_CHAT_ID 不再决定日志接收者。

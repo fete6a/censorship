@@ -68,6 +68,9 @@ pub async fn finish_review(env: &Env, chat_id: i64, message_id: i64, status: &st
         js_i64(chat_id), js_i64(message_id),
     ])?;
     stmt.run().await?;
+    let _ = tg::send_to_review_or_chat(env, chat_id, &format!(
+        "message={message_id} status={status} category={category} probability={probability:.3}"
+    )).await;
     Ok(())
 }
 
@@ -328,4 +331,35 @@ pub async fn can_review(env: &Env, chat_id: i64) -> Result<bool> {
 pub async fn can_auto_ban(env: &Env, chat_id: i64) -> Result<bool> {
     Ok(managed_chat(env,chat_id).await?.is_some_and(|c|
         c.status == "active" && c.chat_type == "supergroup"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GroupSettings {
+    pub dry_run: Option<i64>,
+    pub logs_enabled: i64,
+}
+pub async fn group_settings(env: &Env, chat_id: i64) -> Result<Option<GroupSettings>> {
+    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled FROM group_settings WHERE chat_id=?")
+        .bind(&[js_i64(chat_id)])?.first::<GroupSettings>(None).await
+}
+pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
+    Ok(group_settings(env,chat_id).await?.and_then(|s|s.dry_run)
+        .map(|value|value!=0).unwrap_or_else(||crate::util::flag(env,"DRY_RUN",true)))
+}
+pub async fn group_logs(env: &Env, chat_id: i64) -> Result<bool> {
+    Ok(group_settings(env,chat_id).await?.map(|s|s.logs_enabled!=0).unwrap_or(true))
+}
+pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: bool) -> Result<()> {
+    if chat_id>=0 {return Err(fail("Invalid group ID"));}
+    let sql=if dry_run {
+        "INSERT INTO group_settings(chat_id,dry_run) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run"
+    } else {
+        "INSERT INTO group_settings(chat_id,logs_enabled) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET logs_enabled=excluded.logs_enabled"
+    };
+    env.d1("DB")?.prepare(sql).bind(&[js_i64(chat_id),js_i64(i64::from(enabled))])?.run().await?;
+    if dry_run && enabled {
+        env.d1("DB")?.prepare("UPDATE pending_bans SET status='canceled',cancellation_reason='dry_run_enabled',resolved_at=? WHERE chat_id=? AND status='pending'")
+            .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
+    }
+    Ok(())
 }
