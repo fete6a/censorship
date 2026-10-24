@@ -263,11 +263,26 @@ pub async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
     // Retain replay receipts longer than processed_updates (14 days) so a
     // delayed duplicate cannot shift a manual warning baseline.
-    env.d1("DB")?.prepare("DELETE FROM warning_edit_receipts WHERE created_at<?")
-        .bind(&[js_i64(now()-30*86400)])?.run().await?;
-    // Expired manual baselines must not linger indefinitely.
-    env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
-        .bind(&[js_i64(now()-7*86400)])?.run().await?;
+    // An accidental old-schema rollout may omit either additive table.
+    // Ignore only its exact missing-table failure, never unrelated D1 errors.
+    let receipt_cleanup = env.d1("DB")?.prepare("DELETE FROM warning_edit_receipts WHERE created_at<?")
+        .bind(&[js_i64(now()-30*86400)])?.run().await;
+    if let Err(error) = receipt_cleanup {
+        if error.to_string().contains("no such table: warning_edit_receipts") {
+            worker::console_error!("warning_edit_receipts_missing: migrate D1 before release");
+        } else {
+            return Err(error);
+        }
+    }
+    let warning_cleanup = env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
+        .bind(&[js_i64(now()-7*86400)])?.run().await;
+    if let Err(error) = warning_cleanup {
+        if error.to_string().contains("no such table: warning_adjustments") {
+            worker::console_error!("warning_adjustments_missing: migrate D1 before release");
+        } else {
+            return Err(error);
+        }
+    }
     let keep_days = crate::util::config(env,"ARCHIVE_DAYS").parse::<i64>().unwrap_or(0);
     if keep_days > 0 {
         env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")

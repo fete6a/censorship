@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active' } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
@@ -59,6 +59,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
             return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
           }
           if (sql.includes('INSERT INTO warning_edit_receipts')) {
+             if (missingWarningTable) throw new Error('D1_ERROR: no such table: warning_edit_receipts');
              if (warningReceiptIds.has(values[0])) return null;
              warningReceiptIds.add(values[0]);
              warningAdjustments.set(`${values[1]}:${values[2]}`,{count:values[3],start:strikeEvents.length,actor:values[4]});
@@ -81,6 +82,9 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
           if (sql.includes('FROM scan_jobs')) return jobs.get(values[0]) || null;
           if (sql.includes('processed_updates')) return { count: completed.has(values[0]) ? 1 : 0 };
           if (sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')) {
+            if (missingWarningTable) throw new Error('D1_ERROR: no such table: warning_adjustments');
+            if (warningReadFailsAfterDelete && telegram.some(call=>call.method==='deleteMessage'))
+              throw new Error('D1_ERROR: transient failure after Telegram deletion');
             const key=`${values[0]}:${values[1]}`,entry=warningAdjustments.get(key);
             const newer=strikeEvents.filter((x,i)=>x.key===key && (!entry || i>=entry.start)).length;
             // Existing runtime fixtures supply strikeCount as the effective total.
@@ -1125,3 +1129,42 @@ await test('replayed warning update cannot erase a later strike in a new command
   assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/1\/3/);
 });
 
+
+
+await test('missing warning table blocks deletion before Telegram or strike writes', async()=>{
+ const f=fixture({remove:true,missingWarningTable:true});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ await f.consume(message(groupA,3100),{retry:true});
+ assert.equal(f.telegram.some(call=>call.method==='deleteMessage'),false);
+ assert.equal(f.statements.some(s=>s.sql.includes('INSERT OR IGNORE INTO violations')),false);
+ assert.equal(f.completed.has(3100),false);
+ assert.equal(f.archives.has(String(groupA)+':3100'),true,'archival can precede the failed preflight');
+ assert.ok(f.statements.some(s=>s.operation==='read' && s.sql.includes('SELECT COALESCE((SELECT base_count FROM warning_adjustments')), 'pre-deletion warning-count D1 query must be attempted');
+ assert.equal(f.reviews.get(`${groupA}:3100`)?.last_status,'pending','failed preflight must not report a finished moderation action');
+});
+
+await test('missing warning table fails administrator updates without canceling punishments', async()=>{
+ const f=fixture({missingWarningTable:true});
+ const cmd=command('/warnings 22 2',{id:groupA,type:'supergroup'});
+ cmd.update_id=3101;
+ await f.consume(cmd,{retry:true});
+ assert.equal(f.warningAdjustments.size,0);
+ assert.equal(f.statements.some(s=>s.sql.includes('UPDATE pending_bans')),false);
+ assert.equal(f.completed.has(3101),false);
+});
+
+await test('post-delete count failure is a partial result, and retry avoids duplicate deletion', async()=>{
+ const f=fixture({remove:true,warningReadFailsAfterDelete:true});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ const update=message(groupA,3102);
+ await f.consume(update,{retry:true});
+ assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.completed.has(3102),false);
+ assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'pending');
+ await f.consume(update);
+ assert.equal(f.telegram.filter(call=>call.method==='deleteMessage').length,1);
+ assert.equal(f.statements.filter(s=>s.sql.includes('INSERT OR IGNORE INTO violations')).length,1);
+ assert.equal(f.reviews.get(String(groupA)+':3102')?.last_status,'previously_deleted');
+ assert.equal(f.telegram.some(call=>call.method==='restrictChatMember'),false);
+});
