@@ -1,6 +1,6 @@
 # Telegram Clef-omni Moderator
 
-A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it is an administrator, uses each group's `getChat.description` as its moderation policy, reviews text and media with `@cf/cloudflare/clef-omni`, archives Bot API updates in D1, and can delete messages, warn users, mute them for 60 seconds, and ban them after the administrator cancellation window.
+A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it is an administrator, uses each group's `getChat.description` as its moderation policy, reviews text-only messages with `@cf/cloudflare/clef-flash` and media with `@cf/cloudflare/clef-omni`, archives Bot API updates in D1, and can delete messages, warn users, mute them for 60 seconds, and ban them after the administrator cancellation window.
 
 **This bot is not silent.** Private review logs are enabled by default for each managed group, including when moderation is in dry-run mode. Successful enforcement also triggers public notices in the affected group. Commands reply in the chat and forum topic where they were issued. These are separate notification paths.
 
@@ -8,6 +8,8 @@ A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it
 - **Safe enforcement default:** `DRY_RUN=true` archives and classifies messages without deleting or banning; per-group `/dry-run off` enables enforcement.
 - **Per-group isolation:** each group has independent administrator authorization, dry-run, private-log and removal-threshold settings. Clef-omni's binary `violation.noul` score threshold defaults to 93%. Cloudflare Queues batches up to 20 events or 10 seconds (whichever comes first); each message is still classified and punished independently.
 - **History:** a Telegram Desktop JSON importer handles text-only history. The Bot API cannot retrieve unobserved old messages.
+
+**Model routing:** Pure text uses Clef-flash in live moderation, single-message scans and bulk history scans. Messages containing supported images, audio or video use Clef-omni, including their captions. Unsupported, malformed or oversized media remains unavailable for automatic enforcement; it is never silently reviewed as caption-only text. Both routes use the same typed questions, parsing, thresholds and group safeguards.
 
 **Chinese instructions:** [README_CN.md](README_CN.md).
 

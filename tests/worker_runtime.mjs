@@ -213,9 +213,12 @@ function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remov
     }
   }
   context.fetch = async request => {
+    if (new URL(request.url).pathname.startsWith('/file/'))
+      return new Response(new Uint8Array([1,2,3,4]));
     const method = new URL(request.url).pathname.split('/').at(-1);
     const args = JSON.parse(await request.text());
     telegram.push({ method, args });
+    if (method === 'getFile') return Response.json({ok:true,result:{file_path:'fixtures/'+args.file_id,file_size:4}});
     if (method === 'getChatAdministrators') return Response.json({ ok: true, result: [
       ...(args.chat_id === groupA ? adminsA : [21]).map(id=>({status:owners[args.chat_id]?.id===id?'creator':'administrator',user:{id,is_bot:false,...(owners[args.chat_id]?.id===id?owners[args.chat_id]:{})}})),
       { status: 'administrator', user: { id: 99, is_bot: true } },
@@ -301,17 +304,57 @@ await test('AI binding receives plain JSON state and nested questions for a grou
   await f.consume({ update_id: 456, message: { message_id: 43, from: { id: 11 },
     chat: { id: groupA, type: 'supergroup' }, text: 'A normal message' } });
   assert.equal(f.aiCalls.length, 1);
-  assert.equal(f.aiCalls[0].model, '@cf/cloudflare/clef-omni');
+  assert.equal(f.aiCalls[0].model, '@cf/cloudflare/clef-flash');
   const input = f.aiCalls[0].input;
+  assert.equal(input.model, 'clef-flash');
   assert.equal(input.state?.group_description, 'Do not post advertisements');
   assert.equal(input.state?.message_text, 'A normal message');
   assert.equal(input.questions?.violation?.type, 'noul');
   assert.equal(input.questions?.action, undefined, 'model never chooses allow/remove');
   assert.deepEqual(Object.keys(input.questions.violation.criteria).sort(), ['false', 'true']);
-  for (const field of ['images', 'audio', 'videos']) assert.deepEqual(input[field], []);
+  for (const field of ['images', 'audio', 'videos']) assert.equal(input[field], undefined);
   const reviewed = f.statements.find(s => s.sql.includes('UPDATE archived_messages'));
   assert.equal(reviewed?.values[0], 'allow');
   assert.equal(f.errors.length, 0);
+});
+
+await test('media with captions keeps the omni route and its actual media input',async()=>{
+  for(const [media,field] of [
+    [{photo:[{file_id:'photo',file_size:4}]},'images'],
+    [{document:{file_id:'image-doc',mime_type:'image/png'}},'images'],
+    [{sticker:{file_id:'sticker',is_animated:false,is_video:false}},'images'],
+    [{audio:{file_id:'audio',mime_type:'audio/mpeg'}},'audio'],
+    [{video:{file_id:'video',mime_type:'video/mp4',duration:2}},'videos'],
+  ]){
+    const f=fixture();const update=message(groupA,9500);
+    Object.assign(update.message,media,{caption:'Caption is not a text-only message'});
+    delete update.message.text;
+    await f.consume(update);
+    assert.equal(f.aiCalls.length,1);
+    assert.equal(f.aiCalls[0].model,'@cf/cloudflare/clef-omni');
+    assert.equal(f.aiCalls[0].input.model,'clef-omni');
+    assert.equal(f.aiCalls[0].input[field].length,1);
+    assert.match(f.aiCalls[0].input[field][0],/^data:.*;base64,/);
+    assert.equal(f.aiCalls[0].input.state.caption,'Caption is not a text-only message');
+  }
+});
+
+await test('unsupported or malformed media never falls back to flash caption-only review',async()=>{
+  for(const media of [
+    {document:{file_id:'pdf',mime_type:'application/pdf'}},
+    {photo:[]},
+    {sticker:{file_id:'animated',is_animated:true}},
+    {voice:{file_id:'voice',mime_type:'audio/ogg'}},
+    {photo:[{file_id:'large',file_size:5*1024*1024}]},
+  ]){
+    const f=fixture({remove:true});const update=message(groupA,9501);
+    f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+    Object.assign(update.message,media,{caption:'Do not discard this attachment'});
+    await f.consume(update);
+    assert.equal(f.aiCalls.length,0);
+    assert.equal(f.reviews.get(groupA+':9501')?.last_status,'review_error');
+    assert.equal(f.telegram.some(x=>['deleteMessage','restrictChatMember','banChatMember'].includes(x.method)),false);
+  }
 });
 
 function command(text, chat = { id: 11, type: 'private' }) {

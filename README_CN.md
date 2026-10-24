@@ -26,7 +26,7 @@
 
 ## 审核及处罚
 
-- 文字、照片、音频、视频通过 Cloudflare Workers AI `@cf/cloudflare/clef-omni` 审核。模型仅输出 `violation.noul` 违规概率、违规类别及严重度，**不再输出 allow/review/remove 动作，由 Rust 自动决定审核状态**。OGG/Opus 语音需要额外配置独立 HTTPS 转码服务（见 `transcoder/`）。大文件或模型不可用：**不自动处罚**。
+- 纯文本通过 Cloudflare Workers AI `@cf/cloudflare/clef-flash` 审核；带照片、音频或视频的消息（包括附带文字说明）继续使用 `@cf/cloudflare/clef-omni`。实时审核、单条扫描和历史扫描共用此路由；不支持、损坏或超限的媒体不会降级为仅审核说明文字。两条路由使用相同问题、解析、阈值与群组保护。模型仅输出 `violation.noul` 违规概率、违规类别及严重度，**不再输出 allow/review/remove 动作，由 Rust 自动决定审核状态**。OGG/Opus 语音需要额外配置独立 HTTPS 转码服务（见 `transcoder/`）。大文件或模型不可用：**不自动处罚**。
 - 判断标准以群简介为准，要求较高置信度。不在群简介禁止范围内的内容不得因此模型自带的“喜好”被处罚。
 - 清晰违规：先删除消息并在 D1 记录警告。7 天累计 3 次（默认）会触发禁言 60 秒（超级群组）。到期且管理员未取消则自动封禁。
 - 管理员始终不被自动封禁；其他管理员也可以在 Telegram UI 手动解除禁言，或通过 `/cancel` 取消待封禁处罚。
