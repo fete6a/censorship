@@ -47,13 +47,12 @@
 | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 取消待封禁，尝试恢复发言权限 |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
 | `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` | 查询或设置指定用户在目标群近 7 天警告次数；仅目标群管理员可操作 |
-| 回复消息 `/scan [audit]` 或 `/scan MESSAGE_ID [audit]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
-| `/scan_all` | `/scan_all -100GROUP_ID` | 扫描机器人已归档的所有消息，默认仅审计 |
-| `/scan_all enforce` | `/scan_all -100GROUP_ID enforce` | 对仍在可删除期限内的违规消息尝试执行处罚 |
+| 回复消息 `/scan [audit\|enforce]` 或 `/scan MESSAGE_ID [audit\|enforce]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit\|enforce]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
+| `/scan_all [audit\|enforce]` | `/scan_all -100GROUP_ID [audit\|enforce]` | 扫描机器人已归档的消息，默认按规则尝试处罚；`audit` 仅审计，`enforce` 显式执行 |
 | `/scan_status` | `/scan_status -100GROUP_ID` | 查询进度 |
 | `/scan_stop` | `/scan_stop -100GROUP_ID` | 停止扫描 |
 
-`/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 仍默认仅审计**，只有显式追加 `enforce` 才可能处罚。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
+`/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 同样默认请求执行处罚**；追加 `audit` 才仅审计，`enforce` 仍可显式指定。若目标群开启 dry-run，则所有扫描都不会执行实际处罚。同群已有运行中的历史扫描时，再发 `/scan_all` 会收到冲突提示，不会重置原任务的模式和进度；可用 `/scan_status` 查询或 `/scan_stop` 停止后重启。不同群组的历史扫描任务相互独立。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
 
 `/warnings USER_ID` 仅查询当前群该用户近 7 天的有效警告次数；`/warnings USER_ID 2` 设为 2 次（允许 0–3），私聊需用 `/warnings -100GROUP_ID USER_ID 2`。**必须通过目标群实时管理员身份验证**，群内无法指定别的群，D1 所有读写均按 `(chat_id,user_id)` 隔离。调整不会删除原违规记录，也不会立刻禁言或封禁；调整后新违规继续累计，人工基数 7 天后过期。若存在该用户在该群尚未执行的自动封禁，将尝试取消，且不会覆盖管理员手动设置的更长期禁言。
 

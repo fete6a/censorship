@@ -171,19 +171,25 @@ pub async fn set_warning_count(
     Ok(())
 }
 
-pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<i64> {
+/// Atomically start or restart a completed/stopped scan. A running job must
+/// never have its cursor or enforcement mode silently reset by another command.
+pub async fn start_scan(env: &Env, chat_id: i64, enforce: bool) -> Result<Option<i64>> {
     let row = env.d1("DB")?.prepare(
         "SELECT COALESCE(MAX(message_id),0) AS max_id FROM archived_messages WHERE chat_id=?"
     ).bind(&[js_i64(chat_id)])?.first::<MaxRow>(None).await?;
     let max_id = row.map(|r| r.max_id).unwrap_or(0);
-    env.d1("DB")?.prepare(
+    // RETURNING makes the conflict result observable without a racing precheck.
+    // A running scan is left entirely unchanged by the conflict predicate.
+    let started=env.d1("DB")?.prepare(
         "INSERT INTO scan_jobs (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at) \
          VALUES (?,0,?,0,0,?,'running',?,?) \
          ON CONFLICT(chat_id) DO UPDATE SET cursor_message_id=0,max_message_id=excluded.max_message_id, \
-         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at"
+         scanned=0,flagged=0,enforce=excluded.enforce,status='running',started_at=excluded.started_at,updated_at=excluded.updated_at \
+         WHERE scan_jobs.status!='running' \
+         RETURNING max_message_id AS max_id"
     ).bind(&[js_i64(chat_id), js_i64(max_id), js_i64(i64::from(enforce)), js_i64(now()), js_i64(now())])?
-        .run().await?;
-    Ok(max_id)
+        .first::<MaxRow>(None).await?;
+    Ok(started.map(|r|r.max_id))
 }
 
 pub async fn stop_scan(env: &Env, chat_id: i64) -> Result<()> {

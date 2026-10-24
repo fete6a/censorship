@@ -354,10 +354,10 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "/threshold 0.75（或 75%）— 设置删除阈值\n",
             "/dry_run on|off — 模拟模式\n",
             "/logs on|off — 管理员私聊日志\n",
-            "/scan [audit] — 回复消息后审核，默认按规则执行处罚\n",
-            "/scan MESSAGE_ID [audit] — 审核已归档消息\n",
+            "/scan [audit|enforce] — 回复消息后审核，默认按规则执行处罚\n",
+            "/scan MESSAGE_ID [audit|enforce] — 审核已归档消息\n",
             "/warnings USER_ID [0-3] — 查询或设置近 7 天警告次数\n",
-            "/scan_all [enforce] — 历史扫描\n",
+            "/scan_all [audit|enforce] — 历史扫描，默认按规则执行处罚\n",
             "/scan_status、/scan_stop — 查看或停止扫描\n",
             "/pending USER_ID、/cancel USER_ID — 封禁复核与取消\n\n",
             "私聊管理员命令：在命令后加入负数 GROUP_ID，",
@@ -420,7 +420,6 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "该群尚未启用审核或机器人权限不足，请将机器人设为管理员并授予删除消息权限。").await?;
         return Ok(private);
     }
-    let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/threshold" => {
             let changed=!args.is_empty();
@@ -546,8 +545,27 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                 "用户警告次数",&response).await?;
         }
         "/scan_all" => {
-            let max=store::start_scan(env,chat_id,enforce).await?;
-            let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{}",if enforce {"执行模式"} else {"仅审计"});
+            // All administrator-requested scans request enforcement by default.
+            // "audit" explicitly prevents punishment; "enforce" is accepted.
+            let enforce=match args.as_slice() {
+                [] | ["enforce"] => true,
+                ["audit"] => false,
+                _ => {
+                    reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                        "用法：/scan_all [audit|enforce]（私聊：/scan_all GROUP_ID [audit|enforce]）。\n默认按群规尝试执行处罚；audit 仅审计。").await?;
+                    return Ok(true);
+                }
+            };
+            let dry_run=enforce && store::group_dry_run(env,chat_id).await?;
+            let Some(max)=store::start_scan(env,chat_id,enforce).await? else {
+                reply_msg(env,msg,NoticeTone::Warning,"扫描进行中",
+                    "本群已有运行中的历史扫描，未重置进度或更改模式。使用 /scan_status 查看，或 /scan_stop 停止后重新启动。").await?;
+                return Ok(true);
+            };
+            let mode_label=if !enforce {"仅审计：不执行处罚"}
+                else if dry_run {"模拟模式：本群 dry-run 已开启，不执行处罚"}
+                else {"执行模式：依照群规及处罚限制"};
+            let reply=format!("状态：历史审查任务已创建\n截止消息：#{max}\n模式：{mode_label}");
             reply_msg(env,msg,NoticeTone::Success,"历史扫描",&reply).await?;
         }
         "/scan_status" => {
@@ -585,7 +603,7 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             };
             if !target_args.is_empty() && message_id.is_none() {
                 reply_msg(env,msg,NoticeTone::Warning,"参数错误",
-                    "用法：回复消息 /scan [audit]，或 /scan MESSAGE_ID [audit]。\n默认按规则执行处罚，使用 audit 仅审计。私聊请先指定 GROUP_ID。").await?;
+                    "用法：回复消息 /scan [audit|enforce]，或 /scan MESSAGE_ID [audit|enforce]。\n默认按规则执行处罚，使用 audit 仅审计。私聊请先指定 GROUP_ID。").await?;
                 return Ok(true);
             }
             let target=if let Some(id)=message_id {
