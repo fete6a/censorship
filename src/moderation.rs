@@ -237,7 +237,7 @@ async fn review_with_policy_cache(
         id,name:tg::display_name(&msg["from"]),warnings:None,
     });
     if let Some(user_id) = user {
-        store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability,scan).await?;
+        store::add_strike(env, chat_id, msg_id, user_id, &decision.category, decision.remove_probability).await?;
         let count = store::recent_strikes(env, chat_id, user_id).await?;
         if let Some(display)=notice_user.as_mut() {display.warnings=Some(count);}
         let very_severe = flag(env, "IMMEDIATE_BAN", false)
