@@ -14,4 +14,4 @@ jobs:
       - name: Trigger the existing migration-first deployment workflow
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run build.yml --ref main -f deploy=true
+        run: gh workflow run build.yml --repo fete6a/censorship --ref main -f deploy=true
