@@ -912,3 +912,52 @@ await test('private rules keep exact-group authorization and provide rules-speci
  assert.match(allowed.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/Do not post advertisements/);
  assert.equal(allowed.statements.some(s=>s.sql.includes('managed_chats')),false);
 });
+
+
+await test('command responses consistently use titled MarkdownV2, localized labels, and status tones',async()=>{
+ const cases=[
+  ['/help', /ℹ️ \*命令帮助\*\n\n/],
+  ['/rules', /ℹ️ \*群组规则\*\n\n/],
+  ['/threshold', /ℹ️ \*删除阈值\*\n\n/],
+  ['/threshold 75%', /✅ \*删除阈值\*\n\n/],
+  ['/dry_run', /ℹ️ \*群组设置\*\n\n/],
+  ['/logs off', /✅ \*群组设置\*\n\n/],
+  ['/cancel 22', /ℹ️ \*封禁复核取消\*\n\n/],
+  ['/pending 22', /ℹ️ \*封禁复核状态\*\n\n/],
+  ['/scan_all', /✅ \*历史扫描\*\n\n/],
+  ['/scan_status', /ℹ️ \*历史扫描进度\*\n\n/],
+  ['/scan_stop', /✅ \*历史扫描\*\n\n/],
+  ['/dry_run maybe', /⚠️ \*参数错误\*\n\n/],
+  ['/unknown', /⚠️ \*未知命令\*\n\n/],
+ ];
+ for(const [commandLine,pattern] of cases){
+  const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  await f.consume(command(commandLine,{id:groupA,type:'supergroup'}));
+  const responses=f.telegram.filter(x=>x.method==='sendMessage');
+  assert.ok(responses.length>0,commandLine);
+  assert.match(responses[0].args.text,pattern,commandLine);
+  assert.equal(responses[0].args.parse_mode,'MarkdownV2');
+  assert.equal(responses[0].args.link_preview_options?.is_disabled,true);
+ }
+});
+await test('rule descriptions escape Markdown while action and digest details use matching labels',async()=>{
+ const rules='Text *bad* [link](https://example.org) _under_ !';
+ const f=fixture({rules});f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+ await f.consume(command('/rules',{id:groupA,type:'supergroup'}));
+ const reply=f.telegram.find(x=>x.method==='sendMessage')?.args.text||'';
+ assert.match(reply,/ℹ️ \*群组规则\*/);
+ assert.ok(reply.includes('Text \\*bad\\* \\[link\\]\\(https://example\\.org\\) \\_under\\_ \\!'));
+ assert.ok(reply.includes('来源：群组简介'));
+ const flagged=fixture({remove:true,score:0.98,strikeCount:2});
+ flagged.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.9});
+ await flagged.consume(message(groupA,3030));
+ const outputs=flagged.telegram.filter(x=>x.method==='sendMessage').map(x=>x.args.text);
+ const groupNotice=flagged.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA)?.args.text||'';
+ assert.ok(groupNotice.startsWith('🚨 *违规消息已删除*\n\n'));
+ assert.ok(groupNotice.includes('👤 用户：'));
+ assert.ok(groupNotice.includes('📋 *处理说明*'));
+ assert.ok(groupNotice.includes('违规类别：'));
+ assert.ok(groupNotice.includes('📊 近 7 天警告：'));
+ assert.ok(!groupNotice.includes('/3030)'), 'deleted message link is not presented');
+ assert.ok(outputs.every(x=>x.length<4096),'Telegram message size stays within limit');
+});
