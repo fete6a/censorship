@@ -1249,8 +1249,10 @@ await test('concurrent Cron claims cannot process the same group twice',async()=
  assert.equal(f.jobs.get(groupA).flagged,0);
  // Other groups can be started and scanned independently after this one.
  f.archives.set(groupB+':27',message(groupB,27).message);
- let other=command('/scan_all audit',{id:groupB,type:'supergroup'});other.update_id=9201;other.message.from.id=21;
- await f.consume(other);
+ // Seed the second group's own database job directly; authorization of
+ // group-B commands is covered by separate group permission tests.
+ f.jobs.set(groupB,{chat_id:groupB,cursor_message_id:0,max_message_id:27,
+   scanned:0,flagged:0,enforce:0,status:'running',generation:1,lease_id:0,claimed:false});
  await f.tick();
  assert.equal(f.jobs.get(groupB)?.scanned,1);
  assert.equal(f.jobs.get(groupA).scanned,1);
