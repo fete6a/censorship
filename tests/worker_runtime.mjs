@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11] } = {}) {
+function fixture({ queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember } = {}) {
   const settings = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), errors = [], aiCalls = [];
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
@@ -91,6 +91,7 @@ function fixture({ queueError = false, remove = false, dmFail = false, adminsA =
       ...(args.chat_id === groupA ? adminsA : [21]).map(id=>({status:'administrator',user:{id,is_bot:false}})),
       { status: 'administrator', user: { id: 99, is_bot: true } },
     ] });
+    if (method === 'getChatMember' && args.user_id===22 && pauseMember) await pauseMember();
     if (method === 'getChatMember') return Response.json({ ok: true, result: {
       user: { id: args.user_id }, status: args.chat_id === groupA ? 'administrator' : 'member',
     } });
@@ -266,4 +267,14 @@ await test('log recipients are refreshed when group administrators change',async
  const admins=[11];const f=fixture({adminsA:admins});await f.consume(message(groupA,501));
  admins.splice(0,1,12);await f.consume(message(groupA,502));
  assert.deepEqual(f.telegram.filter(c=>c.method==='sendMessage').map(c=>c.args.chat_id),[11,12]);
+});
+
+await test('turning dry-run on stops a review waiting for a Telegram lookup',async()=>{
+ let enter,release;const entered=new Promise(r=>enter=r),gate=new Promise(r=>release=r);
+ const f=fixture({remove:true,pauseMember:async()=>{enter();await gate;}});
+ f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+ const review=f.consume(message(groupA,510)); await entered;
+ await f.consume({...command(`/dry_run ${groupA} on`),update_id:511});
+ release();await review;
+ assert.equal(f.telegram.some(c=>['deleteMessage','restrictChatMember','banChatMember'].includes(c.method)),false);
 });

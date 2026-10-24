@@ -60,6 +60,16 @@ class StoreQueryTests(unittest.TestCase):
         self.add_case(42)
         self.assertIsNotNone(self.claim_at(760))
 
+    def test_group_setting_defaults_and_isolated_partial_updates(self):
+        self.db.execute('INSERT INTO group_settings(chat_id) VALUES(-1002)')
+        source=(ROOT/'src/store.rs').read_text()
+        dry,logs=re.findall(r'"(INSERT INTO group_settings[^"\n]+)"', source)
+        self.db.execute(dry,(-1001,0))
+        self.db.execute(logs,(-1001,0))
+        self.assertEqual(self.db.execute('SELECT chat_id,dry_run,logs_enabled FROM group_settings ORDER BY chat_id DESC').fetchall(),[(-1001,0,0),(-1002,None,1)])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute('INSERT INTO group_settings(chat_id) VALUES(123)')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -208,6 +208,11 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
     } else {
         true // Anonymous administrator/channel sender: no attributable ban or strike.
     };
+    // Settings may change while Telegram lookups are in flight.
+    if store::group_dry_run(env,chat_id).await? {
+        store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
+        return Ok(true);
+    }
     tg::delete(env, chat_id, msg_id).await?;
 
     let mut notice = format!("违规消息 {msg_id} 已删除：{category}。");
@@ -231,7 +236,10 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
                 let already_restricted = field_str(&member,"status") == "restricted" &&
                     (field_int(&member,"until_date").unwrap_or(0) == 0 ||
                      field_int(&member,"until_date").unwrap_or(0) > now() + 60);
-                if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
+                if store::group_dry_run(env,chat_id).await? {
+                    store::set_strike_action(env,chat_id,msg_id,"deleted_no_mute_dry_run").await?;
+                    notice="Dry-run enabled; further punishment stopped.".into();
+                } else if already_restricted || matches!(field_str(&member,"status"),"left"|"kicked") {
                     store::set_strike_action(env,chat_id,msg_id,"existing_external_restriction").await?;
                     notice = format!("用户 {user_id} 已有更长期的限制或不在群内，机器人不会覆盖原处罚或创建新封禁任务。 ");
                 } else {
@@ -542,6 +550,10 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
     }
     // Atomic claim excludes concurrent /cancel and repeated delayed messages.
     if store::claim_due(env,chat_id,user_id,message_id).await?.is_none() {return Ok(());}
+    if store::group_dry_run(env,chat_id).await? {
+        store::conclude_pending(env,chat_id,user_id,message_id,"canceled").await?;
+        return Ok(());
+    }
     match tg::ban(env,chat_id,user_id).await {
         Ok(())=>{
             store::conclude_pending(env,chat_id,user_id,message_id,"banned").await?;
