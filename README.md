@@ -51,9 +51,11 @@ All other management commands check the issuing user's `getChatMember` administr
 | Enforcement mode (query or set) | `/dry-run [on\|off]` (also `/dry_run`) | `/dry_run -100GROUP_ID [on\|off]` |
 | Private review logs (query or set) | `/logs [on\|off]` | `/logs -100GROUP_ID [on\|off]` |
 | Read group policy | `/rules` | `/rules -100GROUP_ID` |
-| Cancel pending ban | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
-| Inspect pending ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
+| Cancel pending ban (does not unmute) | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
+| Inspect pending/processing ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
 | Read or set a user's seven-day warnings | `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` |
+
+`/cancel` only cancels a `pending` ban in D1. It intentionally **never restores Telegram permissions**, because reading a restriction and then lifting it could overwrite a concurrent human administrator's restriction. The bot's own 60-second restriction expires on Telegram automatically unless a human changes it. A case already in `processing` may have submitted a Telegram request and cannot be atomically recalled. `/warnings` reports that distinction, and API-failure retries check that the originating violation was not covered by a warning adjustment.
 | Re-review and enforce an archived or replied-to message by default | Reply with `/scan [audit]` or use `/scan MESSAGE_ID [audit]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit]` |
 | Scan archived messages (audit by default) | `/scan_all [enforce]` | `/scan_all -100GROUP_ID [enforce]` |
 | Scan progress / stop | `/scan_status` / `/scan_stop` | `/scan_status -100GROUP_ID` / `/scan_stop -100GROUP_ID` |

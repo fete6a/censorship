@@ -303,6 +303,18 @@ pub struct PendingBan {
     pub due_at: i64,
 }
 
+#[derive(Deserialize)]
+struct BanStatusRow { status: String }
+
+/// A status snapshot for honest command feedback, including in-flight claims.
+/// This does not authorize changing Telegram member permissions.
+pub async fn ban_case_status(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<String>> {
+    let row=env.d1("DB")?.prepare(
+        "SELECT status FROM pending_bans WHERE chat_id=? AND user_id=?"
+    ).bind(&[js_i64(chat_id),js_i64(user_id)])?.first::<BanStatusRow>(None).await?;
+    Ok(row.map(|r|r.status))
+}
+
 pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Option<PendingBan>> {
     env.d1("DB")?.prepare(
         "SELECT chat_id,user_id,message_id,created_at,due_at,status FROM pending_bans \
@@ -385,9 +397,30 @@ pub async fn conclude_pending(env: &Env, chat_id: i64, user_id: i64, message_id:
     Ok(())
 }
 
+/// Atomically recover an ambiguous Telegram ban failure only if no warning
+/// adjustment covered the originating violation. Otherwise cancel the case.
+/// This is one SQL update so a concurrent receipt and retry cannot resurrect it.
 pub async fn retry_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<()> {
     env.d1("DB")?.prepare(
-        "UPDATE pending_bans SET status='pending' WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
+        "UPDATE pending_bans SET status=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN 'canceled' ELSE 'pending' END, \
+         cancellation_reason=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN 'warning_count_adjusted' ELSE cancellation_reason END, \
+         resolved_at=CASE WHEN EXISTS ( \
+         SELECT 1 FROM warning_adjustments a JOIN violations v \
+         ON v.chat_id=a.chat_id AND v.user_id=a.user_id \
+         WHERE v.chat_id=pending_bans.chat_id AND v.user_id=pending_bans.user_id \
+         AND v.message_id=pending_bans.message_id AND v.rowid<=a.violation_rowid) \
+         THEN unixepoch() ELSE resolved_at END \
+         WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
     Ok(())
 }

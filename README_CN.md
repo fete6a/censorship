@@ -44,7 +44,7 @@
 | `/dry-run off`（或 `/dry_run off`） | `/dry_run -100GROUP_ID off` | 为当前群启用实际处罚；`on` 恢复审计并取消本群待封禁任务；省略参数查询 |
 | `/logs off` | `/logs -100GROUP_ID off` | 只关闭当前群的管理员主动私聊日志；`on` 恢复；省略参数查询；不关闭群公告 |
 | `/rules` | `/rules -100GROUP_ID` | 群内所有成员可读取本群规则；私聊仍限目标群管理员 |
-| `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 取消待封禁，尝试恢复发言权限 |
+| `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 仅取消尚未进入处理阶段的自动封禁任务；**不自动解禁** |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
 | `/warnings USER_ID [0-3]` | `/warnings -100GROUP_ID USER_ID [0-3]` | 查询或设置指定用户在目标群近 7 天警告次数；仅目标群管理员可操作 |
 | 回复消息 `/scan [audit]` 或 `/scan MESSAGE_ID [audit]` | `/scan_id -100GROUP_ID MESSAGE_ID [audit]` | 单条扫描默认按规则执行处罚；追加 `audit` 才仅审计 |
@@ -55,7 +55,7 @@
 
 `/scan`、`/scan_id` 单条扫描**默认请求执行处罚**；使用 `/scan audit` 明确仅审计，原 `enforce` 参数仍兼容。返回实际保存的审核状态、类别与概率。若本群开启 `dry-run`，仍不会真正删除/封禁，回复会提示模拟模式；同样保留群规、阈值、用户类型、48 小时删除窗口、权限与防重复警告检查。**批量 `/scan_all` 仍默认仅审计**，只有显式追加 `enforce` 才可能处罚。目标必须是当前群回复的消息或该群已归档的正整数消息 ID，不能跨群读取。缺少群规或模型失败不误报成功；服务异常保留队列重试。
 
-`/warnings USER_ID` 仅查询当前群该用户近 7 天的有效警告次数；`/warnings USER_ID 2` 设为 2 次（允许 0–3），私聊需用 `/warnings -100GROUP_ID USER_ID 2`。**必须通过目标群实时管理员身份验证**，群内无法指定别的群，D1 所有读写均按 `(chat_id,user_id)` 隔离。调整不会删除原违规记录，也不会立刻禁言或封禁；调整后新违规继续累计，人工基数 7 天后过期。若存在该用户在该群尚未执行的自动封禁，将尝试取消，且不会覆盖管理员手动设置的更长期禁言。
+`/warnings USER_ID` 仅查询当前群该用户近 7 天的有效警告次数；`/warnings USER_ID 2` 设为 2 次（允许 0–3），私聊需用 `/warnings -100GROUP_ID USER_ID 2`。**必须通过目标群实时管理员身份验证**，群内无法指定别的群，D1 所有读写均按 `(chat_id,user_id)` 隔离。调整不会删除原违规记录，也不会立刻禁言或封禁；调整后新违规继续累计，人工基数 7 天后过期。若存在该用户在该群尚处于 `pending` 的自动封禁，会通过原子数据库操作取消；若已经进入 `processing` 或已调用 Telegram，则无法原子撤销，回复会明确提示。`/cancel` 也只取消 `pending` 状态的任务：**不再调用 `getChatMember` 检查后自动解禁，也不会恢复群默认权限**。机器人本身设置的 60 秒禁言等待 Telegram 自行到期；如管理员另行延长或修改限制，应保留人工设置。若封禁 API 失败并准备重新排队，会再次检查是否已被警告调整覆盖，防止旧任务重新出现。
 
 Telegram 官方 Bot API 无法遍历机器人加入前的消息、也无法任意拉取旧消息 ID。`tools/history-import/` 提供桌面版文本 JSON 离线导入工具，具体导入方式需由数据持有人授权。旧媒体不在导入范围内。Telegram 对大部分消息有 48 小时删除限制。
 

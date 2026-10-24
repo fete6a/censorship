@@ -1131,6 +1131,21 @@ await test('replayed warning update cannot erase a later strike in a new command
 
 
 
+await test('cancel and warning updates never call Telegram unmute or restore permissions', async()=>{
+  const cancel=fixture();
+  cancel.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  await cancel.consume(command('/cancel 22',{id:groupA,type:'supergroup'}));
+  assert.equal(cancel.telegram.some(x=>x.method==='restrictChatMember'),false);
+  assert.equal(cancel.telegram.some(x=>x.method==='getChat' && x.args.chat_id===groupA),false);
+  const warning=fixture();
+  warning.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  const cmd=command('/warnings 22 0',{id:groupA,type:'supergroup'});cmd.update_id=3901;
+  await warning.consume(cmd);
+  assert.equal(warning.telegram.some(x=>x.method==='restrictChatMember'),false);
+  assert.equal(warning.telegram.some(x=>x.method==='banChatMember'),false);
+  assert.match(warning.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/不会自动解除/);
+});
+
 await test('missing warning table blocks deletion before Telegram or strike writes', async()=>{
  const f=fixture({remove:true,missingWarningTable:true});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0});

@@ -214,30 +214,6 @@ pub async fn mute_one_minute(env: &Env, chat_id: i64, user_id: i64) -> Result<i6
     Ok(due_at)
 }
 
-/// Remove the restriction after an explicit administrator cancellation.
-/// Restore the group's default permissions instead of opening disallowed actions.
-pub async fn unmute(env: &Env, chat_id: i64, user_id: i64) -> Result<()> {
-    let chat = api(env, "getChat", json!({"chat_id":chat_id})).await?;
-    let defaults = chat.get("permissions").filter(|v| v.is_object()).cloned().unwrap_or(json!({
-        "can_send_messages": true,
-        "can_send_audios": true,
-        "can_send_documents": true,
-        "can_send_photos": true,
-        "can_send_videos": true,
-        "can_send_video_notes": true,
-        "can_send_voice_notes": true,
-        "can_send_polls": true,
-        "can_send_other_messages": true,
-        "can_add_web_page_previews": true,
-        "can_invite_users": true
-    }));
-    api(env,"restrictChatMember",json!({
-        "chat_id":chat_id,"user_id":user_id,
-        "permissions":defaults,"use_independent_chat_permissions":true
-    })).await?;
-    Ok(())
-}
-
 pub async fn get_member(env: &Env, chat_id: i64, user_id: i64) -> Result<Value> {
     api(env, "getChatMember", json!({"chat_id":chat_id,"user_id":user_id})).await
 }
