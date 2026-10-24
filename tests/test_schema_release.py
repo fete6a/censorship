@@ -69,12 +69,19 @@ class D1ReleaseSafetyTests(unittest.TestCase):
         self.assertEqual(self.state(), ("ready", []))
         self.assertEqual(self.db.execute(count, (-100, 22, 1699000000)).fetchone()[0], 1)
         upsert = store_query("set_warning_count")
-        self.db.execute(upsert, (-100, 22, 2, 1700000000, 11))
+        self.db.execute(upsert, (5000, -100, 22, 2, 11, 1700000000))
         adjusted = self.db.execute("SELECT * FROM warning_adjustments").fetchall()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_edit_receipts").fetchone(), (1,))
+        self.assertEqual(self.db.execute(
+            "SELECT status FROM pending_bans WHERE chat_id=-100"
+        ).fetchone(), ("canceled",), "the receipt trigger should cancel a pending ban")
+        after_command = self.historical_snapshot()
         self.db.executescript(ENSURE)
         self.db.executescript(ENSURE)
         self.assertEqual(self.db.execute("SELECT * FROM warning_adjustments").fetchall(), adjusted)
-        self.assertEqual(self.historical_snapshot(), before)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_edit_receipts").fetchone(), (1,))
+        self.assertEqual(self.historical_snapshot(), after_command)
+        self.assertEqual(after_command[0], before[0], "violation history must survive migration and command")
         self.assertEqual(self.state(), ("ready", []))
         self.assertEqual(self.db.execute(count, (-100, 22, 1699000000)).fetchone()[0], 2)
 
@@ -155,8 +162,123 @@ class D1ReleaseSafetyTests(unittest.TestCase):
     def test_inspection_sql_is_read_only(self):
         self.assertTrue(guard.INSPECTION_SQL.lstrip().upper().startswith("SELECT "))
         self.assertIn("FROM sqlite_master", guard.INSPECTION_SQL)
+        self.assertIn("'trigger'", guard.INSPECTION_SQL)
+        self.assertIn("m.tbl_name", guard.INSPECTION_SQL)
         self.assertNotIn("INSERT ", guard.INSPECTION_SQL.upper())
         self.assertNotIn("DELETE ", guard.INSPECTION_SQL.upper())
+
+
+    def test_post_pr11_database_needs_only_additive_receipt_migration(self):
+        # PR #11 already created adjustments, but PR #13 has not yet run.
+        self.db.executescript(ENSURE.split("-- Durable per-Telegram-update receipt", 1)[0])
+        before = self.historical_snapshot()
+        self.assertEqual(self.state(pre=True), ("migration_required", []))
+        self.assertEqual(self.state()[0], "incompatible")
+        self.db.executescript(ENSURE)
+        self.assertEqual(self.state(), ("ready", []))
+        self.assertEqual(self.historical_snapshot(), before)
+        self.db.executescript(ENSURE)
+        self.assertEqual(self.historical_snapshot(), before)
+
+    def test_adjustment_table_only_and_both_new_objects_missing_is_retryable(self):
+        self.db.executescript(ENSURE)
+        self.db.execute("DROP TABLE warning_edit_receipts")  # SQLite also removes its trigger.
+        previous = self.historical_snapshot()
+        self.assertEqual(self.state(pre=True), ("migration_required", []))
+        self.assertEqual(self.state()[0], "incompatible")
+        self.db.executescript(ENSURE)
+        self.assertEqual(self.state(), ("ready", []))
+        self.assertEqual(self.historical_snapshot(), previous)
+
+    def test_receipts_present_without_trigger_must_fail_closed(self):
+        self.db.executescript(ENSURE)
+        self.db.execute("DROP TRIGGER apply_warning_edit_receipt")
+        # An accepted receipt can exist without applying any side effect.
+        self.db.execute(
+            "INSERT INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) "
+            "VALUES(700,-100,22,0,11,1700000001)"
+        )
+        for pre in (False, True):
+            with self.subTest(pre_migration=pre):
+                state, errors = self.state(pre=pre)
+                self.assertEqual(state, "incompatible")
+                self.assertTrue(any("trigger" in error for error in errors))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_adjustments").fetchone(), (0,))
+        self.assertEqual(self.db.execute(
+            "SELECT status FROM pending_bans WHERE chat_id=-100"
+        ).fetchone(), ("pending",))
+        # Rerunning additive SQL would recreate the trigger, not backfill the
+        # previously accepted but unapplied receipt; do NOT report code 3.
+        self.db.executescript(ENSURE)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_adjustments").fetchone(), (0,))
+
+    def test_wrong_named_trigger_definition_is_not_deployment_ready(self):
+        self.db.executescript(ENSURE)
+        self.db.execute("DROP TRIGGER apply_warning_edit_receipt")
+        self.db.executescript(
+            "CREATE TRIGGER apply_warning_edit_receipt "
+            "AFTER INSERT ON warning_edit_receipts BEGIN SELECT 1; END"
+        )
+        for pre in (False, True):
+            state, errors = self.state(pre=pre)
+            self.assertEqual(state, "incompatible")
+            self.assertTrue(any("trigger definition mismatch" in error for error in errors))
+        self.db.execute(
+            "INSERT INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) "
+            "VALUES(710,-100,22,0,11,1700000001)"
+        )
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_adjustments").fetchone(), (0,))
+
+    def test_receipt_table_without_adjustments_is_incompatible(self):
+        self.db.executescript(ENSURE)
+        self.db.execute("DROP TABLE warning_adjustments")
+        state, reasons = self.state(pre=True)
+        self.assertEqual(state, "incompatible")
+        self.assertTrue(any("receipt table exists without warning_adjustments" in r for r in reasons))
+
+    def test_extra_trigger_on_sensitive_table_is_incompatible(self):
+        self.db.executescript(ENSURE)
+        self.db.executescript(
+            "CREATE TRIGGER unexpected_receipt_effect AFTER INSERT ON warning_edit_receipts "
+            "BEGIN UPDATE pending_bans SET status='canceled' WHERE status='pending'; END"
+        )
+        state, reasons = self.state()
+        self.assertEqual(state, "incompatible")
+        self.assertTrue(any("unexpected trigger" in reason for reason in reasons))
+
+    def test_repeat_receipt_cannot_erase_a_new_genuine_violation(self):
+        self.db.executescript(ENSURE)
+        upsert = store_query("set_warning_count")
+        count = store_query("recent_strikes")
+        self.db.execute(upsert, (901, -100, 22, 0, 11, 1700000001))
+        baseline = self.db.execute(
+            "SELECT base_count,violation_rowid FROM warning_adjustments "
+            "WHERE chat_id=-100 AND user_id=22"
+        ).fetchone()
+        self.assertEqual(baseline, (0, 1))
+        self.db.execute(
+            "INSERT INTO violations(chat_id,user_id,message_id,created_at,category,probability,action) "
+            "VALUES(-100,22,43,1700000002,'spam',0.99,'warned')"
+        )
+        self.db.execute(upsert, (901, -100, 22, 0, 11, 1700000003))
+        self.assertEqual(self.db.execute(
+            "SELECT base_count,violation_rowid FROM warning_adjustments "
+            "WHERE chat_id=-100 AND user_id=22"
+        ).fetchone(), baseline)
+        self.assertEqual(self.db.execute(count, (-100, 22, 1699000000)).fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM warning_edit_receipts").fetchone(), (1,))
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM warning_adjustments WHERE chat_id=-200"
+        ).fetchone())
+
+    def test_trigger_behaviour_is_verified_on_dummy_rows_only(self):
+        self.db.executescript(ENSURE)
+        guard.verify_warning_trigger_behavior()
+        rows = guard.inspect_sqlite(self.db)
+        self.assertEqual(
+            len([row for row in rows if row["object_type"] == "trigger"
+                 and row["object_name"] == "apply_warning_edit_receipt"]), 1
+        )
 
 
 if __name__ == "__main__":

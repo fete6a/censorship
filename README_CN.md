@@ -141,4 +141,6 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 生产 D1 发布前校验
 
-GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 仅表示缺少 `warning_adjustments`，此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+
+联合 PR #13 后，发布预检还要检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。

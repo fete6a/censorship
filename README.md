@@ -104,3 +104,5 @@ Within a Queue delivery, successful policy lookups are reused separately for eac
 ## Mandatory D1 release preflight
 
 Before manually uploading any Worker built from PR #11 or later, follow [the production D1 schema release gate](docs/manual-d1-release.md). The read-only check `python3 tools/check_d1_schema.py --remote` must exit 0 after the additive migration and immediately before upload. Green GitHub Actions does not establish production migration status. Never run `schema/current.sql` against existing D1 data.
+
+The release check includes PR #13's `warning_edit_receipts` table and `apply_warning_edit_receipt` trigger. Its DDL is compared with the canonical schema and its behavior verified only against dummy in-memory data. Existing receipt tables without the trigger require manual reconciliation (not automatic migration).
