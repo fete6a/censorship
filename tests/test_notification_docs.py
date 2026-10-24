@@ -81,8 +81,9 @@ class NotificationDocumentationTests(unittest.TestCase):
 
     def test_group_notices_remain_independent_of_private_logs(self):
         sender = self.telegram.split(
-            "pub async fn send_group_notice(", 1
+            "pub async fn reply_command(", 1
         )[1].split("async fn send_admin_markdown(", 1)[0]
+        self.assertIn('api(env,"sendMessage",args)', sender)
         self.assertIn("post_markdown(env,chat_id,", sender)
         self.assertIn("send_group_action_notice(", sender)
         self.assertNotIn("group_logs", sender)
@@ -91,10 +92,11 @@ class NotificationDocumentationTests(unittest.TestCase):
             "fn command_parts(", 1
         )[0]
         self.assertIn("tg::delete(env, chat_id, msg_id).await?;", review)
-        self.assertIn("tg::send_group_action_notice(env,chat_id,msg_id,user,", review)
+        self.assertIn("tg::send_group_action_notice(env,chat_id,msg_id,notice_user.as_ref(),", review)
         self.assertIn("tg::ban(env,chat_id,user_id).await", self.moderation)
-        self.assertIn("tg::send_group_action_notice(env,chat_id,message_id,Some(user_id),", self.moderation)
-        self.assertIn("if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice", self.moderation)
+        self.assertIn("tg::send_group_action_notice(env,chat_id,message_id,Some(&user),", self.moderation)
+        self.assertIn("tg::reply_command(env,msg,&reply).await?;", self.moderation)
+        self.assertNotIn("tg::send(env,origin_chat_id,", self.moderation)
         self.assertIn("does not disable group action notices", self.en)
         self.assertIn("不关闭群内处罚通知", self.cn)
         self.assertIn("`/threshold`", self.en)

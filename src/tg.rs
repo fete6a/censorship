@@ -69,31 +69,46 @@ async fn post_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
     Ok(())
 }
 
-/// Private command replies; dynamic text is escaped before adding formatting.
-pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
-    if chat_id <= 0 { return Ok(()); }
-    post_markdown(env,chat_id,&formatting::plain_notice("机器人管理",text)).await
-}
-
-/// Public group messages are best effort and never reissue completed punishment.
-pub async fn send_group_notice(env: &Env, chat_id: i64, text: &str) {
-    if chat_id>=0 {return;}
-    if post_markdown(env,chat_id,&formatting::plain_notice("群组通知",text)).await.is_err() {
-        worker::console_error!("group_notice_delivery_failed");
+/// Commands reply where they were issued, including the originating forum topic.
+/// A failed confirmation must not replay a completed management operation.
+pub async fn reply_command(env: &Env, message: &Value, text: &str) -> Result<()> {
+    let (chat_id, _) = ids(message).ok_or_else(|| fail("Invalid command chat"))?;
+    let mut args = json!({
+        "chat_id":chat_id,
+        "text":formatting::plain_notice("机器人管理",text),
+        "parse_mode":"MarkdownV2",
+        "link_preview_options":{"is_disabled":true}
+    });
+    if let Some(id) = field_int(message,"message_id").filter(|id|*id>0) {
+        args["reply_parameters"] = json!({"message_id":id,"allow_sending_without_reply":true});
     }
+    if let Some(id) = field_int(message,"message_thread_id").filter(|id|*id>0) {
+        args["message_thread_id"] = json!(id);
+    }
+    if api(env,"sendMessage",args).await.is_err() {
+        worker::console_error!("command_reply_delivery_failed chat={}",chat_id);
+    }
+    Ok(())
 }
 
 /// User mention links are generated solely from positive Telegram numeric IDs.
 /// Deleted message IDs remain plain text: they cannot reliably be opened.
 pub async fn send_group_action_notice(
-    env: &Env, chat_id: i64, message_id: i64, user_id: Option<i64>,
+    env: &Env, chat_id: i64, message_id: i64, user: Option<&formatting::ActionUser>,
     title: &str, text: &str
 ) {
     if chat_id>=0 {return;}
-    let body=formatting::action_notice(title,message_id,user_id,text);
+    let body=formatting::action_notice(title,message_id,user,text);
     if post_markdown(env,chat_id,&body).await.is_err() {
         worker::console_error!("group_action_notice_delivery_failed");
     }
+}
+
+pub async fn send_admin_action_notice(
+    env: &Env, chat_id: i64, message_id: i64, user: Option<&formatting::ActionUser>,
+    title: &str, text: &str,
+) -> Result<()> {
+    send_admin_markdown(env,chat_id,&[formatting::action_notice(title,message_id,user,text)],None).await
 }
 
 /// Fetch current human administrators for the exact group; no global DM target.
@@ -110,6 +125,14 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anch
     };
     let heading=formatting::group_heading(chat_id,field_str(&info,"title"),
         field_str(&info,"username"),field_str(&info,"invite_link"),anchor);
+    let owner=admins.as_array().and_then(|members|members.iter().find(|member|
+        field_str(member,"status")=="creator" && member["user"]["is_bot"]!=true));
+    let owner_heading=match owner {
+        Some(member)=>formatting::owner_heading(field_int(&member["user"],"id"),
+            field_str(&member["user"],"first_name"),field_str(&member["user"],"last_name")),
+        None=>formatting::owner_heading(None,"",""),
+    };
+    let heading=format!("{heading}{owner_heading}");
     if let Some(admins)=admins.as_array() {
         for member in admins {
             if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
@@ -242,7 +265,8 @@ pub fn normalize(msg: &Value) -> Value {
         "message_id": msg["message_id"],
         "chat": {"id": msg["chat"]["id"], "type": msg["chat"]["type"]},
         "date": msg["date"],
-        "from": {"id": msg["from"]["id"], "is_bot": msg["from"]["is_bot"]},
+        "from": {"id": msg["from"]["id"], "is_bot": msg["from"]["is_bot"],
+            "first_name":msg["from"]["first_name"], "last_name":msg["from"]["last_name"]},
         "sender_chat": msg["sender_chat"]
     });
     for key in keys {
@@ -267,6 +291,11 @@ pub fn author(msg: &Value) -> Option<i64> {
         return None;
     }
     field_int(&msg["from"], "id")
+}
+
+pub fn display_name(user: &Value) -> String {
+    format!("{} {}",field_str(user,"first_name").trim(),field_str(user,"last_name").trim())
+        .trim().chars().take(128).collect()
 }
 
 pub fn is_eligible_group_message(msg: &Value) -> bool {
