@@ -137,3 +137,8 @@ unset BOT_TOKEN WEBHOOK_SECRET
 警告次数直接使用当前群、当前用户近 7 天的违规记录，达到三次后条形填满，超过三次仍显示实际次数。归档保留用户显示名称，供重审显示；匿名身份不归属具体用户次数。管理员日志的违规概率使用十格 Markdown 进度条及准确百分比；缺少群规或模型失败不展示虚构分数，省略空类别、重复群 ID、内部状态码与重复处罚说明。
 
 同一次 Queue 消费内按群复用成功获取的群规；命令和成员变更会清空本批缓存，失败查询不缓存。若群简介在批次处理中被外部修改，缓存可能短暂保留旧值，直到失效或下一批次。模型推理、归档、确认和重试仍逐条顺序处理。
+
+
+## 生产 D1 发布前校验
+
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 PR #11 之后的 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 仅表示缺少 `warning_adjustments`，此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。

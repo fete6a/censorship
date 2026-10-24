@@ -224,6 +224,11 @@ async fn review_with_policy_cache(
         store::finish_review(env,chat_id,msg_id,"dry_run_flag",&decision.category,decision.remove_probability).await?;
         return Ok(true);
     }
+    // Fail closed on missing warning schema before irreversible Telegram deletion.
+    // The post-insert count remains authoritative after concurrent adjustments.
+    if let Some(user_id) = user {
+        let _ = store::recent_strikes(env, chat_id, user_id).await?;
+    }
     tg::delete(env, chat_id, msg_id).await?;
 
     let mut notice = String::new();
