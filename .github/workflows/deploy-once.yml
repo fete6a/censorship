@@ -1,0 +1,17 @@
+name: One-time reviewed production deployment
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/deploy-once.yml]
+permissions:
+  contents: read
+  actions: write
+jobs:
+  dispatch:
+    if: ${{ github.repository == 'fete6a/censorship' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger migration-first deploy with repository Actions secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --repo fete6a/censorship --ref main -f deploy=true
