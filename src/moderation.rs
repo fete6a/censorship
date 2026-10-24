@@ -277,7 +277,7 @@ pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
         notice.push_str("匿名/频道身份：无法归属具体用户，不封禁。");
     }
     let notice=format!("违规消息 {msg_id} 已删除：{category}。\n{notice}");
-    tg::send_group_notice(env,chat_id,&notice).await;
+    tg::send_group_action_notice(env,chat_id,msg_id,user,"违规消息已删除",&notice).await;
     store::finish_review(env, chat_id, msg_id, "deleted", &decision.category, decision.remove_probability).await?;
     // Notification failure must not erase the successful deletion.
     let _ = tg::send_to_review_or_chat(env, chat_id, &notice).await;
@@ -355,7 +355,7 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
                 store::set_group_threshold(env,chat_id,value).await?;
             }
             let value=store::group_threshold(env,chat_id).await?;
-            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; delete when remove probability meets the threshold and category is not none; chosen action and separate confidences are informational.",value,value*100.0);
+            let reply=format!("Group {chat_id}: removal threshold {} ({}%). Applies to future reviews; the bot computes the status from Clef's violation probability and the category, with no model-selected allow action.",value,value*100.0);
             if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice(env,chat_id,&reply).await;}
         }
         "/dry-run" | "/dry_run" | "/logs" => {
@@ -494,13 +494,13 @@ async fn ensure_group_enrolled(env: &Env, chat: &Value) -> Result<bool> {
     Ok(matches!(status,"active"|"delete_only"))
 }
 
-pub async fn process_update(env: &Env, update: &Value) -> Result<()> {
+pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64)>> {
     let update_id=field_int(update,"update_id").ok_or_else(||fail("Telegram update lacks update_id"))?;
-    if store::is_update_done(env,update_id).await? {return Ok(());}
+    if store::is_update_done(env,update_id).await? {return Ok(None);}
     if let Some(change)=update.get("my_chat_member") {
         on_my_membership(env,change).await?;
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     }
     if let Some(change)=update.get("chat_member") {
         if let Some(id)=field_int(&change["chat"],"id") {
@@ -509,43 +509,45 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<()> {
             }
         }
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     }
     let msg=update.get("message").or_else(||update.get("edited_message"));
     let Some(msg)=msg else {
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     };
     // Private admin commands include the negative chat id as their first arg.
     if field_str(&msg["chat"],"type") == "private" {
         let _=handle_admin_command(env,msg).await?;
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     }
-    if tg::ids(msg).is_none() {return Ok(());}
+    if tg::ids(msg).is_none() {return Ok(None);}
     if !ensure_group_enrolled(env,&msg["chat"]).await? || !tg::is_eligible_group_message(msg) {
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     }
     if handle_admin_command(env,msg).await? {
         store::mark_update_done(env,update_id).await?;
-        return Ok(());
+        return Ok(None);
     }
-    if tg::message_has_payload(msg) {
+    let reviewed=if tg::message_has_payload(msg) {
         store::archive(env,msg).await?;
         review(env,msg,Mode::Live).await?;
-    }
+        tg::ids(msg)
+    } else {None};
     store::mark_update_done(env,update_id).await?;
-    Ok(())
+    Ok(reviewed)
 }
 
 /// Deal with user confirmations after the one-minute mute period.
-pub async fn process_queue_item(env: &Env, item: &Value) -> Result<()> {
+pub async fn process_queue_item(env: &Env, item: &Value) -> Result<Option<(i64,i64)>> {
     if field_str(item,"kind") == "ban_check" {
         let Some(chat_id)=field_int(item,"chat_id") else{return Err(fail("Timer missing chat_id"));};
         let Some(user_id)=field_int(item,"user_id") else{return Err(fail("Timer missing user_id"));};
         let Some(message_id)=field_int(item,"message_id") else{return Err(fail("Timer missing message_id"));};
-        finalize_pending(env,chat_id,user_id,message_id).await
+        finalize_pending(env,chat_id,user_id,message_id).await?;
+        Ok(None)
     } else {
         process_update(env,item).await
     }
@@ -590,7 +592,7 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
             let notice=format!(
                 "用户 {user_id} 在 60 秒管理员复核期内未被取消，现已执行封禁。"
             );
-            tg::send_group_notice(env,chat_id,&notice).await;
+            tg::send_group_action_notice(env,chat_id,message_id,Some(user_id),"封禁已执行",&notice).await;
             let _=tg::send_to_review_or_chat(env,chat_id,&notice).await;
             Ok(())
         },
