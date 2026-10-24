@@ -41,6 +41,24 @@ pub async fn user_is_admin(env: &Env, chat_id: i64, user_id: i64) -> Result<bool
     Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
 }
 
+/// Only for command authorization: inaccessible/nonexistent target groups
+/// cause terminal Telegram HTTP 400/403 errors that must not fill the DLQ.
+/// Leave moderation lookups strict and keep 429/5xx/network errors retryable.
+pub async fn user_is_admin_for_command(env: &Env, chat_id: i64, user_id: i64) -> Result<bool> {
+    let member = match api(env, "getChatMember", json!({"chat_id": chat_id, "user_id": user_id})).await {
+        Ok(member) => member,
+        Err(error) => {
+            let detail = error.to_string();
+            if detail.contains("Telegram method getChatMember failed (HTTP 400)") ||
+               detail.contains("Telegram method getChatMember failed (HTTP 403)") {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    };
+    Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
+}
+
 /// Private command replies and admin logs only.
 pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
     if chat_id <= 0 { return Ok(()); }

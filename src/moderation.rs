@@ -305,9 +305,10 @@ fn command_parts<'a>(env: &Env, message: &'a Value) -> Option<(&'a str, Vec<&'a 
 async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     let Some((cmd, words)) = command_parts(env,msg) else { return Ok(false); };
     let (origin_chat_id, _) = tg::ids(msg).ok_or_else(|| fail("Invalid command chat"))?;
-    let Some(actor) = tg::author(msg) else { return Ok(true); };
     let private = field_str(&msg["chat"], "type") == "private";
     if matches!(cmd, "/start" | "/help") {
+        // These commands only operate privately; group text must be moderated.
+        if !private { return Ok(false); }
         tg::send(env,origin_chat_id,concat!(
             "Commands for group administrators (private chat):\n",
             "/threshold GROUP_ID 0.75 (or 75%)\n/dry_run GROUP_ID on|off\n/logs GROUP_ID on|off\n/rules GROUP_ID\n/scan GROUP_ID MESSAGE_ID [enforce]\n",
@@ -320,6 +321,8 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
         )).await?;
         return Ok(true);
     }
+    // Anonymous group senders must not bypass moderation with a command prefix.
+    let Some(actor) = tg::author(msg) else { return Ok(private); };
     let (chat_id,args): (i64, Vec<&str>) = if private {
         let Some(group_id)=words.first().and_then(|v|v.parse::<i64>().ok()).filter(|id|*id<0) else {
             tg::send(env,origin_chat_id,"请指定群组 ID。例如：/cancel -1001234567890 12345678").await?;
@@ -329,9 +332,10 @@ async fn handle_admin_command(env: &Env, msg: &Value) -> Result<bool> {
     } else {
         (origin_chat_id,words)
     };
-    // Authorize the actor against the exact target group before reading its data.
-    if !tg::user_is_admin(env,chat_id,actor).await? {return Ok(true);}
-    if !store::can_review(env,chat_id).await? {return Ok(true);}
+    // A denied group command is still an ordinary group message to moderate.
+    // Private denials stay silent and acknowledge the update.
+    if !tg::user_is_admin_for_command(env,chat_id,actor).await? {return Ok(private);}
+    if !store::can_review(env,chat_id).await? {return Ok(private);}
     let enforce = args.iter().any(|s| *s == "enforce");
     match cmd {
         "/threshold" => {
