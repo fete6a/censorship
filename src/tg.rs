@@ -3,6 +3,7 @@ use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
 use crate::util::{fail, field_str, field_int, secret};
 use crate::body::response_bytes;
+use crate::formatting;
 
 pub async fn api(env: &Env, method: &str, args: Value) -> Result<Value> {
     let token = secret(env, "BOT_TOKEN")?;
@@ -59,24 +60,44 @@ pub async fn user_is_admin_for_command(env: &Env, chat_id: i64, user_id: i64) ->
     Ok(matches!(field_str(&member, "status"), "creator" | "administrator"))
 }
 
-/// Private command replies and admin logs only.
-pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
-    if chat_id <= 0 { return Ok(()); }
-    api(env, "sendMessage", json!({"chat_id": chat_id, "text": text})).await?;
+/// One safe Telegram MarkdownV2 sender for commands, digests and notices.
+async fn post_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
+    api(env, "sendMessage", json!({
+        "chat_id":chat_id, "text":markdown, "parse_mode":"MarkdownV2",
+        "link_preview_options":{"is_disabled":true}
+    })).await?;
     Ok(())
 }
 
-/// Public action notices must remain in the group where the action occurred.
-/// Independent of the private admin logs setting; delivery is best effort.
+/// Private command replies; dynamic text is escaped before adding formatting.
+pub async fn send(env: &Env, chat_id: i64, text: &str) -> Result<()> {
+    if chat_id <= 0 { return Ok(()); }
+    post_markdown(env,chat_id,&formatting::plain_notice("机器人管理",text)).await
+}
+
+/// Public group messages are best effort and never reissue completed punishment.
 pub async fn send_group_notice(env: &Env, chat_id: i64, text: &str) {
     if chat_id>=0 {return;}
-    if api(env,"sendMessage",json!({"chat_id":chat_id,"text":text})).await.is_err() {
+    if post_markdown(env,chat_id,&formatting::plain_notice("群组通知",text)).await.is_err() {
         worker::console_error!("group_notice_delivery_failed");
     }
 }
 
-/// Deliver only to current human administrators of this exact group. No global recipient.
-pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
+/// User mention links are generated solely from positive Telegram numeric IDs.
+/// Deleted message IDs remain plain text: they cannot reliably be opened.
+pub async fn send_group_action_notice(
+    env: &Env, chat_id: i64, message_id: i64, user_id: Option<i64>,
+    title: &str, text: &str
+) {
+    if chat_id>=0 {return;}
+    let body=formatting::action_notice(title,message_id,user_id,text);
+    if post_markdown(env,chat_id,&body).await.is_err() {
+        worker::console_error!("group_action_notice_delivery_failed");
+    }
+}
+
+/// Fetch current human administrators for the exact group; no global DM target.
+async fn send_admin_markdown(env: &Env, chat_id: i64, markdown: &str) -> Result<()> {
     if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
     let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
         Ok(value)=>value,
@@ -86,11 +107,28 @@ pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Resu
         for member in admins {
             if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
             if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
-                if send(env,user_id,&format!("Group {chat_id}\n{text}")).await.is_err() {
+                if post_markdown(env,user_id,markdown).await.is_err() {
                     worker::console_error!("group_admin_log_dm_failed");
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Enforcement, cancellation and scan notifications are independent of the
+/// compact passive review digests.
+pub async fn send_to_review_or_chat(env: &Env, chat_id: i64, text: &str) -> Result<()> {
+    let display=format!("群组 {}\n{}",chat_id,text);
+    send_admin_markdown(env,chat_id,&formatting::plain_notice("管理员通知",&display)).await
+}
+
+/// Queue batches group successful reviews by originating chat. A single admin
+/// lookup/DM is used per chunk, not per allowed message.
+pub async fn send_review_digest(env: &Env, chat_id: i64, rows: &[formatting::ReviewLine]) -> Result<()> {
+    if rows.is_empty() {return Ok(());}
+    for markdown in formatting::review_digest(chat_id,rows) {
+        send_admin_markdown(env,chat_id,&markdown).await?;
     }
     Ok(())
 }
