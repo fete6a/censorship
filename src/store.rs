@@ -215,11 +215,31 @@ pub async fn current_pending(env: &Env, chat_id: i64, user_id: i64) -> Result<Op
     ).bind(&[js_i64(chat_id),js_i64(user_id)])?.first::<PendingBan>(None).await
 }
 
+/// Fetch at most eight per Cron tick; never-attempted timers run before retries.
 pub async fn due_pending(env: &Env) -> Result<Vec<PendingBan>> {
     env.d1("DB")?.prepare(
         "SELECT chat_id,user_id,message_id,created_at,due_at,status FROM pending_bans \
-         WHERE status='pending' AND due_at<=? ORDER BY due_at,chat_id,user_id LIMIT 8"
+         WHERE status='pending' AND due_at<=?1 AND next_attempt_at<=?1 \
+         ORDER BY next_attempt_at,due_at,chat_id,user_id LIMIT 8"
     ).bind(&[js_i64(now())])?.all().await?.results::<PendingBan>()
+}
+
+/// Reserve a per-case retry slot *before* Telegram calls, including getChatMember.
+/// Keep status pending so admin /cancel can still win before atomic claim_due.
+/// Conditional D1 update also limits overlapping Cron/Queue attempts.
+/// Retry intervals are 60 seconds, then 120, capped at 240 seconds.
+pub async fn begin_pending_attempt(env: &Env, chat_id: i64, user_id: i64, message_id: i64) -> Result<bool> {
+    let attempted = env.d1("DB")?.prepare(
+        "UPDATE pending_bans SET attempt_count=attempt_count+1, \
+         next_attempt_at=unixepoch() + CASE WHEN attempt_count=0 THEN 60 \
+         WHEN attempt_count=1 THEN 120 ELSE 240 END \
+         WHERE chat_id=? AND user_id=? AND message_id=? AND status='pending' \
+         AND due_at BETWEEN unixepoch()-600 AND unixepoch() \
+         AND next_attempt_at<=unixepoch() \
+         RETURNING chat_id,user_id,message_id,created_at,due_at,status"
+    ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?
+      .first::<PendingBan>(None).await?;
+    Ok(attempted.is_some())
 }
 
 pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i64, due_at: i64) -> Result<()> {
@@ -227,8 +247,9 @@ pub async fn create_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i
         "INSERT INTO pending_bans(chat_id,user_id,message_id,created_at,due_at,status) \
          VALUES(?,?,?,?,?,'pending') ON CONFLICT(chat_id,user_id) DO UPDATE SET \
          message_id=excluded.message_id,created_at=excluded.created_at,due_at=excluded.due_at, \
-         status='pending',canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
-         WHERE pending_bans.status IN ('banned','canceled','failed')"
+         status='pending',next_attempt_at=0,attempt_count=0, \
+         canceled_by=NULL,cancellation_reason=NULL,resolved_at=NULL \
+         WHERE pending_bans.status IN ('banned','canceled','failed')
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id),js_i64(now()),js_i64(due_at)])?.run().await?;
     Ok(())
 }
@@ -273,6 +294,17 @@ pub async fn retry_pending(env: &Env, chat_id: i64, user_id: i64, message_id: i6
     env.d1("DB")?.prepare(
         "UPDATE pending_bans SET status='pending' WHERE chat_id=? AND user_id=? AND message_id=? AND status='processing'"
     ).bind(&[js_i64(chat_id),js_i64(user_id),js_i64(message_id)])?.run().await?;
+    Ok(())
+}
+
+/// Expire overdue pending rows even when backoff delays their next attempt.
+/// This preserves the original strict ten-minute expiry without batch starvation.
+pub async fn expire_overdue_pending(env: &Env) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE pending_bans SET status='canceled', \
+         cancellation_reason='timer_too_late',resolved_at=unixepoch() \
+         WHERE status='pending' AND due_at<unixepoch()-600"
+    ).run().await?;
     Ok(())
 }
 

@@ -558,6 +558,9 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
         store::cancel_pending_automatically(env,chat_id,user_id,message_id,"banning_disabled").await?;
         return Ok(());
     }
+    // Reserve a retry slot before any Telegram lookup, or the earliest failures
+    // monopolize all eight Cron slots. This leaves admin cancellation possible.
+    if !store::begin_pending_attempt(env,chat_id,user_id,message_id).await? {return Ok(());}
     // Never ban a promoted administrator or somebody who already left / was banned.
     // If Telegram is unreachable, do not issue a punitive API request.
     let member=tg::get_member(env,chat_id,user_id).await?;
@@ -595,7 +598,9 @@ pub async fn finalize_pending(env: &Env, chat_id:i64, user_id:i64, message_id:i6
 
 pub async fn process_pending_tick(env:&Env)->Result<()> {
     store::expire_stale_processing(env).await?;
-    // Snapshot each due case once; a failing API call cannot abort the batch.
+    store::expire_overdue_pending(env).await?;
+    // Snapshot only ready cases; persisted backoff rotates failed attempts
+    // behind fresh due timers, even if their Telegram requests keep failing.
     for case in store::due_pending(env).await? {
         if let Err(error) = finalize_pending(env,case.chat_id,case.user_id,case.message_id).await {
             console_error!("pending_case_failed chat={} user={} error={}",case.chat_id,case.user_id,error);
