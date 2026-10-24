@@ -293,20 +293,17 @@ pub async fn next_archived(env: &Env, job: &Job) -> Result<Option<ArchiveItem>> 
     ])?.first::<ArchiveItem>(None).await
 }
 
-#[derive(Deserialize)]
-struct ScanUpdateRow { chat_id: i64 }
-
 /// CAS fences the scan generation, Cron claim and original cursor.
 pub async fn advance_scan(env: &Env, job: &Job, message_id: i64, flagged: bool) -> Result<bool> {
     let updated=env.d1("DB")?.prepare(
         "UPDATE scan_jobs SET cursor_message_id=?,scanned=scanned+1,flagged=flagged+?,updated_at=unixepoch() \
          WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
-         AND cursor_message_id=? AND ?>cursor_message_id AND ?<=max_message_id RETURNING chat_id"
+         AND cursor_message_id=? AND ?>cursor_message_id AND ?<=max_message_id RETURNING chat_id AS count"
     ).bind(&[
         js_i64(message_id),js_i64(i64::from(flagged)),js_i64(job.chat_id),
         js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
         js_i64(message_id),js_i64(message_id),
-    ])?.first::<ScanUpdateRow>(None).await?;
+    ])?.first::<CountRow>(None).await?;
     Ok(updated.is_some())
 }
 
@@ -315,10 +312,10 @@ pub async fn finish_scan(env: &Env, job: &Job) -> Result<bool> {
     let finished=env.d1("DB")?.prepare(
         "UPDATE scan_jobs SET status='done',lease_until=0,updated_at=unixepoch() \
          WHERE chat_id=? AND generation=? AND lease_id=? AND status='running' AND lease_until>unixepoch() \
-         AND cursor_message_id=? RETURNING chat_id"
+         AND cursor_message_id=? RETURNING chat_id AS count"
     ).bind(&[
         js_i64(job.chat_id),js_i64(job.generation),js_i64(job.lease_id),js_i64(job.cursor_message_id),
-    ])?.first::<ScanUpdateRow>(None).await?;
+    ])?.first::<CountRow>(None).await?;
     Ok(finished.is_some())
 }
 

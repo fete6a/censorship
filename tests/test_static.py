@@ -189,7 +189,7 @@ class SmokeTests(unittest.TestCase):
         self.assertIn('update.get("my_chat_member")',src)
         self.assertIn('ensure_group_enrolled(env,&msg["chat"])',src)
         self.assertIn('member_capabilities(&event["new_chat_member"]',src)
-        self.assertIn('pub async fn reply_command(',tg)
+        self.assertIn('pub async fn reply_command_titled(',tg)
         self.assertIn('allow_sending_without_reply',tg)
         self.assertNotIn('GROUP_CHAT_ID',util)
         conf=json.loads((ROOT/'wrangler.jsonc').read_text())

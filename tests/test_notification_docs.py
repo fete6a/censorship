@@ -62,7 +62,7 @@ class NotificationDocumentationTests(unittest.TestCase):
     def test_private_log_recipients_and_log_switch_are_documented(self):
         delivery = self.telegram.split(
             "async fn send_admin_markdown(", 1
-        )[1].split("pub async fn send_to_review_or_chat(", 1)[0]
+        )[1].split("pub async fn send_to_review_or_chat_titled(", 1)[0]
         self.assertIn("group_logs(env,chat_id)", delivery)
         self.assertIn("getChatAdministrators", delivery)
         self.assertIn('member["user"]["is_bot"]==true', delivery)
@@ -81,7 +81,7 @@ class NotificationDocumentationTests(unittest.TestCase):
 
     def test_group_notices_remain_independent_of_private_logs(self):
         sender = self.telegram.split(
-            "pub async fn reply_command(", 1
+            "pub async fn reply_command_titled(", 1
         )[1].split("async fn send_admin_markdown(", 1)[0]
         self.assertIn('api(env,"sendMessage",args)', sender)
         self.assertIn("post_markdown(env,chat_id,", sender)

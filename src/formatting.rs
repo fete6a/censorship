@@ -62,10 +62,6 @@ pub fn notice(tone: NoticeTone, title: &str, text: &str) -> String {
     if body.is_empty() { heading } else { format!("{heading}\n\n{}", escape_md(body)) }
 }
 
-pub fn plain_notice(title: &str, text: &str) -> String {
-    notice(NoticeTone::Info, title, text)
-}
-
 pub fn message_link(chat_id: i64, message_id: i64) -> Option<String> {
     if message_id<=0 {return None;}
     let group=chat_id.to_string();

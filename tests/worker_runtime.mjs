@@ -99,13 +99,13 @@ function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remov
             const job=jobs.get(values[2]);
             if(!job||job.generation!==values[3]||job.lease_id!==values[4]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[5])return null;
             job.cursor_message_id=values[0];job.scanned++;job.flagged+=values[1];
-            return {chat_id:job.chat_id};
+            return {count:job.chat_id};
           }
           if (sql.startsWith("UPDATE scan_jobs SET status='done'")) {
             const job=jobs.get(values[0]);
             if(!job||job.generation!==values[1]||job.lease_id!==values[2]||job.status!=='running'||!job.claimed||job.cursor_message_id!==values[3])return null;
             job.status='done';job.claimed=false;
-            return {chat_id:job.chat_id};
+            return {count:job.chat_id};
           }
           if (sql.includes('FROM scan_jobs') || sql.startsWith('SELECT COUNT(*) AS count FROM scan_jobs')) {
             if(sql.includes('COUNT(*)')) {
@@ -482,7 +482,7 @@ await test('edits of the same message inside one window are deduplicated in the 
  assert.match(summary[0].args.text,/1 条/);
  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
  assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
- assert.equal(f.reviews.get(groupA+':17')?.last_status,'deleted');
+ assert.equal(f.reviews.get(groupA+':870')?.last_status,'deleted');
 });
 
 await test('MarkdownV2 action notice uses numeric Telegram links without exposing deleted message link',async()=>{
