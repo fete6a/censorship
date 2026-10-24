@@ -195,7 +195,7 @@ async fn review_with_policy_cache(
     let safe_mode = store::group_dry_run(env,chat_id).await?;
     if mode == Mode::Audit || safe_mode {
         store::finish_review(env, chat_id, msg_id,
-            if safe_mode { "dry_run_flag" } else { "audit_flag" },
+            if mode == Mode::Audit { "audit_flag" } else { "dry_run_flag" },
             &decision.category, decision.remove_probability).await?;
         return Ok(true);
     }
