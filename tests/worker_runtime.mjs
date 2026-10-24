@@ -1122,6 +1122,6 @@ await test('replayed warning update cannot erase a later strike in a new command
   f.completed.delete(3400);
   await f.consume(again);
   assert.equal(f.warningReceiptIds.size,1);
-  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/1\\/3/);
+  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/1\/3/);
 });
 
