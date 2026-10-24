@@ -68,8 +68,11 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
     // Punitive actions remain per-message and are acknowledged independently.
     // Passive admin DMs are grouped only after the individual D1 reviews commit.
     let mut reviewed: BTreeMap<i64, BTreeSet<i64>>=BTreeMap::new();
+    // A Queue delivery has a short lifetime. Reuse only successful group rule
+    // lookups; ordered classification and punishment are still sequential.
+    let mut policies: BTreeMap<i64, String> = BTreeMap::new();
     for message in batch.messages()? {
-        match moderation::process_queue_item(&env, message.body()).await {
+        match moderation::process_queue_item(&env, message.body(), &mut policies).await {
             Ok(entry) => {
                 message.ack();
                 if let Some((chat_id,message_id))=entry {
