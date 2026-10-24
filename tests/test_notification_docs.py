@@ -1,0 +1,122 @@
+"""Static guardrails for bilingual documentation of Telegram notification behavior.
+
+These inspect source defaults and send paths rather than treating either README
+as the authority. They run in the existing Python unittest discovery CI step.
+"""
+from pathlib import Path
+import re
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class NotificationDocumentationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        def read(path):
+            return (ROOT / path).read_text(encoding="utf-8")
+
+        cls.en = read("README.md")
+        cls.cn = read("README_CN.md")
+        cls.store = read("src/store.rs")
+        cls.telegram = read("src/tg.rs")
+        cls.moderation = read("src/moderation.rs")
+        cls.migration = read("migrations/0004_group_settings.sql")
+
+    def test_private_log_default_matches_code_migration_and_both_readmes(self):
+        function = re.search(
+            r"pub async fn group_logs\b.*?\{(.*?)\n\}",
+            self.store, re.DOTALL,
+        )
+        self.assertIsNotNone(function, "Cannot locate group_logs default")
+        fallback = re.search(r"\.unwrap_or\(\s*(true|false)\s*\)", function.group(1))
+        self.assertIsNotNone(fallback, "Cannot determine group_logs fallback")
+        default_enabled = fallback.group(1) == "true"
+
+        column = re.search(
+            r"\blogs_enabled\s+INTEGER\s+NOT\s+NULL\s+DEFAULT\s+([01])\b",
+            self.migration, re.IGNORECASE,
+        )
+        self.assertIsNotNone(column, "Cannot determine D1 logs_enabled default")
+        self.assertEqual(int(column.group(1)), int(default_enabled),
+                         "Unconfigured group and newly inserted group defaults differ")
+
+        expected = (
+            ("**Private administrator logs are on by default.**",
+             "**管理员私人审核日志默认开启。**")
+            if default_enabled else
+            ("**Private administrator logs are off by default.**",
+             "**管理员私人审核日志默认关闭。**")
+        )
+        unexpected = (
+            ("**Private administrator logs are off by default.**",
+             "**管理员私人审核日志默认关闭。**")
+            if default_enabled else
+            ("**Private administrator logs are on by default.**",
+             "**管理员私人审核日志默认开启。**")
+        )
+        for doc, required, forbidden in zip((self.en, self.cn), expected, unexpected):
+            self.assertIn(required, doc)
+            self.assertNotIn(forbidden, doc)
+
+    def test_private_log_recipients_and_log_switch_are_documented(self):
+        delivery = self.telegram.split(
+            "pub async fn send_to_review_or_chat(", 1
+        )[1].split("pub async fn delete(", 1)[0]
+        self.assertIn("group_logs(env,chat_id)", delivery)
+        self.assertIn("getChatAdministrators", delivery)
+        self.assertIn('member["user"]["is_bot"]==true', delivery)
+        self.assertIn("send(env,user_id,", delivery)
+        self.assertNotIn("ADMIN_DM_CHAT_ID",
+                         self.store + self.telegram + self.moderation)
+        for doc in (self.en, self.cn):
+            self.assertIn("`/logs off`", doc)
+            self.assertIn("`/logs on`", doc)
+            self.assertIn("`ADMIN_DM_CHAT_ID`", doc)
+            self.assertIn("`getChatAdministrators`", doc)
+            self.assertIn("`/start`", doc)
+        self.assertIn("current human administrators", self.en)
+        self.assertIn("当前人类管理员", self.cn)
+
+    def test_group_notices_remain_independent_of_private_logs(self):
+        sender = self.telegram.split(
+            "pub async fn send_group_notice(", 1
+        )[1].split("pub async fn send_to_review_or_chat(", 1)[0]
+        self.assertIn('api(env,"sendMessage"', sender)
+        self.assertNotIn("group_logs", sender)
+        review = self.moderation.split("pub async fn review(", 1)[1].split(
+            "fn command_parts(", 1
+        )[0]
+        self.assertIn("tg::delete(env, chat_id, msg_id).await?;", review)
+        self.assertIn("tg::send_group_notice(env,chat_id,&notice).await;", review)
+        self.assertIn("tg::ban(env,chat_id,user_id).await", self.moderation)
+        self.assertGreaterEqual(
+            self.moderation.count("tg::send_group_notice(env,chat_id,&notice).await;"), 2
+        )
+        self.assertIn("if private {tg::send(env,origin_chat_id,&reply).await?;} else {tg::send_group_notice", self.moderation)
+        self.assertIn("does not disable group action notices", self.en)
+        self.assertIn("不关闭群内处罚通知", self.cn)
+        self.assertIn("`/threshold`", self.en)
+        self.assertIn("`/threshold`", self.cn)
+
+    def test_permissions_privacy_and_security_claims(self):
+        for doc in (self.en, self.cn):
+            for prerequisite in ("can_delete_messages", "can_restrict_members",
+                                 "sendMessage", "getChatAdministrators", "DRY_RUN=true"):
+                self.assertIn(prerequisite, doc)
+        for section in ("## Notifications", "## Administrator commands",
+                        "## Configuration and deployment", "## Security and privacy"):
+            self.assertIn(section, self.en)
+        for obsolete in (
+            "Silent by design",
+            "No group notification privileges required",
+            "No group warning messages",
+            "the *only* unsolicited notification target",
+        ):
+            self.assertNotIn(obsolete, self.en)
+        self.assertIn("D1 archiving", self.en)
+        self.assertIn("D1 归档", self.cn)
+
+
+if __name__ == "__main__":
+    unittest.main()
