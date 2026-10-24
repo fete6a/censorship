@@ -161,8 +161,8 @@ pub async fn set_warning_count(
         return Err(fail("Invalid warning adjustment scope, user, count or update"));
     }
     let inserted = env.d1("DB")?.prepare(
-        "INSERT OR IGNORE INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) \
-         VALUES(?,?,?,?,?,?) RETURNING update_id AS count"
+        "INSERT INTO warning_edit_receipts(update_id,chat_id,user_id,base_count,actor_id,created_at) \
+         VALUES(?,?,?,?,?,?) ON CONFLICT(update_id) DO NOTHING RETURNING update_id AS count"
     ).bind(&[js_i64(update_id),js_i64(chat_id),js_i64(user_id),
         js_i64(count),js_i64(actor_id),js_i64(now())])?.first::<CountRow>(None).await?;
     Ok(inserted.is_some())
