@@ -62,6 +62,41 @@ class SmokeTests(unittest.TestCase):
         flagged=flagged+1 WHERE chat_id=-100 AND cursor_message_id=0''',(15,))
         self.assertEqual(self.db.execute('SELECT scanned,flagged FROM scan_jobs').fetchone(),(1,1))
 
+    def test_atomic_scan_start_and_cross_group_conflicts(self):
+        src=(ROOT / 'src/store.rs').read_text()
+        self.assertIn("WHERE scan_jobs.status!='running'",src)
+        self.assertIn('RETURNING max_message_id AS max_id',src)
+        sql="""INSERT INTO scan_jobs
+        (chat_id,cursor_message_id,max_message_id,scanned,flagged,enforce,status,started_at,updated_at)
+        VALUES (?,0,?,0,0,?,'running',?,?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+        cursor_message_id=0,max_message_id=excluded.max_message_id,
+        scanned=0,flagged=0,enforce=excluded.enforce,
+        status='running',started_at=excluded.started_at,updated_at=excluded.updated_at
+        WHERE scan_jobs.status!='running'
+        RETURNING max_message_id AS max_id"""
+        def start(chat,enforce):
+            return self.db.execute(sql,(chat,10,enforce,100,100)).fetchone()
+        self.assertEqual(start(-100,0),(10,))
+        self.db.execute('UPDATE scan_jobs SET cursor_message_id=7,scanned=3 WHERE chat_id=-100')
+        self.assertIsNone(start(-100,1))
+        self.assertEqual(self.db.execute('SELECT cursor_message_id,scanned,enforce FROM scan_jobs WHERE chat_id=-100').fetchone(),(7,3,0))
+        self.assertEqual(start(-200,1),(10,))
+        self.assertEqual(self.db.execute('SELECT enforce FROM scan_jobs WHERE chat_id=-200').fetchone(),(1,))
+        self.db.execute("UPDATE scan_jobs SET status='stopped' WHERE chat_id=-100")
+        self.assertEqual(start(-100,1),(10,))
+        self.assertEqual(self.db.execute('SELECT cursor_message_id,scanned,enforce FROM scan_jobs WHERE chat_id=-100').fetchone(),(0,0,1))
+
+    def test_scan_defaults_match_help_and_bilingual_readmes(self):
+        src=(ROOT/'src/moderation.rs').read_text()
+        en=(ROOT/'README.md').read_text()
+        cn=(ROOT/'README_CN.md').read_text()
+        self.assertIn('[] | ["enforce"] => true',src)
+        self.assertIn('["audit"] => false',src)
+        self.assertIn('/scan_all [audit|enforce]',src)
+        self.assertIn('enforcement by default',en)
+        self.assertIn('默认请求执行处罚',cn)
+
     def test_auto_onboard_and_command_replies(self):
         src=(ROOT/'src/moderation.rs').read_text()
         tg=(ROOT/'src/tg.rs').read_text()
