@@ -521,9 +521,9 @@ await test('high violation score with category none is needs_review instead of a
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
 });
-await test('other category behaves like none, never punishing or preserving other in reviews',async()=>{
-  for(const [score,expected] of [[0.99,'needs_review'],[0.6,'allow']]){
-    const f=fixture({remove:true,score,categoryChoice:'other'});
+await test('other and adult categories behave like none, without punishment or distinct stored categories',async()=>{
+  for(const categoryChoice of ['none','other','adult']) for(const [score,expected] of [[0.99,'needs_review'],[0.6,'allow']]){
+    const f=fixture({remove:true,score,categoryChoice});
     f.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.8});
     await f.consume(message(groupA,1707));
     assert.deepEqual(f.reviews.get(`${groupA}:1707`),
@@ -533,6 +533,7 @@ await test('other category behaves like none, never punishing or preserving othe
     const digest=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id>0)?.args.text||'';
     assert.ok(digest.includes(expected==='needs_review'?'人工复核':'通过'));
     assert.ok(!digest.includes('其他违反群规'));
+    assert.ok(!digest.includes('不当成人内容'));
   }
 });
 await test('score below threshold is allow as computed by Rust, not a model label',async()=>{
