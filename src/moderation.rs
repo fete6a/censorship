@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use worker::{console_error, console_log, Env, Result};
 use crate::{media, store, tg};
 use crate::util::{config, fail, field_int, field_str, flag, now};
@@ -147,8 +148,25 @@ fn category_name(category: &str) -> &'static str {
 /// An AI failure, a missing group description, and unsupported media
 /// always result in zero punitive actions (fail open).
 pub async fn review(env: &Env, msg: &Value, mode: Mode) -> Result<bool> {
+    review_with_policy_cache(env, msg, mode, None).await
+}
+
+/// A Queue invocation may reuse a successfully fetched description for the same
+/// group. Never cache failures or share policies across groups or invocations.
+/// Commands and membership updates invalidate the caller's cache.
+async fn review_with_policy_cache(
+    env: &Env, msg: &Value, mode: Mode, mut policies: Option<&mut BTreeMap<i64, String>>
+) -> Result<bool> {
     let (chat_id, msg_id) = tg::ids(msg).ok_or_else(|| fail("Missing message ID"))?;
-    let rules = match tg::group_rules(env, chat_id).await {
+    let cached = policies.as_ref().and_then(|p| p.get(&chat_id).cloned());
+    let rules_result = match cached {
+        Some(rules) => Ok(rules),
+        None => tg::group_rules(env, chat_id).await,
+    };
+    if let Ok(rules) = &rules_result {
+        if let Some(cache) = policies.as_mut() { cache.insert(chat_id, rules.clone()); }
+    }
+    let rules = match rules_result {
         Ok(p) if !p.trim().is_empty() => p,
         Ok(_) => {
             store::finish_review(env, chat_id, msg_id, "no_group_description", "none", 0.0).await?;
@@ -495,14 +513,22 @@ async fn ensure_group_enrolled(env: &Env, chat: &Value) -> Result<bool> {
 }
 
 pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64)>> {
+    process_update_with_policy_cache(env, update, &mut BTreeMap::new()).await
+}
+
+async fn process_update_with_policy_cache(
+    env: &Env, update: &Value, policies: &mut BTreeMap<i64, String>
+) -> Result<Option<(i64,i64)>> {
     let update_id=field_int(update,"update_id").ok_or_else(||fail("Telegram update lacks update_id"))?;
     if store::is_update_done(env,update_id).await? {return Ok(None);}
     if let Some(change)=update.get("my_chat_member") {
+        policies.clear();
         on_my_membership(env,change).await?;
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     }
     if let Some(change)=update.get("chat_member") {
+        policies.clear();
         if let Some(id)=field_int(&change["chat"],"id") {
             if store::can_review(env,id).await? {
                 cancel_from_member_update(env,change).await?;
@@ -516,6 +542,11 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64
         store::mark_update_done(env,update_id).await?;
         return Ok(None);
     };
+    // Commands may alter moderation configuration. Conservatively invalidate
+    // policy snapshots before command processing (including private commands).
+    if field_str(msg, "text").trim_start().starts_with('/') {
+        policies.clear();
+    }
     // Private admin commands include the negative chat id as their first arg.
     if field_str(&msg["chat"],"type") == "private" {
         let _=handle_admin_command(env,msg).await?;
@@ -533,7 +564,7 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64
     }
     let reviewed=if tg::message_has_payload(msg) {
         store::archive(env,msg).await?;
-        review(env,msg,Mode::Live).await?;
+        review_with_policy_cache(env,msg,Mode::Live,Some(policies)).await?;
         tg::ids(msg)
     } else {None};
     store::mark_update_done(env,update_id).await?;
@@ -541,7 +572,9 @@ pub async fn process_update(env: &Env, update: &Value) -> Result<Option<(i64,i64
 }
 
 /// Deal with user confirmations after the one-minute mute period.
-pub async fn process_queue_item(env: &Env, item: &Value) -> Result<Option<(i64,i64)>> {
+pub async fn process_queue_item(
+    env: &Env, item: &Value, policies: &mut BTreeMap<i64, String>
+) -> Result<Option<(i64,i64)>> {
     if field_str(item,"kind") == "ban_check" {
         let Some(chat_id)=field_int(item,"chat_id") else{return Err(fail("Timer missing chat_id"));};
         let Some(user_id)=field_int(item,"user_id") else{return Err(fail("Timer missing user_id"));};
@@ -549,7 +582,7 @@ pub async fn process_queue_item(env: &Env, item: &Value) -> Result<Option<(i64,i
         finalize_pending(env,chat_id,user_id,message_id).await?;
         Ok(None)
     } else {
-        process_update(env,item).await
+        process_update_with_policy_cache(env,item,policies).await
     }
 }
 
