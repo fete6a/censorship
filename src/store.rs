@@ -261,6 +261,10 @@ pub async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[js_i64(now()-14*86400)])?.run().await?;
     env.d1("DB")?.prepare("DELETE FROM violations WHERE created_at<?")
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
+    // Retain replay receipts longer than processed_updates (14 days) so a
+    // delayed duplicate cannot shift a manual warning baseline.
+    env.d1("DB")?.prepare("DELETE FROM warning_edit_receipts WHERE created_at<?")
+        .bind(&[js_i64(now()-30*86400)])?.run().await?;
     // Expired manual baselines must not linger indefinitely.
     env.d1("DB")?.prepare("DELETE FROM warning_adjustments WHERE adjusted_at<?")
         .bind(&[js_i64(now()-7*86400)])?.run().await?;
