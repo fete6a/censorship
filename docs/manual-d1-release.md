@@ -3,17 +3,17 @@
 GitHub Actions builds and tests only. Green CI never proves that production D1 was migrated.
 
 1. Confirm production Cloudflare account and D1 DB binding against wrangler.jsonc. Record a D1 Time Travel recovery bookmark and the currently deployed Worker version; a full data export is a separate operation requiring appropriate authorization. Do not apply schema/current.sql on existing data.
-2. On an authenticated operator machine, run: python3 tools/check_d1_schema.py --remote --pre-migration
+2. On an authenticated operator machine, run: cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote --pre-migration
    Exit 0 = required warning objects and scan-fencing columns ready; exit 3 = known additive migration needed; exit 2 = incompatible or ambiguous schema, STOP.
 3. Only after exit 3, run the additive idempotent schema/ensure_warning_adjustments.sql manually via authorized Cloudflare connector or: npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql
    Also apply exactly the missing scan_jobs ALTER statements printed by the preflight. These come from schema/ensure_scan_fencing.sql. The full scan migration is one-time, not idempotent: do not repeat existing columns. A partially applied scan migration is resumable using only the remaining printed statements. Historical jobs and messages are preserved.
-4. Verify: python3 tools/check_d1_schema.py --remote ; exit 0 is MANDATORY. Recheck immediately before Worker upload. An existing wrong-shape table or trigger is not repaired by CREATE IF NOT EXISTS.
+4. Verify: cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote ; exit 0 is MANDATORY. Recheck immediately before Worker upload. An existing wrong-shape table or trigger is not repaired by CREATE IF NOT EXISTS.
 5. Verify the exact main commit, green Rust/SQLite/Wasm tests, and downloaded artifact SHA-256. Manually upload unchanged modules with Cloudflare MCP. Keep bindings, Secrets, Queues, Cron, and webhook. Do not enable production deployment in GitHub Actions.
 6. Verify active version, /healthz, Queue errors and a harmless dry-run review. If rollout fails, return to previous Worker artifact, not a destructive database rollback.
 
 The production batch reads sqlite_master and literal PRAGMA table_info only, never message contents or production rows. It verifies tables, column metadata, primary keys, indexes, warning constraints and the exact required receipt-trigger definition. Canonical trigger behavior is also tested on disposable in-memory SQLite dummy rows, not against production. Extra D1 migration-ledger tables remain intact. Any missing core object or incompatible version blocks release; operator investigation is required.
 
-Optional Cloudflare connector route: run the read-only batch printed by python3 tools/check_d1_schema.py --print-inspection-sql against the same DB, save all successful statement responses in Wrangler-compatible JSON, and run: python3 tools/check_d1_schema.py --from-json response.json
+Optional Cloudflare connector route: run the read-only batch printed by cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --print-inspection-sql against the same DB, save all successful statement responses in Wrangler-compatible JSON, and run: cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --from-json response.json
 
 ## Recovery from partial execution
 
@@ -21,7 +21,7 @@ Old Workers could delete a Telegram message and record a strike, then fail at wa
 
 The new Worker checks the warning-count SQL before irreversible Telegram deletion for attributed senders. It counts again after recording the genuine strike to account for concurrent manual adjustments. A failure after deletion can still be partial and requires investigation. Never substitute an old-schema warning count: that silently changes escalation decisions. Cleanup ignores only the exact missing warning_adjustments or warning_edit_receipts table error and propagates other D1 failures.
 
-Run python3 -m unittest discover -s tests -v and the existing Rust/Wasm CI. tests/fixtures/schema_before_warning_adjustments.sql reproduces the actual pre-PR11 schema in ephemeral SQLite, not production D1. Tests exercise preservation, idempotence, wrong-shape tables, partial SQL failures and mismatched old versions.
+Run cargo test --manifest-path tools/maintenance/Cargo.toml and the existing Rust/Wasm CI. tests/fixtures/schema_before_warning_adjustments.sql reproduces the actual pre-PR11 schema in ephemeral SQLite, not production D1. Tests exercise preservation, idempotence, wrong-shape tables, partial SQL failures and mismatched old versions.
 
 ## PR #11 / #13 migration compatibility
 

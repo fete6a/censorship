@@ -18,14 +18,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Python and SQLite tests
-        run: python3 -m unittest discover -s tests -v
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - name: Rust unit tests
         run: |
+          cargo test --manifest-path tools/maintenance/Cargo.toml --locked
           cargo test --lib
           cargo test --manifest-path tools/history-import/Cargo.toml
           cargo test --manifest-path transcoder/Cargo.toml

@@ -127,7 +127,7 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 通过 Cloudflare MCP 手动部署与群组导航
 
-下载 main 成功构建的 Worker 产物，核对 SHA-256 和源提交；先记录当前 Worker 版本与 D1 Time Travel 恢复书签。通过已授权 Cloudflare MCP 执行 `python3 tools/check_d1_schema.py --print-inspection-sql` 打印的只读元数据及 PRAGMA 批次，将成功结果保存为 JSON，并用 `--from-json response.json --pre-migration` 校验。按输出补齐增量迁移，再去掉 `--pre-migration` 复查（必须退出 0），然后将原始 `index.js` 和二进制 `index_bg.wasm` 作为模块上传，不重新打包。保留现有绑定、变量、密钥、兼容性与可观测性配置，发布后核对活动版本和 `/healthz`。数据库内容、Queue 消费者、Cron 和 Telegram Webhook 配置保留。
+下载 main 成功构建的 Worker 产物，核对 SHA-256 和源提交；先记录当前 Worker 版本与 D1 Time Travel 恢复书签。通过已授权 Cloudflare MCP 执行 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --print-inspection-sql` 打印的只读元数据及 PRAGMA 批次，将成功结果保存为 JSON，并用 `--from-json response.json --pre-migration` 校验。按输出补齐增量迁移，再去掉 `--pre-migration` 复查（必须退出 0），然后将原始 `index.js` 和二进制 `index_bg.wasm` 作为模块上传，不重新打包。保留现有绑定、变量、密钥、兼容性与可观测性配置，发布后核对活动版本和 `/healthz`。数据库内容、Queue 消费者、Cron 和 Telegram Webhook 配置保留。
 
 管理员私聊摘要和处罚日志增加当前群名、群 ID 与可点击链接：公开群使用用户名链接；私有群优先使用已存在的 Telegram 邀请链接，否则链接到仍存在的已审核消息，供群成员进入。不会新建邀请链接。元数据不可用时回退到群 ID 和可用消息链接。群名安全转义，收件人仍只限目标群当前人类管理员。
 
@@ -140,7 +140,7 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 生产 D1 发布前校验
 
-GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `python3 tools/check_d1_schema.py --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `python3 tools/check_d1_schema.py --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
 
 发布预检同时检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。
 
@@ -155,3 +155,9 @@ GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Wor
 联合发布预检也要求扫描租约字段完整。`--pre-migration` 会打印尚缺少的扫描 `ALTER` 语句；只执行这些语句，不要重复运行已部分执行的扫描迁移。停止后已发出的禁言可能仍然完成，但过期扫描不能再创建待封禁任务。
 
 警告编辑以 Telegram 更新 ID 去重。清理旧违规后，新违规 ID 仍高于有效人工基线，避免重用 rowid 导致漏计。不要独立重建或 VACUUM 违规表，除非同时保留其与警告基线的顺序关系。
+
+## 实现语言与本地检查
+
+生产审核逻辑、历史导入器、转码服务均使用 Rust。D1 发布预检及离线 SQLite、源码和文档回归测试也已迁入独立的 [Rust 维护工具包](tools/maintenance/README.md)，不再需要 Python。运行 `cargo test --manifest-path tools/maintenance/Cargo.toml --locked` 即可执行。维护工具的本地 SQLite 等依赖不会链接进生产 Wasm。
+
+保留的手写 JavaScript 是 `tests/worker_runtime.mjs`，用于加载真实编译产物，验证 Cloudflare 的 JS/Wasm 边界及模拟外部服务；改为纯原生 Rust 测试会失去这部分集成覆盖。`build/index.js` 由 SDK 自动生成，是当前部署路径所需的 Wasm 加载胶水。Node/Wrangler 仍用于构建及本地开发，不承担手写的审核业务逻辑。
