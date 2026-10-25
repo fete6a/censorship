@@ -1,0 +1,205 @@
+//! Bounded, best-effort link evidence obtained with the Worker's native fetch.
+//! A link/page is untrusted data, never a source of moderation instructions.
+use std::collections::BTreeSet;
+use std::net::IpAddr;
+use serde_json::{json, Value};
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url};
+use crate::body::response_bytes;
+use crate::util::field_str;
+
+const MAX_URLS: usize = 2;
+const MAX_URL_LEN: usize = 2048;
+const MAX_PAGE_BYTES: usize = 256 * 1024;
+const MAX_EXCERPT: usize = 2400;
+const MAX_REDIRECTS: usize = 2;
+
+fn parse_url(input: &str, allow_bare: bool) -> Option<Url> {
+    let trimmed = input.trim_matches(|c: char| matches!(c,
+        ' ' | '\n' | '\r' | '\t' | '<' | '>' | '"' | '\'' |
+        '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '!' | '.'));
+    if trimmed.len() > MAX_URL_LEN || trimmed.is_empty() { return None; }
+    let candidate = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        trimmed.to_owned()
+    } else if trimmed.starts_with("www.") || (allow_bare && trimmed.contains('.')) {
+        format!("https://{trimmed}")
+    } else {
+        return None;
+    };
+    Url::parse(&candidate).ok().filter(|u| matches!(u.scheme(),"http"|"https"))
+}
+
+fn safe_target(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http"|"https") ||
+        !url.username().is_empty() || url.password().is_some() ||
+        url.port().is_some() { return false; }
+    let Some(host) = url.host_str() else { return false; };
+    if host.len()>253 || host.parse::<IpAddr>().is_ok() || !host.contains('.') ||
+        !host.is_ascii() || host.ends_with('.') { return false; }
+    // Reject local/special-use names and malformed DNS names. The Cloudflare
+    // network also enforces restrictions on destinations; this validation
+    // is not intended to be a DNS resolver or a guarantee against rebinding.
+    if ["localhost","local","internal","lan","home","test","invalid","example",
+        "onion","arpa","corp"].iter().any(|suffix|host==*suffix ||
+            host.ends_with(&format!(".{suffix}"))) { return false; }
+    host.split('.').all(|label| !label.is_empty() && label.len()<=63 &&
+        !label.starts_with('-') && !label.ends_with('-') &&
+        label.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-'))
+}
+
+fn utf16_span(text: &str, offset: usize, length: usize) -> Option<String> {
+    if length==0 || length>MAX_URL_LEN || offset>text.len()*2 {return None;}
+    let units:Vec<u16>=text.encode_utf16().collect();
+    let end=offset.checked_add(length)?;
+    String::from_utf16(units.get(offset..end)?).ok()
+}
+
+fn collect(msg: &Value) -> Vec<Url> {
+    let mut seen=BTreeSet::new();
+    let mut urls=Vec::new();
+    let mut add=|raw:&str, bare:bool| {
+        if urls.len()>=MAX_URLS {return;}
+        if let Some(url)=parse_url(raw,bare) {
+            let key=url.as_str().to_string();
+            if seen.insert(key) { urls.push(url); }
+        }
+    };
+    for (text_key, entities_key) in [("text","entities"),("caption","caption_entities")] {
+        let text=field_str(msg,text_key);
+        if let Some(entities)=msg[entities_key].as_array() {
+            for entity in entities.iter().take(32) {
+                match field_str(entity,"type") {
+                    "text_link" => add(field_str(entity,"url"),true),
+                    "url" => if let (Some(start),Some(length))=(entity["offset"].as_u64(),entity["length"].as_u64()) {
+                        if let Some(raw)=utf16_span(text,start as usize,length as usize) {add(&raw,true);}
+                    },
+                    _=>{},
+                }
+            }
+        }
+        for raw in text.split_whitespace().take(256) {add(raw,false);}
+    }
+    urls
+}
+
+fn public_url(url:&Url)->String {
+    let mut safe=url.clone();
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.as_str().chars().take(350).collect()
+}
+
+fn excerpt(bytes:&[u8], html:bool)->String {
+    let text=String::from_utf8_lossy(bytes);
+    let mut out=String::new();
+    let mut in_tag=false;
+    let mut space=false;
+    for ch in text.chars() {
+        if html && ch=='<' {in_tag=true;continue;}
+        if html && ch=='>' {in_tag=false;space=true;continue;}
+        if in_tag {continue;}
+        if ch.is_control() || ch.is_whitespace() {
+            if !space && !out.is_empty() {out.push(' ');space=true;}
+        } else {
+            out.push(ch);space=false;
+        }
+        if out.chars().count()>=MAX_EXCERPT {break;}
+    }
+    out.trim().to_owned()
+}
+
+/// Return a JSON array of bounded page evidence. Network errors and
+/// blocked/unsupported URLs cannot prevent reviewing the original message.
+pub async fn evidence(msg: &Value) -> Vec<Value> {
+    let mut results=Vec::new();
+    for url in collect(msg) {
+        let displayed=public_url(&url);
+        if !safe_target(&url) {
+            results.push(json!({"url":displayed,"status":"blocked_target"}));
+            continue;
+        }
+        let mut current=url;
+        let mut result=json!({"url":displayed,"status":"unavailable"});
+        for hop in 0..=MAX_REDIRECTS {
+            let headers=Headers::new();
+            if headers.set("Accept","text/html,text/plain,application/json;q=0.8").is_err() ||
+                headers.set("Range","bytes=0-262143").is_err() {break;}
+            let mut init=RequestInit::new();
+            init.with_method(Method::Get).with_headers(headers).with_redirect(RequestRedirect::Manual);
+            let Ok(request)=Request::new_with_init(current.as_str(),&init) else {break;};
+            let Ok(mut response)=Fetch::Request(request).send().await else {break;};
+            let code=response.status_code();
+            if (300..400).contains(&code) {
+                if hop==MAX_REDIRECTS {
+                    result["status"]=json!("redirect_limit");
+                    break;
+                }
+                let next=response.headers().get("Location").ok().flatten()
+                    .and_then(|location|current.join(&location).ok());
+                if let Some(next)=next {
+                    if !safe_target(&next) {
+                        result["status"]=json!("blocked_redirect");
+                        break;
+                    }
+                    current=next;
+                    continue;
+                }
+                result["status"]=json!("invalid_redirect");
+                break;
+            }
+            result["final_url"]=json!(public_url(&current));
+            result["http_status"]=json!(code);
+            if !(200..300).contains(&code) {
+                result["status"]=json!("http_error");break;
+            }
+            let mime=response.headers().get("Content-Type").ok().flatten().unwrap_or_default();
+            let mime=mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            if !(mime.starts_with("text/") || mime=="application/json" ||
+                mime=="application/xhtml+xml") {
+                result["status"]=json!("non_text_content");
+                break;
+            }
+            result["mime"]=json!(mime);
+            match response_bytes(&mut response,MAX_PAGE_BYTES).await {
+                Ok(bytes)=>{
+                    result["status"]=json!("fetched");
+                    result["excerpt"]=json!(excerpt(&bytes,mime=="text/html" || mime=="application/xhtml+xml"));
+                }
+                Err(_)=>result["status"]=json!("response_too_large_or_unreadable"),
+            }
+            break;
+        }
+        results.push(result);
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn excludes_local_and_credentialed_targets() {
+        for target in ["http://127.0.0.1/", "https://[::1]/","https://example.local/",
+            "https://u:p@example.org/","https://example.org:8080/","http://a.internal/",
+            "https://localhost/","ftp://example.org/","https://169.254.169.254/"] {
+            if let Some(url)=parse_url(target,false) {assert!(!safe_target(&url),"{target}");}
+        }
+        assert!(safe_target(&parse_url("https://example.org/a",false).unwrap()));
+    }
+    #[test]
+    fn collects_raw_and_hidden_links_and_utf16_offsets() {
+        let msg=json!({"text":"🔒 See https://a.example.org/x, and docs.example.org",
+            "entities":[{"type":"url","offset":7,"length":24},
+                        {"type":"text_link","url":"https://b.example.org/path","offset":36,"length":2}]});
+        let links=collect(&msg);
+        assert_eq!(links.len(),2);
+        assert_eq!(links[0].host_str(),Some("b.example.org"));
+        assert_eq!(links[1].host_str(),Some("a.example.org"));
+        assert_eq!(utf16_span("🔒AB",2,2).as_deref(),Some("AB"));
+    }
+    #[test]
+    fn never_exposes_query_secrets_as_page_urls() {
+        let url=parse_url("https://example.org/path?token=secret#fragment",false).unwrap();
+        assert_eq!(public_url(&url),"https://example.org/path");
+    }
+}
