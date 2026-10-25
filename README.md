@@ -150,3 +150,12 @@ Use `/logs on|warn|off` in the group, or `/logs -100GROUP_ID on|warn|off` privat
 Command replies and group action notices always remain independent of these modes. The mode is persisted per group, survives restarts and does not change dry-run, thresholds, penalties or archiving. `on` restores full logging after `warn`; delivery rechecks the mode after external lookups before rendering digests.
 
 Existing deployments require the additive `group_settings.logs_warn_only` column. Run the Rust preflight in `--pre-migration` mode, execute only the missing ALTER printed from `schema/ensure_log_filter.sql`, then require a normal preflight exit 0 before uploading this Worker. Existing groups keep their previous on/off setting and default all-log behavior. This is a one-time ALTER; do not rerun it if the column already exists.
+
+
+### Extended message and URL review
+
+- Telegram text/caption, ordinary supported image/audio/video files, stickers, documents of recognized media MIME types, and supported metadata-only messages (polls, locations, venues, contacts, dice, games, paid-media notices, stories, giveaways, payment notices and video-chat events) are eligible for review. Text-only or structured metadata is evaluated with **Clef-flash**; actual supported image/audio/video bytes use **Clef-omni**. Not all Telegram media formats are decodable: unsupported and oversized files receive a review-error status rather than a false text-only clearance.
+- HTTP(S) links in text/caption and Telegram URL/text-link entities are inspected using the **Worker's built-in Rust outbound fetch** (up to two distinct URLs per message). This is untrusted evidence, not an independent enforcement rule. Requests restrict hostnames, credentials, ports, redirections, body size and accepted content types; only short text excerpts enter the model. Failed and blocked fetches do not imply an offense. The bot does not execute web scripts or scan content behind logins, and linked media files are not decoded.
+- Contact phone numbers, exact shared coordinates and payment payloads are omitted from the AI structured summary. Archived Telegram metadata may still include sensitive values; configure `ARCHIVE_DAYS` and `/logs` according to group privacy requirements.
+- **Telegram Bot API limitation:** `deleteMessage` can delete messages only within its applicable time window (normally 48 hours), even if the sender was a group administrator. The administrator exemption applies to automatic bans, not to this API deletion-age limit.
+
