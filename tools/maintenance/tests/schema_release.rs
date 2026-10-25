@@ -296,6 +296,7 @@ fn scan_migration_resumes_each_partial_state_preserving_jobs() {
     );
     batch(&db, ENSURE_WARNINGS);
     batch(&db, ENSURE_LOG_FILTER);
+    batch(&db, ENSURE_CLEANUP);
     let statements = scan_migrations(&inspect_sqlite(&db).unwrap());
     assert_eq!(statements.len(), 3);
     for (i, s) in statements.iter().enumerate() {
