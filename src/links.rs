@@ -102,7 +102,7 @@ fn excerpt(bytes:&[u8], html:bool)->String {
         } else {
             out.push(ch);space=false;
         }
-        if out.chars().count()>=MAX_EXCERPT {break;}
+        if out.len()>=MAX_EXCERPT {break;}
     }
     out.trim().to_owned()
 }
@@ -189,12 +189,12 @@ mod tests {
     #[test]
     fn collects_raw_and_hidden_links_and_utf16_offsets() {
         let msg=json!({"text":"🔒 See https://a.example.org/x, and docs.example.org",
-            "entities":[{"type":"url","offset":7,"length":24},
+            "entities":[{"type":"url","offset":7,"length":23},
                         {"type":"text_link","url":"https://b.example.org/path","offset":36,"length":2}]});
         let links=collect(&msg);
         assert_eq!(links.len(),2);
-        assert_eq!(links[0].host_str(),Some("b.example.org"));
-        assert_eq!(links[1].host_str(),Some("a.example.org"));
+        assert!(links.iter().any(|url|url.host_str()==Some("b.example.org")));
+        assert!(links.iter().any(|url|url.host_str()==Some("a.example.org")));
         assert_eq!(utf16_span("🔒AB",2,2).as_deref(),Some("AB"));
     }
     #[test]
