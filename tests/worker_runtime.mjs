@@ -598,6 +598,24 @@ await test('warn mode keeps only flagged rows in mixed digests while another gro
  assert.match(a,/1 条/);assert.ok(a.includes('2301'));assert.ok(!a.includes('2300'));assert.match(a,/模拟命中/);
  assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===21&&c.args.text.includes('2302')));
 });
+await test('retryable policy lookup errors alert only permitted admins in on or warn modes',async()=>{
+ for(const mode of ['on','warn','off']) {
+  const f=fixture({policyFail:true});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:mode==='off'?0:1,logs_warn_only:mode==='warn'?1:0});
+  await f.consume(message(groupA,2390),{retry:true});
+  assert.equal(f.reviews.get(`${groupA}:2390`)?.last_status,'policy_unavailable');
+  assert.equal(f.completed.has(2390),false,'retryable error must not be acknowledged');
+  assert.equal(f.telegram.some(c=>['deleteMessage','banChatMember','restrictChatMember'].includes(c.method)),false);
+  const notices=f.telegram.filter(c=>c.method==='sendMessage');
+  if (mode==='off') assert.equal(notices.length,0);
+  else {
+   assert.equal(notices.length,1,'send only a scoped warning on this attempt');
+   assert.equal(notices[0].args.chat_id,11,'use the current human administrator, not a global target');
+   assert.match(notices[0].args.text,/群规查询失败/);
+   assert.match(notices[0].args.text,/2390/);
+  }
+ }
+});
 await test('warn mode retains audit hits, uncertain decisions and inference failures without fake scores',async()=>{
  for(const options of [{remove:true},{remove:true,score:.99,categoryChoice:'none'},{aiFail:true},{rules:''}]) {
   const f=fixture(options);f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});await f.consume(message(groupA,2400));
