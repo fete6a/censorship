@@ -109,7 +109,7 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 数据与风险
 
-- 消息文字、caption 和 Telegram 媒体 `file_id` 将保存在 D1；媒体字节在审核时临时下载给 Workers AI，并不长期保存。`ARCHIVE_DAYS=0` 表示不自动清理归档，请根据隐私需求修改。
+- 消息文字、caption 和 Telegram 媒体 `file_id` 将保存在 D1；媒体字节在审核时临时下载给 Workers AI，并不长期保存。`ARCHIVE_DAYS=0` 表示不自动清理归档，请根据隐私需求修改。此设置仅控制 `archived_messages`，不影响其他 D1 表或已发送的 Telegram 日志。必须明确设置非负整数；缺失、非法、负数或溢出的配置现在会报告清理错误，不会静默转成无限期保留；其他固定期限的 D1 清理保持独立。
 - Bot Token 是管理员凭据，**必须通过 BotFather 轮换用户曾在聊天中贴出的密钥**，不可上传到 GitHub。Webhook secret 另用随机字符串。
 - **通知与隐私：** 默认私聊审核日志会披露群组 ID、消息 ID、群主显示名称及数字 ID 个人资料链接、状态、分类、置信度等元数据；处罚公告会披露违规消息 ID、类别以及适用时的用户 ID 和处罚状态，但不会转发原文。`/logs off` 不会删除已发送日志、不影响 D1 归档与保留期、不关闭 Worker 控制台日志或群内公告。机器人被移出群、无群内发言能力、无法获取管理员列表，或管理员未主动私聊/已屏蔽机器人时，对应通知可能无法送达。
 - 本项目没有内置 Telegram UI，它通过 Telegram Bot API 和 Cloudflare Rust Workers 运行；请先做真实端到端误判、权限、取消期和通知送达测试。
