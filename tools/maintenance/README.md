@@ -48,3 +48,34 @@ unit tests would stop testing the actual host integration. Its tests still run i
 CI after building the Worker. Generated `build/index.js` remains required by the
 current `workers-rs`/`wasm-bindgen` deployment path; it is not handwritten business
 logic. Wrangler also remains the official development CLI.
+
+## Rust-first JavaScript boundary inventory
+
+After `worker-build --release`, run:
+
+```sh
+cargo run --manifest-path tools/maintenance/Cargo.toml --bin js-inventory -- build
+```
+
+The native inventory reports the checked-in handwritten JavaScript/TypeScript
+and Python files (bytes and lines), the count of real built-Wasm integration
+tests, generated JavaScript glue (bytes and lines), and the Wasm size. The
+inventory *fails closed* if unexpected handwritten JS/TS or Python is introduced,
+critical integration coverage markers disappear, fewer than 97 existing
+built-Wasm test registrations remain, or the generated Worker artifact is
+missing. CI runs the actual 97+ Node/Wasm integration cases independently and
+runs this inventory after building; a count or textual marker alone does not
+prove a test passes.
+
+The single handwritten JS entry point is `tests/worker_runtime.mjs`. Its
+Node VM loader and Cloudflare host doubles must remain in JavaScript to
+exercise the actual `index.js` plus `index_bg.wasm` boundary. They are not
+duplicated business logic in the deployed Worker. The `build/` JS is generated
+by `worker-build`, not handwritten. A Rust port of the JavaScript host doubles
+would still require JavaScript interop and risk bypassing the actual host
+boundary, so it is not justified by language-line-count reduction.
+
+This policy is intentionally strict: when a new script or redesigned test
+harness is demonstrably necessary, update the inventory policy and its review
+in the same PR. The inventory is separate from production D1, migrations, and
+runtime code, and needs no Cloudflare credentials.
