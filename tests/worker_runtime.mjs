@@ -1089,7 +1089,7 @@ await test('policy cache does not retain failed lookups or cross a membership ch
  const fail=fixture({policyFail:true});
  const outcomes=await fail.consumeBatch([message(groupA,1900),message(groupA,1901)]);
  assert.ok(outcomes.every(o=>o.retried&&!o.acked));
- assert.equal(fail.telegram.filter(c=>c.method==='getChat').length,2);
+ assert.equal(fail.telegram.filter(c=>c.method==='getChat').length,4,'two policy attempts plus two best-effort admin log metadata lookups');
  const f=fixture();
  await f.consumeBatch([message(groupA,1902),{update_id:1903,chat_member:{chat:{id:groupA}}},message(groupA,1904)]);
  assert.equal(f.telegram.filter(c=>c.method==='getChat').length,3);
