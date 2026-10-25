@@ -319,6 +319,22 @@ pub async fn finish_scan(env: &Env, job: &Job) -> Result<bool> {
     Ok(finished.is_some())
 }
 
+/// Only an explicit zero disables archive cleanup. Invalid values must not
+/// silently become unlimited retention or overflow the time arithmetic.
+fn archive_cutoff(raw: &str, current_time: i64) -> Result<Option<i64>> {
+    const INVALID: &str = "Invalid ARCHIVE_DAYS: expected non-negative integer (0 disables archive cleanup)";
+    let days = raw.parse::<i64>().map_err(|_| fail(INVALID))?;
+    if days < 0 {
+        return Err(fail(INVALID));
+    }
+    if days == 0 {
+        return Ok(None);
+    }
+    let seconds = days.checked_mul(86_400).ok_or_else(|| fail(INVALID))?;
+    let cutoff = current_time.checked_sub(seconds).ok_or_else(|| fail(INVALID))?;
+    Ok(Some(cutoff))
+}
+
 pub async fn cleanup(env: &Env) -> Result<()> {
     env.d1("DB")?.prepare("DELETE FROM processed_updates WHERE processed_at<?")
         .bind(&[js_i64(now()-14*86400)])?.run().await?;
@@ -346,13 +362,13 @@ pub async fn cleanup(env: &Env) -> Result<()> {
             return Err(error);
         }
     }
-    let keep_days = crate::util::config(env,"ARCHIVE_DAYS").parse::<i64>().unwrap_or(0);
-    if keep_days > 0 {
-        env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")
-            .bind(&[js_i64(now()-keep_days*86400)])?.run().await?;
-    }
+    // The fixed 30-day cleanup must still run if archive policy is misconfigured.
     env.d1("DB")?.prepare("DELETE FROM pending_bans WHERE status IN ('banned','canceled','failed') AND resolved_at<?")
         .bind(&[js_i64(now()-30*86400)])?.run().await?;
+    if let Some(cutoff) = archive_cutoff(&crate::util::config(env,"ARCHIVE_DAYS"), now())? {
+        env.d1("DB")?.prepare("DELETE FROM archived_messages WHERE sent_at<?")
+            .bind(&[js_i64(cutoff)])?.run().await?;
+    }
     Ok(())
 }
 
@@ -588,3 +604,27 @@ pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: b
     Ok(())
 }
 
+#[cfg(test)]
+mod archive_retention_tests {
+    use super::archive_cutoff;
+
+    #[test]
+    fn explicit_zero_and_finite_days_preserve_the_configured_policy() {
+        let now = 20_000_000_i64;
+        assert_eq!(archive_cutoff("0", now).unwrap(), None);
+        for days in [7_i64, 30, 90] {
+            assert_eq!(
+                archive_cutoff(&days.to_string(), now).unwrap(),
+                Some(now - days * 86_400)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_missing_values_cannot_silently_disable_cleanup() {
+        for raw in ["", "-1", "7d", "7.5", "unlimited", "9223372036854775807"] {
+            assert!(archive_cutoff(raw, 20_000_000).is_err(), "{raw}");
+        }
+        assert!(archive_cutoff("1", i64::MIN).is_err());
+    }
+}
