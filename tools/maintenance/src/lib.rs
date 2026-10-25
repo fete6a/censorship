@@ -18,6 +18,20 @@ const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
 const LOG_FILTER_COLUMN_DDL_SUFFIX: &str =
     ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT0CHECK(LOGS_WARN_ONLYIN(0,1)))";
 
+fn approved_log_filter_ddl(sql: &str) -> bool {
+    // Deliberately conservative: retain every quote/comment character. In
+    // particular, SQLite double-quoted strings must never become SQL tokens.
+    // Unsupported equivalent spellings require operator investigation.
+    let ddl: String = sql.chars().filter(|c| !c.is_whitespace())
+        .flat_map(char::to_uppercase).collect();
+    let Some(prefix) = ddl.trim_end_matches(';').strip_suffix(LOG_FILTER_COLUMN_DDL_SUFFIX) else {
+        return false;
+    };
+    // Earlier column/table constraints can also restrict the new flag.
+    // Reject all earlier references, including quoted identifiers and comments.
+    !prefix.contains("LOGS_WARN_ONLY")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub object_type: String,
@@ -341,8 +355,7 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         if name == "group_settings" && got_cols.contains_key(&Some("logs_warn_only")) {
             // Compare only the new column's DDL; historical definitions of
             // unrelated settings need not be textually identical to SCHEMA.
-            let ddl = normalized_ddl(got[0].definition.as_deref().unwrap_or(""));
-            if !ddl.trim_end_matches(';').ends_with(LOG_FILTER_COLUMN_DDL_SUFFIX) {
+            if !approved_log_filter_ddl(got[0].definition.as_deref().unwrap_or("")) {
                 errors.push("group_settings.logs_warn_only CHECK/column DDL mismatch".into());
             }
         }

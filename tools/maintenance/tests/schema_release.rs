@@ -408,6 +408,7 @@ fn log_filter_check_constraint_must_match_approved_addition() {
         "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only >= 0)",
         "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1)) CHECK (logs_warn_only = 0)",
         "logs_warn_only INTEGER NOT NULL DEFAULT 0 /* CHECK (logs_warn_only IN (0,1)) */",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (\"logs_warn_only IN (0,1)\")",
     ] {
         let db = Connection::open_in_memory().unwrap();
         batch(&db, &before);
@@ -428,6 +429,22 @@ fn log_filter_check_constraint_must_match_approved_addition() {
                 result.errors.iter().any(|e| e.contains("group_settings.logs_warn_only CHECK/column DDL mismatch")),
                 "{column}: {:?}", result.errors
             );
+        }
+    }
+}
+
+#[test]
+fn earlier_column_constraint_cannot_restrict_log_filter() {
+    for reference in ["logs_warn_only", "\"logs_warn_only\"", "[logs_warn_only]", "`logs_warn_only`"] {
+        let schema = SCHEMA.replace(
+            "remove_threshold REAL",
+            &format!("remove_threshold REAL CHECK ({reference}=0)"),
+        );
+        assert_ne!(schema, SCHEMA);
+        let db = Connection::open_in_memory().unwrap();
+        batch(&db, &schema);
+        for pre in [true, false] {
+            assert_eq!(check(&db, pre).status, Status::Incompatible, "{reference}");
         }
     }
 }
