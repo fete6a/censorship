@@ -1260,7 +1260,7 @@ await test('authorized group admin can set and query one member warning count wi
   assert.equal(writes.length,1);
   assert.deepEqual(writes[0].values.slice(1,4),[groupA,22,0]);
   assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
-   assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42]);
+  assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42]);
   assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/0\/3/);
   const query=command('/warnings 22',{id:groupA,type:'supergroup'});query.update_id=2601;
   await f.consume(query);
@@ -1275,7 +1275,8 @@ await test('manual warning adjustments count only subsequent violations without 
   const reset=command('/warnings 22 0',{id:groupA,type:'supergroup'});reset.update_id=2700;
   await f.consume(reset);
   await f.consume(message(groupA,2701));
-  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+  assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id!==42)
+    .map(x=>x.args.message_id),[2701]);
   assert.equal(f.telegram.some(x=>x.method==='restrictChatMember'),false);
   assert.match(f.telegram.find(x=>x.method==='sendMessage'&&x.args.chat_id===groupA&&x.args.text.includes('违规消息已删除'))?.args.text||'',/1\/3/);
   const set=command('/warnings 22 3',{id:groupA,type:'supergroup'});set.update_id=2702;
@@ -1283,7 +1284,8 @@ await test('manual warning adjustments count only subsequent violations without 
   assert.equal(f.telegram.filter(x=>x.method==='restrictChatMember').length,0,'setting 3 is not itself a penalty');
   await f.consume(message(groupA,2703));
   assert.equal(f.telegram.filter(x=>x.method==='restrictChatMember').length,1,'next actionable violation can escalate');
-  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,2);
+  assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id!==42)
+    .map(x=>x.args.message_id),[2701,2703]);
 });
 
 await test('warning management is isolated by exact target group and rejects unauthorized or anonymous actors',async()=>{
