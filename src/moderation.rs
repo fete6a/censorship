@@ -168,6 +168,8 @@ async fn classify(env: &Env, rules: &str, msg: &Value) -> Result<Decision> {
     } else {
         ("@cf/cloudflare/clef-omni","clef-omni")
     };
+    // Text/caption are original review content, unlike derived link URLs.
+    // Link metadata redaction does not promise to scrub secrets in content.
     let state = json!({
         "group_description": rules,
         "message_text": field_str(msg,"text").chars().take(12000).collect::<String>(),
