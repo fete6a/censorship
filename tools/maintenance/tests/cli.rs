@@ -1,4 +1,4 @@
-use censorship_maintenance::{canonical_db, inspect_sqlite};
+use censorship_maintenance::{canonical_db, inspect_sqlite, inspection_queries};
 use serde_json::json;
 use std::{
     path::PathBuf,
@@ -44,7 +44,7 @@ fn cli_prints_read_only_inspection_without_external_tools() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("SELECT "));
-    assert_eq!(text.matches("PRAGMA table_info(").count(), 9);
+    assert_eq!(text.matches("PRAGMA table_info(").count(), inspection_queries().unwrap().len()-1);
 }
 #[test]
 fn cli_ready_missing_and_pre_migration_exit_codes() {
