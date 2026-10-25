@@ -176,6 +176,14 @@ async fn review_with_policy_cache(
         }
         Err(error) => {
             store::finish_review_scoped(env, chat_id, msg_id, "policy_unavailable", "none", 0.0,scan).await?;
+            // Unlike completed reviews, a retryable rule lookup failure never
+            // reaches the Queue digest. Send a scoped best-effort error notice
+            // without acknowledging the update or changing moderation outcomes.
+            // A persistent upstream failure may notify again on later retries.
+            if mode == Mode::Live && scan.is_none() {
+                let _=tg::send_to_review_or_chat_titled(env,chat_id,NoticeTone::Error,
+                    "群规查询失败",&format!("消息：{msg_id}\\n本次审核未完成，系统将自动重试。")).await;
+            }
             return Err(error);
         }
     };
