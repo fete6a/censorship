@@ -51,7 +51,7 @@ All other management commands check the issuing user's `getChatMember` administr
 | --- | --- | --- |
 | Removal threshold (query or set) | `/threshold [0.75 or 75%]` | `/threshold -100GROUP_ID [0.75 or 75%]` |
 | Enforcement mode (query or set) | `/dry-run [on\|off]` (also `/dry_run`) | `/dry_run -100GROUP_ID [on\|off]` |
-| Private review logs (query or set) | `/logs [on\|warn\|off]` | `/logs -100GROUP_ID [on\|off]` |
+| Private review logs (query or set) | `/logs [on\|warn\|off]` | `/logs -100GROUP_ID [on\|warn\|off]` |
 | Read group policy | `/rules` | `/rules -100GROUP_ID` |
 | Cancel pending ban (does not unmute) | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
 | Inspect pending/processing ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
