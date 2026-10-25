@@ -49,6 +49,8 @@ jobs:
           node-version: '24'
       - name: Built Worker queue and group authorization regression tests
         run: node --experimental-vm-modules tests/worker_runtime.mjs
+      - name: Audit generated JS and preserve built-Wasm host coverage
+        run: cargo run --manifest-path tools/maintenance/Cargo.toml --bin js-inventory -- build
       - name: Assert build output
         run: |
           test -s build/index.js
