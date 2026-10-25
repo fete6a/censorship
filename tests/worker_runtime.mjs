@@ -35,7 +35,8 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
+function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false, clock = null, onPendingRun = null } = {}) {
+  context.Date = clock ? class FakeDate extends Date { static now() { return clock.value; } } : Date;
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const pageRequests = [];
@@ -162,6 +163,7 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
         },
         async run() {
           statements.push({ sql, values, operation: 'write' });
+          if (onPendingRun && sql.startsWith("UPDATE pending_bans SET status='canceled'")) await onPendingRun();
           if (sql.includes('INSERT INTO group_settings')) {
             const row = settings.get(values[0]) || { dry_run: null, logs_enabled: 1 };
             row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
@@ -252,7 +254,7 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
     throw new Error(`Unexpected Telegram method: ${method}`);
   };
   const env = { WEBHOOK_SECRET: secret, BOT_TOKEN: 'test-only-token', MODERATION_QUEUE: new WorkerQueue(),
-    DB: new D1Database(), AI: new Ai(), DRY_RUN: 'true', BOT_USERNAME: 'example_bot' };
+    DB: new D1Database(), AI: new Ai(), DRY_RUN: 'true', ARCHIVE_DAYS: '0', BOT_USERNAME: 'example_bot' };
   const worker = new module.namespace.default({ waitUntil() {} }, env);
   async function consumeBatch(updates) {
     const outcomes=updates.map(()=>({acked:false,retried:false}));
@@ -270,10 +272,26 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
     assert.equal(outcome.retried,retry);
     assert.equal(outcome.acked,!retry);
   }
-  async function tick(){await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()});}
+  async function tick(scheduledTime=Date.now()){await worker.scheduled({cron:'* * * * *',scheduledTime});}
   return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls, pageRequests,
     settings, reviews, archives, jobs, warningAdjustments, warningReceiptIds, consume, consumeBatch, env };
 }
+
+await test('daily cleanup is not lost when midnight Cron starts after its scheduled minute', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock = {value: midnight + 61_000};
+  const f = fixture({clock});
+  await f.tick(midnight);
+  assert.equal(f.statements.filter(s => s.sql.startsWith('DELETE FROM processed_updates')).length, 1);
+});
+
+await test('daily cleanup is not lost when pending work crosses the midnight minute', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock = {value: midnight + 59_000};
+  const f = fixture({clock, onPendingRun: () => {clock.value = midnight + 61_000;}});
+  await f.tick(midnight);
+  assert.equal(f.statements.filter(s => s.sql.startsWith('DELETE FROM processed_updates')).length, 1);
+});
 
 await test('webhook preserves nested payload and IDs through JSON queue delivery', async () => {
   const f = fixture();
