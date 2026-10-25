@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
+function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
@@ -231,7 +231,11 @@ function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, queue
       user: { id: args.user_id }, status: args.chat_id === groupA && args.user_id===11 ? 'administrator' : 'member',
     } });
     if (['restrictChatMember','banChatMember'].includes(method)) return Response.json({ok:true,result:true});
-    if (method === 'deleteMessage') {if(pauseDelete)await pauseDelete();return Response.json({ok:true,result:true});}
+    if (method === 'deleteMessage') {
+      if(pauseDelete && (pauseDeleteTarget===null || args.message_id===pauseDeleteTarget))await pauseDelete();
+      if(deleteError)return Response.json({ok:false},{status:403});
+      return Response.json({ok:true,result:true});
+    }
     if (method === 'sendMessage' && ((dmFail && args.chat_id>0)||(noticeFail && args.chat_id<0))) return Response.json({ok:false},{status:403});
     if (method === 'sendMessage') return Response.json({ ok: true, result: { message_id: 1 } });
     if(method==='getChat' && policyFail) return Response.json({ok:false},{status:503});
@@ -946,6 +950,7 @@ await test('commands addressed to another bot get no command reply and remain su
  await f.consume(command('/scan@another_bot',{id:groupA,type:'supergroup'}));
  assert.equal(f.telegram.some(c=>c.method==='sendMessage'),false);
  assert.equal(f.aiCalls.length,1);
+  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
 });
 
 await test('disabled groups receive command feedback and execute no management action',async()=>{
@@ -967,7 +972,8 @@ await test('explicit audit scan reports findings without sanctions in the same t
  assert.match(sends[1].args.text,/▰+.*99/);
  assert.ok(sends.every(c=>c.args.chat_id===groupA&&c.args.message_thread_id===88));
  assert.equal(f.aiCalls.length,1);
- assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+ assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[42]);
+ assert.equal(f.telegram.some(c=>c.method==='deleteMessage'&&c.args.message_id===1600),false);
  assert.ok(f.archives.has(`${groupA}:1600`));
 });
 
@@ -1003,7 +1009,7 @@ await test('scan reports model failure or missing group rules without claiming a
   const final=f.telegram.filter(c=>c.method==='sendMessage').at(-1)?.args.text||'';
   assert.match(final,/未获得有效审核结果/);
   assert.ok(!final.includes('通过'));assert.ok(!final.includes('违规概率'));
-  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
+  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'&&c.args.message_id===1603),false);
  }
 });
 
@@ -1023,7 +1029,7 @@ await test('scan enforce preserves dry-run and duplicate punishment protections'
   update.message.reply_to_message=message(groupA,1605).message;
   await f.consume(update);
   await f.consume({...update,update_id:update.update_id+1});
-  assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,dryRun?0:1);
+  assert.equal(f.telegram.filter(c=>c.method==='deleteMessage'&&c.args.message_id===1605).length,dryRun?0:1);
   assert.equal(f.telegram.filter(c=>c.method==='banChatMember').length,0);
   assert.match(f.telegram.filter(c=>c.method==='sendMessage').at(-1)?.args.text||'',dryRun?/模拟命中/:/已处理/);
  }
@@ -1205,7 +1211,7 @@ await test('single /scan enforces by default only in a group with enforcement en
   const commandUpdate=command('/scan',{id:groupA,type:'supergroup'});
   commandUpdate.message.reply_to_message=message(groupA,2201).message;
   await enforcing.consume(commandUpdate);
-  assert.equal(enforcing.telegram.filter(x=>x.method==='deleteMessage').length,1);
+  assert.equal(enforcing.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id===2201).length,1);
   assert.ok(enforcing.statements.some(x=>x.sql.includes('INSERT INTO violations')));
   assert.equal(enforcing.reviews.get(`${groupA}:2201`)?.last_status,'deleted');
   assert.match(enforcing.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/已删除/);
@@ -1215,7 +1221,7 @@ await test('single /scan enforces by default only in a group with enforcement en
   const dryUpdate=command('/scan',{id:groupA,type:'supergroup'});
   dryUpdate.message.reply_to_message=message(groupA,2202).message;
   await dry.consume(dryUpdate);
-  assert.equal(dry.telegram.some(x=>x.method==='deleteMessage'),false);
+  assert.equal(dry.telegram.some(x=>x.method==='deleteMessage'&&x.args.message_id===2202),false);
   assert.equal(dry.reviews.get(`${groupA}:2202`)?.last_status,'dry_run_flag');
   assert.match(dry.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/dry\\-run.*未执行处罚/);
 });
@@ -1227,7 +1233,7 @@ await test('single /scan audit explicitly remains non-punitive even when enforce
     const update=command('/scan audit',{id:groupA,type:'supergroup'});
     update.message.reply_to_message=message(groupA,2203).message;
     await f.consume(update);
-    assert.equal(f.telegram.some(x=>['deleteMessage','restrictChatMember','banChatMember'].includes(x.method)),false);
+    assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method) || (x.method==='deleteMessage'&&x.args.message_id===2203)),false);
     assert.equal(f.reviews.get(`${groupA}:2203`)?.last_status,'audit_flag');
     assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/仅审计，未执行处罚/);
   }
@@ -1239,7 +1245,7 @@ await test('single scan rejects invalid flags and nonpositive message IDs before
     await f.consume(command(text,{id:groupA,type:'supergroup'}));
     assert.equal(f.aiCalls.length,0,text);
     assert.ok(!f.statements.some(x=>x.sql.includes('SELECT payload FROM archived_messages')),text);
-    assert.ok(!f.telegram.some(x=>x.method==='deleteMessage'),text);
+    assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42],text);
     assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/参数错误/,text);
   }
 });
@@ -1253,7 +1259,8 @@ await test('authorized group admin can set and query one member warning count wi
   const writes=f.statements.filter(x=>x.sql.includes('INSERT INTO warning_edit_receipts'));
   assert.equal(writes.length,1);
   assert.deepEqual(writes[0].values.slice(1,4),[groupA,22,0]);
-  assert.equal(f.telegram.some(x=>['deleteMessage','restrictChatMember','banChatMember'].includes(x.method)),false);
+  assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
+   assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42]);
   assert.match(f.telegram.find(x=>x.method==='sendMessage')?.args.text||'',/0\/3/);
   const query=command('/warnings 22',{id:groupA,type:'supergroup'});query.update_id=2601;
   await f.consume(query);
@@ -1407,7 +1414,7 @@ await test('bulk scan respects group dry-run',async()=>{
  await f.consume(command('/scan_all',{id:groupA,type:'supergroup'}));
  assert.equal(f.jobs.get(groupA)?.enforce,1);
  assert.match(f.telegram.filter(x=>x.method==='sendMessage').at(-1)?.args.text||'',/模拟模式.*不执行处罚/);
- assert.equal(f.telegram.some(x=>x.method==='deleteMessage'),false);
+ assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42]);
 });
 
 await test('duplicate bulk scan does not override active job and stop permits restart',async()=>{
@@ -1457,12 +1464,12 @@ await test('old enforcement result after stop and audit restart cannot alter new
  assert.equal(f.jobs.get(groupA).cursor_message_id,0);
  assert.equal(f.jobs.get(groupA).scanned,0);
  assert.equal(f.jobs.get(groupA).flagged,0);
- assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id===17).length,0);
  assert.equal(f.reviews.get(groupA+':17')?.last_status,undefined);
  const second=f.tick();await second;
  assert.equal(f.jobs.get(groupA).enforce,0);
  assert.equal(f.jobs.get(groupA).scanned,1);
- assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,0);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id===17).length,0);
  await f.tick();
  assert.equal(f.jobs.get(groupA).status,'done');
  assert.equal(f.telegram.filter(x=>x.method==='sendMessage'&&x.args.text.includes('历史审查完成')).length,1);
@@ -1495,7 +1502,7 @@ await test('concurrent Cron claims cannot process the same group twice',async()=
 await test('Telegram deletion already in flight is not represented as atomically cancellable',async()=>{
  let unblock,entered;
  const held=new Promise(resolve=>unblock=resolve),begun=new Promise(resolve=>entered=resolve);
- const f=fixture({remove:true,score:.99,strikeCount:2,pauseDelete:async()=>{entered();await held}});
+ const f=fixture({remove:true,score:.99,strikeCount:2,pauseDeleteTarget:17,pauseDelete:async()=>{entered();await held}});
  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
  f.archives.set(groupA+':17',message(groupA,17).message);
  let start=command('/scan_all enforce',{id:groupA,type:'supergroup'});start.update_id=9300;await f.consume(start);
@@ -1505,7 +1512,7 @@ await test('Telegram deletion already in flight is not represented as atomically
  unblock();await old;
  assert.equal(f.jobs.get(groupA).cursor_message_id,0);
  assert.equal(f.jobs.get(groupA).enforce,0);
- assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+ assert.equal(f.telegram.filter(x=>x.method==='deleteMessage'&&x.args.message_id===17).length,1);
  assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
  assert.equal(f.reviews.get(groupA+':17')?.last_status,'deleted');
 });
@@ -1546,4 +1553,74 @@ await test('administrator flagged messages cannot bypass Bot API 48 hour deletio
   assert.equal(f.reviews.get(groupA+':4601')?.last_status,'too_old_to_delete');
   assert.equal(f.telegram.some(call=>call.method==='deleteMessage'),false);
   assert.equal(f.telegram.some(call=>call.method==='banChatMember'),false);
+});
+
+
+await test('group bot commands are removed after their responses while private commands are retained',async()=>{
+  for(const cmd of ['/help','/rules','/logs warn','/threshold','/scan_status','/unknown','/logs bogus']){
+    const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+    const update=command(cmd,{id:groupA,type:'supergroup'});
+    update.message.message_thread_id=19;
+    await f.consume(update);
+    const sends=f.telegram.filter(x=>x.method==='sendMessage');
+    assert.ok(sends.length>=1,cmd);
+    assert.ok(sends.every(x=>x.args.chat_id===groupA&&x.args.message_thread_id===19),cmd);
+    assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>[x.args.chat_id,x.args.message_id]),[[groupA,42]],cmd);
+    assert.ok(f.telegram.findIndex(x=>x.method==='deleteMessage')>f.telegram.findIndex(x=>x.method==='sendMessage'),cmd);
+    assert.equal(f.completed.has(789),true,cmd);
+  }
+  const privateCmd=fixture();
+  await privateCmd.consume(command('/help'));
+  assert.equal(privateCmd.telegram.some(x=>x.method==='deleteMessage'),false);
+});
+
+await test('unauthorized group commands are moderated before cleanup and cannot mutate group settings',async()=>{
+  for(const anonymous of [false,true]){
+    const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+    const update=command('/logs off',{id:groupA,type:'supergroup'});
+    update.message.from.id=22;
+    if(anonymous)update.message.sender_chat={id:groupA};
+    await f.consume(update);
+    assert.equal(f.settings.get(groupA)?.logs_enabled,0);
+    assert.equal(f.statements.some(x=>x.sql.includes('INSERT INTO group_settings')),false);
+    assert.equal(f.aiCalls.length,1);
+    assert.equal(f.reviews.get(groupA+':42')?.last_status,'allow');
+    assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[42]);
+  }
+});
+
+await test('punitive removal of a slash-message does not issue a duplicate housekeeping delete',async()=>{
+  const f=fixture({remove:true,score:1});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  const update=message(groupA,6102);
+  update.message.text='/help forbidden-advertisement';
+  await f.consume(update);
+  assert.equal(f.reviews.get(groupA+':6102')?.last_status,'deleted');
+  assert.deepEqual(f.telegram.filter(x=>x.method==='deleteMessage').map(x=>x.args.message_id),[6102]);
+});
+
+await test('failed command cleanup is nonfatal, nonretryable and not applied to old messages',async()=>{
+  const f=fixture({deleteError:true});
+  f.settings.set(groupA,{dry_run:1,logs_enabled:0});
+  const update=command('/dry_run off',{id:groupA,type:'supergroup'});
+  await f.consume(update);await f.consume(update);
+  assert.equal(f.settings.get(groupA)?.dry_run,0);
+  assert.equal(f.completed.has(update.update_id),true);
+  assert.equal(f.statements.filter(x=>x.sql.includes('INSERT INTO group_settings')).length,1);
+  assert.equal(f.telegram.filter(x=>x.method==='deleteMessage').length,1);
+  assert.ok(f.errors.some(x=>x.includes('command_message_cleanup_failed')));
+
+  const old=fixture();
+  const stale=command('/help',{id:groupA,type:'supergroup'});
+  stale.message.date=Math.floor(Date.now()/1000)-49*3600;
+  await old.consume(stale);
+  assert.equal(old.telegram.some(x=>x.method==='deleteMessage'),false);
+});
+
+await test('transient command failures keep their source messages for successful retries',async()=>{
+  const f=fixture({policyFail:true});
+  const update=command('/rules',{id:groupA,type:'supergroup'});
+  await f.consume(update,{retry:true});
+  assert.equal(f.completed.has(update.update_id),false);
+  assert.equal(f.telegram.some(x=>x.method==='deleteMessage'),false);
 });
