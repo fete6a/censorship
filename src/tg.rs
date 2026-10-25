@@ -257,7 +257,7 @@ pub async fn download(env: &Env, file_id: &str, max_len: usize) -> Result<Vec<u8
 }
 
 pub fn normalize(msg: &Value) -> Value {
-    let keys = ["text", "caption", "photo", "video", "video_note", "voice", "audio", "document", "animation", "sticker"];
+    let keys = ["text", "caption", "entities", "caption_entities", "photo", "video", "video_note", "voice", "audio", "document", "animation", "sticker", "poll", "location", "venue", "contact", "dice", "game", "paid_media", "story", "giveaway", "giveaway_winners", "proximity_alert_triggered", "video_chat_started", "video_chat_ended", "message_auto_delete_timer_changed", "successful_payment", "invoice", "boost_added", "forward_origin", "reply_markup"];
     let mut item = json!({
         "message_id": msg["message_id"],
         "chat": {"id": msg["chat"]["id"], "type": msg["chat"]["type"]},
@@ -308,10 +308,10 @@ pub fn is_eligible(msg: &Value, group_id: i64) -> bool {
 }
 
 pub fn message_has_payload(msg: &Value) -> bool {
-    if !field_str(msg, "text").trim().is_empty() || !field_str(msg, "caption").trim().is_empty() {
+    if !field_str(msg, "text").trim().is_empty() || !field_str(msg, "caption").trim().is_empty() || !msg["entities"].is_null() || !msg["caption_entities"].is_null() {
         return true;
     }
-    ["photo", "video", "video_note", "voice", "audio", "document", "animation", "sticker"]
+    ["photo", "video", "video_note", "voice", "audio", "document", "animation", "sticker", "poll", "location", "venue", "contact", "dice", "game", "paid_media", "story", "giveaway", "giveaway_winners", "proximity_alert_triggered", "video_chat_started", "video_chat_ended", "message_auto_delete_timer_changed", "successful_payment", "invoice", "boost_added"]
         .iter().any(|k| msg.get(k).is_some_and(|v| !v.is_null()))
 }
 
