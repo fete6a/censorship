@@ -35,9 +35,10 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
+function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
+  const pageRequests = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
   context.console = { ...console, error: (...args) => errors.push(args.join(' ')) };
   class WorkerQueue {
@@ -214,6 +215,11 @@ function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, pause
     }
   }
   context.fetch = async request => {
+    if (new URL(request.url).hostname !== "api.telegram.org") {
+      pageRequests.push(request);
+      if (!pageFetch) throw new Error("Unexpected page fetch");
+      return pageFetch(request);
+    }
     if (new URL(request.url).pathname.startsWith('/file/'))
       return new Response(new Uint8Array([1,2,3,4]));
     const method = new URL(request.url).pathname.split('/').at(-1);
@@ -265,7 +271,7 @@ function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, pause
     assert.equal(outcome.acked,!retry);
   }
   async function tick(){await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()});}
-  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls,
+  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls, pageRequests,
     settings, reviews, archives, jobs, warningAdjustments, warningReceiptIds, consume, consumeBatch, env };
 }
 
@@ -1625,4 +1631,79 @@ await test('transient command failures keep their source messages for successful
   await f.consume(update,{retry:true});
   assert.equal(f.completed.has(update.update_id),false);
   assert.equal(f.telegram.some(x=>x.method==='deleteMessage'),false);
+});
+
+
+await test('hidden credentialed text links never add credentials to model input or fetches', async () => {
+  for (const caption of [false, true]) {
+    const f = fixture();
+    const update = message(groupA, 4100);
+    const target = 'https://hidden-user:Hidden%40Password@example.org/private?token=hidden-query#hidden-fragment';
+    update.message.text = 'Read this';
+    const entities = [{type:'text_link',offset:0,length:4,url:target}];
+    if (caption) {
+      delete update.message.text;
+      update.message.caption = 'Read this';
+      update.message.caption_entities = entities;
+    } else update.message.entities = entities;
+    await f.consume(update);
+    assert.equal(f.aiCalls.length, 1);
+    assert.equal(f.pageRequests.length, 0);
+    const input = f.aiCalls[0].input;
+    assert.equal(input.state.link_evidence[0].status, 'blocked_target');
+    for (const secret of ['hidden-user', 'Hidden%40Password', 'hidden-query', 'hidden-fragment'])
+      assert.ok(!JSON.stringify(input).includes(secret), secret);
+    assert.equal(input.state.link_evidence[0].url, undefined);
+  }
+});
+
+await test('URL evidence strips userinfo defensively and redirects never disclose or fetch rejected targets', async () => {
+  for (const location of [
+    'https://redirect-user:RedirectPassword@example.org/secret?redirect-token=private#fragment',
+    'http://127.0.0.1/private', 'https://private.internal/path',
+  ]) {
+    const f = fixture({pageFetch: () => new Response(null, {status:302,headers:{Location:location}})});
+    const update = message(groupA, 4101);
+    update.message.text = 'Read this';
+    update.message.entities = [{type:'text_link',offset:0,length:4,url:'https://example.org/start?original-token=private#fragment'}];
+    await f.consume(update);
+    assert.equal(f.pageRequests.length,1);
+    assert.equal(f.pageRequests[0].redirect,'manual');
+    const input = f.aiCalls[0].input;
+    assert.deepEqual(input.state.link_evidence,[{url:'https://example.org/start',status:'blocked_redirect'}]);
+    for(const secret of ['redirect-user','RedirectPassword','redirect-token','original-token','fragment'])
+      assert.ok(!JSON.stringify(input).includes(secret),secret);
+  }
+});
+
+await test('safe redirects retain page review and sanitized final URLs within fetch limits', async () => {
+  const f = fixture({pageFetch: request => new URL(request.url).pathname === '/start'
+    ? new Response(null,{status:302,headers:{Location:'/final?final-token=private#fragment'}})
+    : new Response('<p>Useful page evidence</p>',{headers:{'Content-Type':'text/html'}})});
+  const update = message(groupA,4102);
+  update.message.text = 'Read these';
+  update.message.entities = ['start','other','ignored'].map(p=>({type:'text_link',offset:0,length:4,url:`https://example.org/${p}?query-token=private#fragment`}));
+  await f.consume(update);
+  assert.equal(f.pageRequests.length,3);
+  assert.ok(f.pageRequests.every(r=>r.redirect==='manual'));
+  assert.equal(f.aiCalls[0].input.state.link_evidence.length,2);
+  assert.deepEqual(f.aiCalls[0].input.state.link_evidence[0],{url:'https://example.org/start',status:'fetched',final_url:'https://example.org/final',http_status:200,mime:'text/html',excerpt:'Useful page evidence'});
+  assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('token='));
+  const capped = fixture({pageFetch:()=>new Response(null,{status:302,headers:{Location:'/again'}})});
+  await capped.consume(update);
+  assert.equal(capped.pageRequests.length,6,'two links, three hops each');
+  assert.ok(capped.aiCalls[0].input.state.link_evidence.every(x=>x.status==='redirect_limit'));
+});
+
+await test('explicit text and caption URLs remain original moderation content, blocked evidence adds no URL', async () => {
+  for(const field of ['text','caption']) {
+    const f=fixture();const update=message(groupA,4103);
+    delete update.message.text;
+    const original='Review https://visible-user:VisiblePassword@example.org/path?visible-token=private#visible-fragment';
+    update.message[field]=original;
+    await f.consume(update);
+    assert.equal(f.pageRequests.length,0);
+    assert.equal(f.aiCalls[0].input.state[field==='text'?'message_text':'caption'],original);
+    assert.deepEqual(f.aiCalls[0].input.state.link_evidence,[{status:'blocked_target'}]);
+  }
 });

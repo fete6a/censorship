@@ -83,6 +83,10 @@ fn collect(msg: &Value) -> Vec<Url> {
 
 fn public_url(url:&Url)->String {
     let mut safe=url.clone();
+    // Display-only copy: never sanitize the target before safe_target(),
+    // which must still reject credentials rather than fetching anonymously.
+    safe.set_password(None).expect("HTTP(S) URL supports removing password");
+    safe.set_username("").expect("HTTP(S) URL supports removing username");
     safe.set_query(None);
     safe.set_fragment(None);
     safe.as_str().chars().take(350).collect()
@@ -112,11 +116,13 @@ fn excerpt(bytes:&[u8], html:bool)->String {
 pub async fn evidence(msg: &Value) -> Vec<Value> {
     let mut results=Vec::new();
     for url in collect(msg) {
-        let displayed=public_url(&url);
         if !safe_target(&url) {
-            results.push(json!({"url":displayed,"status":"blocked_target"}));
+            // Rejected hidden entity destinations are not moderation content.
+            // Do not copy any part of their address into model evidence.
+            results.push(json!({"status":"blocked_target"}));
             continue;
         }
+        let displayed=public_url(&url);
         let mut current=url;
         let mut result=json!({"url":displayed,"status":"unavailable"});
         for hop in 0..=MAX_REDIRECTS {
@@ -202,4 +208,28 @@ mod tests {
         let url=parse_url("https://example.org/path?token=secret#fragment",false).unwrap();
         assert_eq!(public_url(&url),"https://example.org/path");
     }
+    #[test]
+    fn hidden_credentials_are_collected_but_never_public() {
+        for raw in ["https://hidden-user:HiddenPassword@example.org/path?token=secret#fragment",
+            "https://hidden-user@example.org/path", "https://:HiddenPassword@example.org/path",
+            "https://us%40er:pa%3Ass@example.org/path"] {
+            let msg=json!({"text":"Read this", "entities":[
+                {"type":"text_link","offset":0,"length":4,"url":raw}]});
+            let urls=collect(&msg);
+            assert_eq!(urls.len(),1);
+            assert!(!safe_target(&urls[0]));
+            assert_eq!(public_url(&urls[0]),"https://example.org/path");
+        }
+    }
+    #[test]
+    fn redirect_display_is_sanitized_without_weakening_target_validation() {
+        let start=Url::parse("https://example.org/start").unwrap();
+        let next=start.join("//redirect-user:RedirectPassword@example.org/end?token=secret#fragment").unwrap();
+        assert!(!safe_target(&next));
+        assert_eq!(public_url(&next),"https://example.org/end");
+        let relative=start.join("/end?token=secret#fragment").unwrap();
+        assert!(safe_target(&relative));
+        assert_eq!(public_url(&relative),"https://example.org/end");
+    }
+
 }
