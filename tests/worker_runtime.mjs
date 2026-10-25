@@ -592,7 +592,7 @@ await test('warn mode suppresses allowed digests and avoids administrator lookup
  assert.equal(f.telegram.some(c=>c.method==='getChatAdministrators'||c.method==='sendMessage'),false);
 });
 await test('warn mode keeps only flagged rows in mixed digests while another group still receives allows',async()=>{
- const f=fixture({scores:[0.1,0.99,0.1]});f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ const f=fixture({remove:true,scores:[0.1,0.99,0.1]});f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
  await f.consumeBatch([message(groupA,2300),message(groupA,2301),message(groupB,2302)]);
  const a=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id===11)?.args.text||'';
  assert.match(a,/1 条/);assert.ok(a.includes('2301'));assert.ok(!a.includes('2300'));assert.match(a,/模拟命中/);
