@@ -110,18 +110,29 @@ pub async fn send_admin_action_notice(
     env: &Env, chat_id: i64, message_id: i64, user: Option<&formatting::ActionUser>,
     title: &str, text: &str,
 ) -> Result<()> {
-    send_admin_markdown(env,chat_id,&[formatting::action_notice(title,message_id,user,text)],None).await
+    send_admin_markdown(env,chat_id,|_| (vec![formatting::action_notice(title,message_id,user,text)],None)).await
 }
 
 /// Fetch current human administrators for the exact group; no global DM target.
-async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anchor: Option<i64>) -> Result<()> {
-    if chat_id>=0 || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
+async fn send_admin_markdown(env: &Env, chat_id: i64,
+    render: impl Fn(crate::store::LogMode) -> (Vec<String>,Option<i64>)
+) -> Result<()> {
+    use crate::store::LogMode;
+    if chat_id>=0 {return Ok(());}
+    let initial_mode=crate::store::group_log_mode(env,chat_id).await?;
+    if initial_mode==LogMode::Off || render(initial_mode).0.is_empty() {return Ok(());}
     let admins=match api(env,"getChatAdministrators",json!({"chat_id":chat_id})).await {
         Ok(value)=>value,
         Err(_)=>{worker::console_error!("group_admin_logs_unavailable");return Ok(());}
     };
     // Metadata failures must not discard completed reviews or their admin logs.
     let info=api(env,"getChat",json!({"chat_id":chat_id})).await.unwrap_or(Value::Null);
+    // Re-render using the latest mode after external lookups. In particular an
+    // on -> warn/off change while fetching administrators must not leak allows.
+    let mode=crate::store::group_log_mode(env,chat_id).await?;
+    if mode==LogMode::Off {return Ok(());}
+    let (markdowns,anchor)=render(mode);
+    if markdowns.is_empty() {return Ok(());}
     let anchor=if anchor.is_some() {anchor} else {
         crate::store::group_log_anchor(env,chat_id).await.unwrap_or(None)
     };
@@ -139,7 +150,7 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anch
         for member in admins {
             if !matches!(field_str(member,"status"),"creator"|"administrator") || member["user"]["is_bot"]==true {continue;}
             if let Some(user_id)=field_int(&member["user"],"id").filter(|id|*id>0) {
-                for markdown in markdowns {
+                for markdown in &markdowns {
                     if post_markdown(env,user_id,&format!("{heading}{markdown}")).await.is_err() {
                         worker::console_error!("group_admin_log_dm_failed");
                     }
@@ -155,7 +166,11 @@ async fn send_admin_markdown(env: &Env, chat_id: i64, markdowns: &[String], anch
 pub async fn send_to_review_or_chat_titled(
     env: &Env, chat_id: i64, tone: formatting::NoticeTone, title: &str, text: &str
 ) -> Result<()> {
-    send_admin_markdown(env,chat_id,&[formatting::notice(tone,title,text)],None).await
+    send_admin_markdown(env,chat_id,|mode| {
+        if mode==crate::store::LogMode::Warn && !matches!(tone,formatting::NoticeTone::Warning|formatting::NoticeTone::Error) {
+            (Vec::new(),None)
+        } else {(vec![formatting::notice(tone,title,text)],None)}
+    }).await
 }
 
 /// Queue batches group successful reviews by originating chat. A single admin
@@ -164,10 +179,12 @@ pub async fn send_review_digest(env: &Env, chat_id: i64, message_ids: &[i64]) ->
     if chat_id>=0 || message_ids.is_empty() || !crate::store::group_logs(env,chat_id).await? {return Ok(());}
     let rows=crate::store::last_review_logs(env,chat_id,message_ids).await?;
     if rows.is_empty() {return Ok(());}
-    // Recheck logs immediately before delivery; settings may change during D1 reads.
-    let anchor=rows.iter().rev().find(|row|!matches!(row.status.as_str(),"deleted"|"previously_deleted"))
-        .map(|row|row.message_id);
-    send_admin_markdown(env,chat_id,&formatting::review_digest(chat_id,&rows),anchor).await
+    send_admin_markdown(env,chat_id,|mode| {
+        let selected:Vec<_>=rows.iter().filter(|row|mode!=crate::store::LogMode::Warn || formatting::is_warning_status(&row.status)).cloned().collect();
+        let anchor=selected.iter().rev().find(|row|!matches!(row.status.as_str(),"deleted"|"previously_deleted"))
+            .map(|row|row.message_id);
+        (formatting::review_digest(chat_id,&selected),anchor)
+    }).await
 }
 
 pub async fn delete(env: &Env, chat_id: i64, message_id: i64) -> Result<()> {

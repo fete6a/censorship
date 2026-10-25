@@ -42,7 +42,7 @@
 | --- | --- | --- |
 | `/threshold 0.75` | `/threshold -100GROUP_ID 0.75` | 仅本群管理员设置删除阈值；省略数值查询，支持 `75%`；群内公开回复 |
 | `/dry-run off`（或 `/dry_run off`） | `/dry_run -100GROUP_ID off` | 为当前群启用实际处罚；`on` 恢复审计并取消本群待封禁任务；省略参数查询 |
-| `/logs off` | `/logs -100GROUP_ID off` | 只关闭当前群的管理员主动私聊日志；`on` 恢复；省略参数查询；不关闭群公告 |
+| `/logs off` | `/logs -100GROUP_ID off` | 只关闭当前群的管理员主动私聊日志；`on` 恢复全部日志，`warn` 仅警告；省略参数查询；不关闭群公告 |
 | `/rules` | `/rules -100GROUP_ID` | 群内所有成员可读取本群规则；私聊仍限目标群管理员 |
 | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` | 仅取消尚未进入处理阶段的自动封禁任务；**不自动解禁** |
 | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` | 查看剩余取消期 |
@@ -161,3 +161,15 @@ GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Wor
 生产审核逻辑、历史导入器、转码服务均使用 Rust。D1 发布预检及离线 SQLite、源码和文档回归测试也已迁入独立的 [Rust 维护工具包](tools/maintenance/README.md)，不再需要 Python。运行 `cargo test --manifest-path tools/maintenance/Cargo.toml --locked` 即可执行。维护工具的本地 SQLite 等依赖不会链接进生产 Wasm。
 
 保留的手写 JavaScript 是 `tests/worker_runtime.mjs`，用于加载真实编译产物，验证 Cloudflare 的 JS/Wasm 边界及模拟外部服务；改为纯原生 Rust 测试会失去这部分集成覆盖。`build/index.js` 由 SDK 自动生成，是当前部署路径所需的 Wasm 加载胶水。Node/Wrangler 仍用于构建及本地开发，不承担手写的审核业务逻辑。
+
+### 管理员日志模式
+
+统一用法：群内 `/logs on|warn|off`；私聊 `/logs -100GROUP_ID on|warn|off`，须是目标群管理员。省略模式可查询当前值，只接受 `on`、`warn`、`off`。
+
+- `on`：全部管理员私聊审核日志，保留当前默认行为。
+- `warn`：只发送删除/封禁、模拟或审计命中、人工复核、超过删除时限的违规及审核异常；跳过普通放行、已处理的重复消息，以及常规扫描完成/成功取消等信息通知。
+- `off`：关闭本群管理员主动私聊日志。
+
+三种模式均不影响命令回复和群内处罚公告，不改变 dry-run、阈值、处罚、归档或其他群设置。模式按群持久化，重启后保留；从 `warn` 切回 `on` 恢复全部日志。摘要在外部查询后再次读取模式再生成，避免设置变化时继续带出放行记录。
+
+现有部署需增量添加 `group_settings.logs_warn_only`。先运行 Rust 预检的 `--pre-migration` 模式，只执行打印出的 `schema/ensure_log_filter.sql` 中尚缺少的 ALTER，然后普通预检必须退出 0 才能发布。旧群组保留原开关及全部日志行为。该 ALTER 只执行一次，字段已存在时不要重复执行。

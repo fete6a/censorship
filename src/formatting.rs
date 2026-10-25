@@ -8,6 +8,13 @@ pub struct ReviewLine {
     pub probability: f64,
 }
 
+/// In warn mode keep actionable/review-needed outcomes and review failures.
+/// Routine allowed, pending and previously processed duplicates are quiet.
+pub fn is_warning_status(status: &str) -> bool {
+    matches!(status,"deleted"|"needs_review"|"dry_run_flag"|"audit_flag"|
+        "too_old_to_delete"|"review_error"|"policy_unavailable"|"no_group_description")
+}
+
 pub struct ActionUser {
     pub id: i64,
     pub name: String,
@@ -220,6 +227,15 @@ pub fn review_digest(chat_id: i64, rows: &[ReviewLine]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warn_filter_keeps_actionable_outcomes_and_failures_only() {
+        for status in ["deleted","needs_review","dry_run_flag","audit_flag","too_old_to_delete","review_error","policy_unavailable","no_group_description"] {
+            assert!(is_warning_status(status),"{status}");
+        }
+        for status in ["allow","pending","previously_deleted","unknown"] {
+            assert!(!is_warning_status(status),"{status}");
+        }
+    }
     #[test]
     fn escapes_untrusted_markdown() {
         let original="*x* [evil](https://bad.example) _test_ ! \\";

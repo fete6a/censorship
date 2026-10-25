@@ -1,5 +1,5 @@
 use censorship_maintenance::{
-    inspection_queries, parse_inspection_json, scan_migrations, validate, Result, Status,
+    additive_migrations, inspection_queries, parse_inspection_json, validate, Result, Status,
 };
 use std::{
     io::Read,
@@ -111,11 +111,25 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Status::MigrationRequired => {
-            println!("MIGRATION_REQUIRED: known additive warning objects or scan-fencing columns are absent.\nApply schema/ensure_warning_adjustments.sql manually (idempotent).");
-            for sql in scan_migrations(&rows) {
+            println!("MIGRATION_REQUIRED: known additive warning objects, scan-fencing or log-filter columns are absent.");
+            if ![
+                ("table", "warning_adjustments"),
+                ("table", "warning_edit_receipts"),
+                ("trigger", "apply_warning_edit_receipt"),
+            ]
+            .iter()
+            .all(|(kind, name)| {
+                rows.iter()
+                    .any(|row| row.object_type == *kind && row.object_name == *name)
+            }) {
+                println!("Apply schema/ensure_warning_adjustments.sql manually (idempotent).");
+            }
+            for sql in additive_migrations(&rows) {
                 println!("{sql}");
             }
-            println!("Apply only the missing scan ALTERs printed above, then rerun without --pre-migration.");
+            println!(
+                "Apply only the missing ALTERs printed above, then rerun without --pre-migration."
+            );
             Ok(3)
         }
         Status::Incompatible => {

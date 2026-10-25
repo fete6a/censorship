@@ -51,7 +51,7 @@ All other management commands check the issuing user's `getChatMember` administr
 | --- | --- | --- |
 | Removal threshold (query or set) | `/threshold [0.75 or 75%]` | `/threshold -100GROUP_ID [0.75 or 75%]` |
 | Enforcement mode (query or set) | `/dry-run [on\|off]` (also `/dry_run`) | `/dry_run -100GROUP_ID [on\|off]` |
-| Private review logs (query or set) | `/logs [on\|off]` | `/logs -100GROUP_ID [on\|off]` |
+| Private review logs (query or set) | `/logs [on\|warn\|off]` | `/logs -100GROUP_ID [on\|off]` |
 | Read group policy | `/rules` | `/rules -100GROUP_ID` |
 | Cancel pending ban (does not unmute) | `/cancel USER_ID` | `/cancel -100GROUP_ID USER_ID` |
 | Inspect pending/processing ban | `/pending USER_ID` | `/pending -100GROUP_ID USER_ID` |
@@ -62,7 +62,7 @@ All other management commands check the issuing user's `getChatMember` administr
 
 `/cancel` only cancels a `pending` ban in D1 and never restores Telegram permissions. The bot's 60-second restriction expires automatically unless a human changes it. A `processing` case may already have submitted a Telegram request and cannot be atomically recalled. Warning adjustments fence subsequent retries of the old violation.
 
-Send `/start` or `/help` in a group or private chat to see command help. Omitting `on`/`off` queries the current logs/dry-run setting. Replies are independent of private-log settings; a failed reply does not replay the completed management action.
+Send `/start` or `/help` in a group or private chat to see command help. Omitting the mode queries the current logs setting; omitting `on`/`off` queries dry-run. Replies are independent of private-log settings; a failed reply does not replay the completed management action.
 
 `/scan` and `/scan_id` accept a replied-to message in the same group or a message ID already archived for that group. **Single-message scans request enforcement by default**; append `audit` to inspect without punishment (`enforce` remains accepted). They report the stored status, category and violation score, and explicitly explain when a dry-run prevented deletion. Even an enforcement scan never bypasses group policy, a nonactionable category, configured threshold, a group's `/dry_run on` state, the 48-hour deletion window, Telegram permissions or duplicate-strike protections. **Bulk `/scan_all` also requests enforcement by default**; `audit` is the explicit non-punitive option, and `enforce` remains accepted. The group's dry-run setting still blocks punitive actions. Starting another `/scan_all` while the same group's scan is running returns a conflict message without resetting its mode or progress; use `/scan_status` or `/scan_stop` before restarting. Independent groups can scan separately. The Bot API cannot fetch arbitrary unarchived messages by ID. Missing policy or model failure is reported as unavailable, not a clean pass; transient errors retain Queue retries.
 
@@ -85,7 +85,7 @@ Cancellation fences future D1 scan progress, completion and ordinary historical 
 - `ARCHIVE_DAYS=0` means archived messages are **not automatically removed**. Set an appropriate positive retention period for your deployment. This setting only controls `archived_messages`, not other D1 tables or delivered Telegram logs. Use an explicit non-negative integer: a missing, malformed, negative or overflowing value now reports a cleanup error instead of silently becoming unlimited retention. Fixed-window D1 cleanup remains independent.
 - `BOT_USERNAME` is used to recognize commands addressed to this bot in groups.
 - There is **no active `ADMIN_DM_CHAT_ID` recipient configuration**. Leaving it unset **does not** disable administrator DMs. Setting it does not select or change the current per-group recipients. Use `/logs off` separately for any group whose private review logs should be disabled.
-- The persistent per-group `logs_enabled` and `dry_run` switches and `remove_threshold` value live in D1; they are **not** controlled by a global DM chat ID. New databases use the **current full schema** (`schema/current.sql`), applied only to an empty database via `npx wrangler d1 execute DB --remote --file schema/current.sql`. **Never run that bootstrap file on existing D1 data.** To enable `/warnings` safely on an existing deployment, first apply the *additive, idempotent* `schema/ensure_warning_adjustments.sql` with the authorized Cloudflare D1 connector (or `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql`); it creates `warning_adjustments`, `warning_edit_receipts` and the `apply_warning_edit_receipt` trigger without deleting violation history. The trigger applies future warning edits and pending-ban cancellation atomically. Also apply the missing scan-fencing ALTERs printed by the preflight. GitHub Actions builds/tests artifacts only; upload through Cloudflare MCP only after the complete production schema passes the normal check.
+- The persistent per-group `logs_enabled`, `logs_warn_only` and `dry_run` switches and `remove_threshold` value live in D1; they are **not** controlled by a global DM chat ID. New databases use the **current full schema** (`schema/current.sql`), applied only to an empty database via `npx wrangler d1 execute DB --remote --file schema/current.sql`. **Never run that bootstrap file on existing D1 data.** To enable `/warnings` safely on an existing deployment, first apply the *additive, idempotent* `schema/ensure_warning_adjustments.sql` with the authorized Cloudflare D1 connector (or `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql`); it creates `warning_adjustments`, `warning_edit_receipts` and the `apply_warning_edit_receipt` trigger without deleting violation history. The trigger applies future warning edits and pending-ban cancellation atomically. Also apply the missing scan-fencing ALTERs printed by the preflight. GitHub Actions builds/tests artifacts only; upload through Cloudflare MCP only after the complete production schema passes the normal check.
 
 See `wrangler.jsonc`, `schema/current.sql` and `.github/workflows/build.yml` for current D1/Queues bindings, a fresh-database bootstrap, Rust fat-LTO CI and manual MCP deployment. Production must have the current schema, queues, AI binding, Telegram webhook and secrets configured before deploying; old schema layouts are not supported.
 
@@ -136,3 +136,17 @@ the actual compiled JS/Wasm artifact and Cloudflare host boundary. Generated
 build/development tools; replacing those boundary tests with native Rust would
 lose integration coverage. The native maintenance dependencies are isolated from
 the production Worker crate.
+
+### Administrator log modes
+
+Use `/logs on|warn|off` in the group, or `/logs -100GROUP_ID on|warn|off` privately as an administrator of that exact group. Omit the mode to query it. The only accepted modes are `on`, `warn` and `off`.
+
+| Mode | Unsolicited private administrator logs |
+| --- | --- |
+| `on` | All review logs and existing action/scan notifications (unchanged default) |
+| `warn` | Deletions/bans, dry-run and audit hits, manual-review outcomes, too-old violations and review failures; skips ordinary allows, already-processed duplicates and routine success/info scan/cancellation notices |
+| `off` | No unsolicited private administrator logs |
+
+Command replies and group action notices always remain independent of these modes. The mode is persisted per group, survives restarts and does not change dry-run, thresholds, penalties or archiving. `on` restores full logging after `warn`; delivery rechecks the mode after external lookups before rendering digests.
+
+Existing deployments require the additive `group_settings.logs_warn_only` column. Run the Rust preflight in `--pre-migration` mode, execute only the missing ALTER printed from `schema/ensure_log_filter.sql`, then require a normal preflight exit 0 before uploading this Worker. Existing groups keep their previous on/off setting and default all-log behavior. This is a one-time ALTER; do not rerun it if the column already exists.
