@@ -1509,3 +1509,41 @@ await test('Telegram deletion already in flight is not represented as atomically
  assert.equal(f.telegram.some(x=>['restrictChatMember','banChatMember'].includes(x.method)),false);
  assert.equal(f.reviews.get(groupA+':17')?.last_status,'deleted');
 });
+
+
+await test('non-media Telegram message types are archived and routed to flash with typed context', async()=>{
+  for(const [kind,value] of [
+    ['poll',{question:'Do you want ads?',options:[{text:'Yes'},{text:'No'}]}],
+    ['contact',{first_name:'Alice',last_name:'Example',phone_number:'+1234567890'}],
+    ['location',{latitude:1.234,longitude:2.345}],
+    ['dice',{emoji:'🎲',value:5}],
+    ['invoice',{title:'Invoice',description:'Donation',currency:'USD',payload:'private-reference'}],
+  ]){
+    const f=fixture();
+    const u=message(groupA,4600);
+    delete u.message.text;
+    u.message[kind]=value;
+    await f.consume(u);
+    assert.equal(f.aiCalls.length,1,kind);
+    assert.equal(f.aiCalls[0].model,'@cf/cloudflare/clef-flash',kind);
+    assert.ok(f.aiCalls[0].input.state.structured_message[kind],kind);
+    const sent=JSON.stringify(f.aiCalls[0].input.state.structured_message);
+    assert.ok(!sent.includes('+1234567890'),'phone number must not be forwarded to AI');
+    assert.ok(!sent.includes('1.234'),'precise location must not be forwarded to AI');
+    assert.ok(!sent.includes('private-reference'),'invoice payload must not be forwarded to AI');
+    assert.equal(f.archives.get(groupA+':4600')[kind]!=null,true);
+  }
+});
+
+await test('administrator flagged messages cannot bypass Bot API 48 hour deletion window',async()=>{
+  const f=fixture({remove:true});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  const update=message(groupA,4601);
+  update.message.from.id=11;
+  update.message.date=Math.floor(Date.now()/1000)-49*3600;
+  await f.consume(update);
+  assert.equal(f.aiCalls.length,1);
+  assert.equal(f.reviews.get(groupA+':4601')?.last_status,'too_old_to_delete');
+  assert.equal(f.telegram.some(call=>call.method==='deleteMessage'),false);
+  assert.equal(f.telegram.some(call=>call.method==='banChatMember'),false);
+});
