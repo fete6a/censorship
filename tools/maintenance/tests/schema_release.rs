@@ -356,6 +356,10 @@ fn log_filter_migration_is_additive_and_preserves_each_existing_mode() {
     batch(&db, pending[0]);
     assert_eq!(check(&db, false).status, Status::Ready);
     assert!(additive_migrations(&inspect_sqlite(&db).unwrap()).is_empty());
+    // The raw ALTER is deliberately one-time. An accidental rerun fails
+    // rather than silently changing any existing settings.
+    assert!(db.execute_batch(ENSURE_LOG_FILTER).is_err());
+    assert_eq!(check(&db, false).status, Status::Ready);
     assert_eq!(sql(&db,"SELECT chat_id,dry_run,logs_enabled,remove_threshold FROM group_settings ORDER BY chat_id",json!([])),snapshot);
     assert_eq!(
         sql(
@@ -387,5 +391,43 @@ fn wrong_existing_log_filter_column_blocks_release_and_migration() {
             assert_eq!(check(&db, pre).status, Status::Incompatible);
         }
         assert!(additive_migrations(&inspect_sqlite(&db).unwrap()).is_empty());
+    }
+}
+
+#[test]
+fn log_filter_check_constraint_must_match_approved_addition() {
+    let before = SCHEMA.replace(
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        "",
+    );
+    // All variants have identical PRAGMA table_info column metadata. Only
+    // sqlite_master retains the CHECK constraint and any extra restrictions.
+    for column in [
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,2))",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only >= 0)",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1)) CHECK (logs_warn_only = 0)",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 /* CHECK (logs_warn_only IN (0,1)) */",
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        batch(&db, &before);
+        batch(&db, &format!("ALTER TABLE group_settings ADD COLUMN {column}"));
+        let rows = inspect_sqlite(&db).unwrap();
+        let log_column = rows
+            .iter()
+            .find(|r| r.object_name == "group_settings" && r.column_name.as_deref() == Some("logs_warn_only"))
+            .unwrap();
+        assert_eq!(log_column.data_type.as_deref(), Some("INTEGER"));
+        assert_eq!(log_column.not_null, Some(1));
+        assert_eq!(log_column.default_value.as_deref(), Some("0"));
+        assert!(additive_migrations(&rows).is_empty(), "{column}");
+        for pre in [true, false] {
+            let result = validate(&rows, pre).unwrap();
+            assert_eq!(result.status, Status::Incompatible, "{column}, pre={pre}");
+            assert!(
+                result.errors.iter().any(|e| e.contains("group_settings.logs_warn_only CHECK/column DDL mismatch")),
+                "{column}: {:?}", result.errors
+            );
+        }
     }
 }

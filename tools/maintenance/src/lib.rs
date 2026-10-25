@@ -13,6 +13,10 @@ pub const ENSURE_LOG_FILTER: &str = include_str!("../../../schema/ensure_log_fil
 pub const METADATA_SQL: &str = "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type,name";
 const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.type,p.\"notnull\",p.pk,p.dflt_value FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS p ON m.type='table' WHERE m.type IN ('table','index','trigger') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.type,m.name,p.cid";
 const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
+// PRAGMA table_info omits CHECK constraints. The canonical schema and approved
+// additive ALTER both place this exact column declaration last.
+const LOG_FILTER_COLUMN_DDL_SUFFIX: &str =
+    ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT0CHECK(LOGS_WARN_ONLYIN(0,1)))";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
@@ -332,6 +336,14 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
                     "column type/constraint/default mismatch: {name}.{}",
                     column.unwrap_or("")
                 ));
+            }
+        }
+        if name == "group_settings" && got_cols.contains_key(&Some("logs_warn_only")) {
+            // Compare only the new column's DDL; historical definitions of
+            // unrelated settings need not be textually identical to SCHEMA.
+            let ddl = normalized_ddl(got[0].definition.as_deref().unwrap_or(""));
+            if !ddl.trim_end_matches(';').ends_with(LOG_FILTER_COLUMN_DDL_SUFFIX) {
+                errors.push("group_settings.logs_warn_only CHECK/column DDL mismatch".into());
             }
         }
         if got_cols.keys().any(|c| !exp_cols.contains_key(c)) {
