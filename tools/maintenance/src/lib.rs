@@ -9,6 +9,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub const SCHEMA: &str = include_str!("../../../schema/current.sql");
 pub const ENSURE_WARNINGS: &str = include_str!("../../../schema/ensure_warning_adjustments.sql");
 pub const ENSURE_SCAN: &str = include_str!("../../../schema/ensure_scan_fencing.sql");
+pub const ENSURE_LOG_FILTER: &str = include_str!("../../../schema/ensure_log_filter.sql");
 pub const METADATA_SQL: &str = "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type,name";
 const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.type,p.\"notnull\",p.pk,p.dflt_value FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS p ON m.type='table' WHERE m.type IN ('table','index','trigger') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.type,m.name,p.cid";
 const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
@@ -238,6 +239,22 @@ pub fn scan_migrations(rows: &[Row]) -> Vec<&'static str> {
         .collect()
 }
 
+pub fn additive_migrations(rows: &[Row]) -> Vec<&'static str> {
+    let mut statements = scan_migrations(rows);
+    if !rows.iter().any(|r| {
+        r.object_type == "table"
+            && r.object_name == "group_settings"
+            && r.column_name.as_deref() == Some("logs_warn_only")
+    }) {
+        statements.extend(
+            ENSURE_LOG_FILTER
+                .lines()
+                .filter(|line| line.starts_with("ALTER TABLE ")),
+        );
+    }
+    statements
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     Ready,
@@ -292,8 +309,8 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         for (&column, e) in &exp_cols {
             let Some(g) = got_cols.get(&column) else {
                 if pre_migration
-                    && name == "scan_jobs"
-                    && column.is_some_and(|c| SCAN_COLUMNS.contains(&c))
+                    && ((name == "scan_jobs" && column.is_some_and(|c| SCAN_COLUMNS.contains(&c)))
+                        || (name == "group_settings" && column == Some("logs_warn_only")))
                 {
                     missing = true;
                 } else {

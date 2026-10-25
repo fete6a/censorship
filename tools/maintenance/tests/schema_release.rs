@@ -24,7 +24,15 @@ fn snapshot(db: &Connection) -> Value {
         "pending_bans",
         "d1_migrations"
     ]
-    .map(|name| sql(db, &format!("SELECT * FROM {name}"), json!([]))))
+    .map(|name| sql(
+        db,
+        &if name == "group_settings" {
+            "SELECT chat_id,dry_run,logs_enabled,remove_threshold FROM group_settings".into()
+        } else {
+            format!("SELECT * FROM {name}")
+        },
+        json!([])
+    )))
 }
 fn inspection_batch(db: &Connection) -> Vec<Value> {
     inspection_queries()
@@ -110,7 +118,7 @@ fn wrong_warning_table_is_not_repaired_by_if_not_exists() {
 fn partial_migration_failure_is_retryable_without_data_loss() {
     let db = old();
     let before = snapshot(&db);
-    for s in scan_migrations(&inspect_sqlite(&db).unwrap()) {
+    for s in additive_migrations(&inspect_sqlite(&db).unwrap()) {
         batch(&db, s);
     }
     assert!(db.execute_batch(&format!("{ENSURE_WARNINGS} INSERT INTO warning_adjustments(chat_id,user_id,base_count,adjusted_at,actor_id) VALUES(-100,22,99,1700000000,11)")).is_err());
@@ -287,6 +295,7 @@ fn scan_migration_resumes_each_partial_state_preserving_jobs() {
         "INSERT INTO scan_jobs(chat_id,max_message_id,started_at,updated_at) VALUES(-100,42,1,1)",
     );
     batch(&db, ENSURE_WARNINGS);
+    batch(&db, ENSURE_LOG_FILTER);
     let statements = scan_migrations(&inspect_sqlite(&db).unwrap());
     assert_eq!(statements.len(), 3);
     for (i, s) in statements.iter().enumerate() {
@@ -323,4 +332,60 @@ fn bootstrap_is_for_an_empty_database_only() {
         "SELECT name FROM sqlite_master WHERE name='d1_migrations'",
         json!([])
     )));
+}
+
+#[test]
+fn log_filter_migration_is_additive_and_preserves_each_existing_mode() {
+    let before = SCHEMA.replace(
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        "",
+    );
+    let db = Connection::open_in_memory().unwrap();
+    batch(&db, &before);
+    batch(&db,"INSERT INTO group_settings(chat_id,dry_run,logs_enabled,remove_threshold) VALUES(-100,0,0,0.8),(-200,1,1,0.9)");
+    let snapshot = sql(
+        &db,
+        "SELECT * FROM group_settings ORDER BY chat_id",
+        json!([]),
+    );
+    assert_eq!(check(&db, true).status, Status::MigrationRequired);
+    assert_eq!(check(&db, false).status, Status::Incompatible);
+    let pending = additive_migrations(&inspect_sqlite(&db).unwrap());
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].contains("group_settings ADD COLUMN logs_warn_only"));
+    batch(&db, pending[0]);
+    assert_eq!(check(&db, false).status, Status::Ready);
+    assert!(additive_migrations(&inspect_sqlite(&db).unwrap()).is_empty());
+    assert_eq!(sql(&db,"SELECT chat_id,dry_run,logs_enabled,remove_threshold FROM group_settings ORDER BY chat_id",json!([])),snapshot);
+    assert_eq!(
+        sql(
+            &db,
+            "SELECT logs_warn_only FROM group_settings ORDER BY chat_id",
+            json!([])
+        ),
+        json!([[0], [0]])
+    );
+}
+
+#[test]
+fn wrong_existing_log_filter_column_blocks_release_and_migration() {
+    let before = SCHEMA.replace(
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        "",
+    );
+    for column in [
+        "logs_warn_only TEXT",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 1",
+    ] {
+        let db = Connection::open_in_memory().unwrap();
+        batch(&db, &before);
+        batch(
+            &db,
+            &format!("ALTER TABLE group_settings ADD COLUMN {column}"),
+        );
+        for pre in [false, true] {
+            assert_eq!(check(&db, pre).status, Status::Incompatible);
+        }
+        assert!(additive_migrations(&inspect_sqlite(&db).unwrap()).is_empty());
+    }
 }

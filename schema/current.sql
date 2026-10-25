@@ -17,7 +17,7 @@ CREATE TABLE archived_messages (
   PRIMARY KEY (chat_id, message_id)
 );
 
-CREATE TABLE group_settings (chat_id INTEGER PRIMARY KEY CHECK (chat_id < 0), dry_run INTEGER CHECK (dry_run IN (0,1)), logs_enabled INTEGER NOT NULL DEFAULT 1 CHECK (logs_enabled IN (0,1)), remove_threshold REAL CHECK(remove_threshold IS NULL OR remove_threshold BETWEEN 0 AND 1));
+CREATE TABLE group_settings (chat_id INTEGER PRIMARY KEY CHECK (chat_id < 0), dry_run INTEGER CHECK (dry_run IN (0,1)), logs_enabled INTEGER NOT NULL DEFAULT 1 CHECK (logs_enabled IN (0,1)), remove_threshold REAL CHECK(remove_threshold IS NULL OR remove_threshold BETWEEN 0 AND 1), logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1)));
 
 CREATE TABLE managed_chats (
   chat_id INTEGER PRIMARY KEY,

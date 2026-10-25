@@ -176,6 +176,14 @@ async fn review_with_policy_cache(
         }
         Err(error) => {
             store::finish_review_scoped(env, chat_id, msg_id, "policy_unavailable", "none", 0.0,scan).await?;
+            // Unlike completed reviews, a retryable rule lookup failure never
+            // reaches the Queue digest. Send a scoped best-effort error notice
+            // without acknowledging the update or changing moderation outcomes.
+            // A persistent upstream failure may notify again on later retries.
+            if mode == Mode::Live && scan.is_none() {
+                let _=tg::send_to_review_or_chat_titled(env,chat_id,NoticeTone::Error,
+                    "群规查询失败",&format!("消息：{msg_id}\n本次审核未完成，系统将自动重试。")).await;
+            }
             return Err(error);
         }
     };
@@ -386,7 +394,7 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             "群组管理命令（仅管理员）：\n",
             "/threshold 0.75（或 75%）— 设置删除阈值\n",
             "/dry_run on|off — 模拟模式\n",
-            "/logs on|off — 管理员私聊日志\n",
+            "/logs on|warn|off — 全部日志、仅警告或关闭管理员私聊日志\n",
             "/scan [audit|enforce] — 回复消息后审核，默认按规则执行处罚\n",
             "/scan MESSAGE_ID [audit|enforce] — 审核已归档消息\n",
             "/warnings USER_ID [0-3] — 查询或设置近 7 天警告次数\n",
@@ -473,8 +481,26 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
             let reply=format!("群组：{chat_id}\n删除阈值：{:.1}%\n生效范围：仅影响后续审核。",value*100.0);
             reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"删除阈值",&reply).await?;
         }
-        "/dry-run" | "/dry_run" | "/logs" => {
-            let dry_run=cmd!="/logs";
+        "/logs" => {
+            let changed=!args.is_empty();
+            if changed {
+                let Some(mode)=store::LogMode::parse(&args) else {
+                    reply_msg(env,msg,NoticeTone::Warning,"参数错误",
+                        "用法：/logs on|warn|off；省略参数查询，私聊请先指定 GROUP_ID。").await?;
+                    return Ok(true);
+                };
+                store::set_group_log_mode(env,chat_id,mode).await?;
+            }
+            let mode=store::group_log_mode(env,chat_id).await?;
+            let explanation=match mode {
+                store::LogMode::All=>"发送全部管理员私聊审核日志。",
+                store::LogMode::Warn=>"仅发送警告、处罚和审核异常；不发送普通放行记录或常规扫描完成通知。",
+                store::LogMode::Off=>"关闭本群管理员私聊日志。",
+            };
+            let reply=format!("群组：{chat_id}\n功能：管理员私聊日志\n当前模式：{}\n说明：{explanation}\n群内处罚公告与命令回复不受影响。",mode.name());
+            reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"群组设置",&reply).await?;
+        }
+        "/dry-run" | "/dry_run" => {
             let changed=!args.is_empty();
             if changed {
                 let enabled=match args.as_slice() {
@@ -485,18 +511,13 @@ async fn execute_admin_command(env: &Env, msg: &Value, cmd: &str, words: Vec<&st
                         return Ok(true);
                     }
                 };
-                store::set_group_option(env,chat_id,dry_run,enabled).await?;
+                store::set_group_dry_run(env,chat_id,enabled).await?;
             }
-            let enabled=if dry_run {store::group_dry_run(env,chat_id).await?} else {store::group_logs(env,chat_id).await?};
-            let name=if dry_run {"模拟审核（dry-run）"} else {"管理员私聊日志"};
-            let explanation=if dry_run {
+            let enabled=store::group_dry_run(env,chat_id).await?;
+            let name="模拟审核（dry-run）";
+            let explanation=
                 if enabled {"仅审核和记录，不执行删除或封禁。"}
-                else {"允许按群规执行处罚，仍受权限及安全检查限制。"}
-            } else if enabled {
-                "按群发送管理员私聊审核日志。"
-            } else {
-                "仅关闭本群私人审核日志；群内处罚公告与命令回复仍会发送。"
-            };
+                else {"允许按群规执行处罚，仍受权限及安全检查限制。"};
             let reply=format!("群组：{chat_id}\n功能：{name}\n当前状态：{}\n说明：{explanation}",if enabled {"开启"} else {"关闭"});
             reply_msg(env,msg,if changed {NoticeTone::Success} else {NoticeTone::Info},"群组设置",&reply).await?;
         }

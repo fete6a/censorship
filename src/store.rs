@@ -564,10 +564,12 @@ pub async fn can_auto_ban(env: &Env, chat_id: i64) -> Result<bool> {
 pub struct GroupSettings {
     pub dry_run: Option<i64>,
     pub logs_enabled: i64,
+    #[serde(default)]
+    pub logs_warn_only: i64,
     pub remove_threshold: Option<f64>,
 }
 pub async fn group_settings(env: &Env, chat_id: i64) -> Result<Option<GroupSettings>> {
-    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled,remove_threshold FROM group_settings WHERE chat_id=?")
+    env.d1("DB")?.prepare("SELECT dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings WHERE chat_id=?")
         .bind(&[js_i64(chat_id)])?.first::<GroupSettings>(None).await
 }
 pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
@@ -576,6 +578,34 @@ pub async fn group_dry_run(env: &Env, chat_id: i64) -> Result<bool> {
 }
 pub async fn group_logs(env: &Env, chat_id: i64) -> Result<bool> {
     Ok(group_settings(env,chat_id).await?.map(|s|s.logs_enabled!=0).unwrap_or(true))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogMode { Off, All, Warn }
+
+impl LogMode {
+    pub fn parse(args: &[&str]) -> Option<Self> {
+        match args { ["on"]=>Some(Self::All), ["warn"]=>Some(Self::Warn), ["off"]=>Some(Self::Off), _=>None }
+    }
+    pub fn name(self) -> &'static str {
+        match self { Self::Off=>"off", Self::All=>"on", Self::Warn=>"warn" }
+    }
+}
+
+pub async fn group_log_mode(env: &Env, chat_id: i64) -> Result<LogMode> {
+    Ok(match group_settings(env,chat_id).await? {
+        Some(s) if s.logs_enabled==0 => LogMode::Off,
+        Some(s) if s.logs_warn_only!=0 => LogMode::Warn,
+        _ => LogMode::All,
+    })
+}
+
+pub async fn set_group_log_mode(env: &Env, chat_id: i64, mode: LogMode) -> Result<()> {
+    if chat_id>=0 {return Err(fail("Invalid group ID"));}
+    env.d1("DB")?.prepare(
+        "INSERT INTO group_settings(chat_id,logs_enabled,logs_warn_only) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET logs_enabled=excluded.logs_enabled,logs_warn_only=excluded.logs_warn_only"
+    ).bind(&[js_i64(chat_id),js_i64(i64::from(mode!=LogMode::Off)),js_i64(i64::from(mode==LogMode::Warn))])?.run().await?;
+    Ok(())
 }
 pub async fn group_threshold(env: &Env, chat_id: i64) -> Result<f64> {
     Ok(group_settings(env,chat_id).await?.and_then(|s|s.remove_threshold).unwrap_or(0.93))
@@ -589,15 +619,12 @@ pub async fn set_group_threshold(env: &Env, chat_id: i64, threshold: f64) -> Res
     ).bind(&[js_i64(chat_id),JsValue::from_f64(threshold)])?.run().await?;
     Ok(())
 }
-pub async fn set_group_option(env: &Env, chat_id: i64, dry_run: bool, enabled: bool) -> Result<()> {
+pub async fn set_group_dry_run(env: &Env, chat_id: i64, enabled: bool) -> Result<()> {
     if chat_id>=0 {return Err(fail("Invalid group ID"));}
-    let sql=if dry_run {
+    env.d1("DB")?.prepare(
         "INSERT INTO group_settings(chat_id,dry_run) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run"
-    } else {
-        "INSERT INTO group_settings(chat_id,logs_enabled) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET logs_enabled=excluded.logs_enabled"
-    };
-    env.d1("DB")?.prepare(sql).bind(&[js_i64(chat_id),js_i64(i64::from(enabled))])?.run().await?;
-    if dry_run && enabled {
+    ).bind(&[js_i64(chat_id),js_i64(i64::from(enabled))])?.run().await?;
+    if enabled {
         env.d1("DB")?.prepare("UPDATE pending_bans SET status='canceled',cancellation_reason='dry_run_enabled',resolved_at=? WHERE chat_id=? AND status='pending'")
             .bind(&[js_i64(now()),js_i64(chat_id)])?.run().await?;
     }
@@ -626,5 +653,20 @@ mod archive_retention_tests {
             assert!(archive_cutoff(raw, 20_000_000).is_err(), "{raw}");
         }
         assert!(archive_cutoff("1", i64::MIN).is_err());
+    }
+}
+
+#[cfg(test)]
+mod log_mode_tests {
+    use super::LogMode;
+    #[test]
+    fn log_modes_accept_only_the_three_documented_single_arguments() {
+        for (arg,mode) in [("on",LogMode::All),("warn",LogMode::Warn),("off",LogMode::Off)] {
+            assert_eq!(LogMode::parse(&[arg]),Some(mode));
+            assert_eq!(mode.name(),arg);
+        }
+        for args in [vec![],vec!["warn","only"],vec!["warn(only)"],vec!["only"],vec!["WARN"],vec!["on","off"]] {
+            assert_eq!(LogMode::parse(&args),None);
+        }
     }
 }

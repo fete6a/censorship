@@ -137,7 +137,7 @@ fn private_logs_target_current_human_admins_and_group_switch_is_documented() {
     contains(
         delivery,
         &[
-            "group_logs(env,chat_id)",
+            "group_log_mode(env,chat_id)",
             "getChatAdministrators",
             "member[\"user\"][\"is_bot\"]==true",
             "post_markdown(env,user_id,",
@@ -413,38 +413,41 @@ fn media_transcoder_and_history_import_stay_native_rust() {
 
 #[test]
 fn group_option_updates_are_partial_and_isolated() {
-    use syn::visit::Visit;
-    struct Strings(Vec<String>);
-    impl<'a> Visit<'a> for Strings {
-        fn visit_lit_str(&mut self, s: &'a syn::LitStr) {
-            if s.value().starts_with("INSERT INTO group_settings") {
-                self.0.push(s.value());
-            }
-        }
-    }
-    let file = syn::parse_file(&source("src/store.rs")).unwrap();
-    let mut strings = Strings(Vec::new());
-    let function = file
-        .items
-        .iter()
-        .find_map(|i| match i {
-            syn::Item::Fn(f) if f.sig.ident == "set_group_option" => Some(f),
-            _ => None,
-        })
-        .unwrap();
-    strings.visit_block(&function.block);
     let db = db();
-    batch(&db, "INSERT INTO group_settings(chat_id) VALUES(-1002)");
-    assert_eq!(strings.0.len(), 2);
-    for query in strings.0 {
-        sql(&db, &query, json!([-1001, 0]));
-    }
+    batch(&db,"INSERT INTO group_settings(chat_id,dry_run,logs_enabled,remove_threshold) VALUES(-1001,0,1,0.8); INSERT INTO group_settings(chat_id) VALUES(-1002)");
+    q(&db, "set_group_log_mode", json!([-1001, 1, 1]));
+    assert_eq!(sql(&db,"SELECT chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings ORDER BY chat_id DESC",json!([])),json!([[-1001,0,1,1,0.8],[-1002,null,1,0,null]]));
+    q(&db, "set_group_dry_run", json!([-1001, 1]));
     assert_eq!(
         sql(
             &db,
-            "SELECT chat_id,dry_run,logs_enabled FROM group_settings ORDER BY chat_id DESC",
+            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
             json!([])
         ),
-        json!([[-1001, 0, 0], [-1002, null, 1]])
+        json!([[1, 1, 1]])
     );
+    q(&db, "set_group_log_mode", json!([-1001, 0, 0]));
+    assert_eq!(
+        sql(
+            &db,
+            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
+            json!([])
+        ),
+        json!([[1, 0, 0]])
+    );
+    q(&db, "set_group_log_mode", json!([-1001, 1, 0]));
+    assert_eq!(
+        sql(
+            &db,
+            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
+            json!([])
+        ),
+        json!([[1, 1, 0]])
+    );
+    assert!(try_sql(
+        &db,
+        "UPDATE group_settings SET logs_warn_only=2 WHERE chat_id=-1001",
+        json!([])
+    )
+    .is_err());
 }

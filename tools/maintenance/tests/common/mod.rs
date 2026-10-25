@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use censorship_maintenance::{canonical_db, inspect_sqlite, scan_migrations, ENSURE_WARNINGS};
+use censorship_maintenance::{additive_migrations, canonical_db, inspect_sqlite, ENSURE_WARNINGS};
 use rusqlite::{
     functions::FunctionFlags,
     types::{Value as SqlValue, ValueRef},
@@ -112,7 +112,7 @@ pub fn clock(db: &Connection, now: i64) -> Arc<AtomicI64> {
     time
 }
 pub fn migrate(db: &Connection) {
-    for statement in scan_migrations(&inspect_sqlite(db).unwrap()) {
+    for statement in additive_migrations(&inspect_sqlite(db).unwrap()) {
         batch(db, statement);
     }
     batch(db, ENSURE_WARNINGS);

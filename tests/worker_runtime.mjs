@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
+function fixture({ pauseAdmins = null, pauseAi = null, pauseDelete = null, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false } = {}) {
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
@@ -164,6 +164,7 @@ function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remov
           if (sql.includes('INSERT INTO group_settings')) {
             const row = settings.get(values[0]) || { dry_run: null, logs_enabled: 1 };
             row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
+            if (sql.includes('logs_warn_only')) row.logs_warn_only = values[2];
             settings.set(values[0], row);
           }
           if (sql.includes('INSERT INTO scan_jobs')) throw new Error('Scan start must use atomic RETURNING');
@@ -219,6 +220,7 @@ function fixture({ pauseAi = null, pauseDelete = null, queueError = false, remov
     const args = JSON.parse(await request.text());
     telegram.push({ method, args });
     if (method === 'getFile') return Response.json({ok:true,result:{file_path:'fixtures/'+args.file_id,file_size:4}});
+    if (method === 'getChatAdministrators' && pauseAdmins) await pauseAdmins(args.chat_id);
     if (method === 'getChatAdministrators') return Response.json({ ok: true, result: [
       ...(args.chat_id === groupA ? adminsA : [21]).map(id=>({status:owners[args.chat_id]?.id===id?'creator':'administrator',user:{id,is_bot:false,...(owners[args.chat_id]?.id===id?owners[args.chat_id]:{})}})),
       { status: 'administrator', user: { id: 99, is_bot: true } },
@@ -553,6 +555,106 @@ await test('logs off for group A does not disable group B logs or change dry-run
  f.telegram.length=0; await f.consume(message(groupA)); await f.consume(message(groupB,457));
  const sends=f.telegram.filter(c=>c.method==='sendMessage');
  assert.deepEqual(sends.map(c=>c.args.chat_id),[21]);
+});
+
+await test('logs warn is persisted per group and leaves dry-run, threshold and other groups unchanged',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:0,logs_enabled:0,remove_threshold:0.8});
+ await f.consume(command(`/logs ${groupA} warn`));
+ assert.deepEqual(f.settings.get(groupA),{dry_run:0,logs_enabled:1,remove_threshold:0.8,logs_warn_only:1});
+ assert.equal(f.settings.has(groupB),false);
+ assert.match(f.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/warn/);
+ assert.equal(f.statements.filter(s=>s.operation==='write'&&s.sql.includes('INSERT INTO group_settings')).length,1);
+ f.telegram.length=0;await f.consume({...command(`/logs ${groupA}`),update_id:790});
+ assert.match(f.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/warn/);
+});
+await test('logs on restores full logs and off disables them after warn',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ await f.consume(command(`/logs ${groupA} on`));assert.equal(f.settings.get(groupA).logs_warn_only,0);assert.equal(f.settings.get(groupA).logs_enabled,1);
+ f.telegram.length=0;await f.consume(message(groupA,2100));assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11));
+ await f.consume({...command(`/logs ${groupA} off`),update_id:2101});assert.equal(f.settings.get(groupA).logs_enabled,0);
+ f.telegram.length=0;await f.consume(message(groupA,2102));assert.equal(f.telegram.some(c=>c.method==='sendMessage'),false);
+});
+await test('logs warn accepts addressed group commands but cannot retarget another group',async()=>{
+ const f=fixture();await f.consume(command('/logs@example_bot warn',{id:groupA,type:'supergroup'}));
+ assert.equal(f.settings.get(groupA).logs_warn_only,1);
+ await f.consume({...command(`/logs ${groupB} warn`),update_id:2110});assert.equal(f.settings.has(groupB),false);
+});
+await test('logs only accepts on warn off and rejects the singular log alias and extra only argument',async()=>{
+ for(const text of [`/logs ${groupA} warn only`,`/logs ${groupA} warn(only)`,`/logs ${groupA} only`,`/log ${groupA} warn`]) {
+  const f=fixture();await f.consume(command(text));assert.equal(f.settings.size,0,text);
+  assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11),text);
+ }
+});
+await test('warn mode suppresses allowed digests and avoids administrator lookups without affecting reviews',async()=>{
+ const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ const outcomes=await f.consumeBatch(Array.from({length:20},(_,i)=>message(groupA,2200+i)));
+ assert.ok(outcomes.every(o=>o.acked&&!o.retried));assert.equal(f.aiCalls.length,20);
+ assert.equal(f.telegram.some(c=>c.method==='getChatAdministrators'||c.method==='sendMessage'),false);
+});
+await test('warn mode keeps only flagged rows in mixed digests while another group still receives allows',async()=>{
+ const f=fixture({remove:true,scores:[0.1,0.99,0.1]});f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ await f.consumeBatch([message(groupA,2300),message(groupA,2301),message(groupB,2302)]);
+ const a=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id===11)?.args.text||'';
+ assert.match(a,/1 条/);assert.ok(a.includes('2301'));assert.ok(!a.includes('2300'));assert.match(a,/模拟命中/);
+ assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===21&&c.args.text.includes('2302')));
+});
+await test('retryable policy lookup errors alert only permitted admins in on or warn modes',async()=>{
+ for(const mode of ['on','warn','off']) {
+  const f=fixture({policyFail:true});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:mode==='off'?0:1,logs_warn_only:mode==='warn'?1:0});
+  await f.consume(message(groupA,2390),{retry:true});
+  assert.equal(f.reviews.get(`${groupA}:2390`)?.last_status,'policy_unavailable');
+  assert.equal(f.completed.has(2390),false,'retryable error must not be acknowledged');
+  assert.equal(f.telegram.some(c=>['deleteMessage','banChatMember','restrictChatMember'].includes(c.method)),false);
+  const notices=f.telegram.filter(c=>c.method==='sendMessage');
+  if (mode==='off') assert.equal(notices.length,0);
+  else {
+   assert.equal(notices.length,1,'send only a scoped warning on this attempt');
+   assert.equal(notices[0].args.chat_id,11,'use the current human administrator, not a global target');
+   assert.match(notices[0].args.text,/群规查询失败/);
+   assert.match(notices[0].args.text,/2390/);
+  }
+ }
+});
+await test('warn mode retains audit hits, uncertain decisions and inference failures without fake scores',async()=>{
+ for(const options of [{remove:true},{remove:true,score:.99,categoryChoice:'none'},{aiFail:true},{rules:''}]) {
+  const f=fixture(options);f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});await f.consume(message(groupA,2400));
+  const log=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id===11)?.args.text||'';assert.ok(log.includes('2400'));
+  if(options.aiFail||options.rules==='')assert.ok(!log.includes('违规概率'));
+ }
+ const audit=fixture({remove:true});audit.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ const archived=message(groupA,2401);audit.archives.set(`${groupA}:2401`,archived.message);
+ await audit.consume(command(`/scan ${groupA} 2401 audit`));
+ assert.ok(audit.telegram.some(c=>c.method==='sendMessage'&&c.args.text.includes('审计命中')));
+});
+await test('warn mode keeps actual deletion and ban notices without changing enforcement',async()=>{
+ const f=fixture({remove:true,strikeCount:1});f.settings.set(groupA,{dry_run:0,logs_enabled:1,logs_warn_only:1});await f.consume(message(groupA,2500));
+ assert.equal(f.telegram.filter(c=>c.method==='deleteMessage').length,1);
+ assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===groupA&&c.args.text.includes('违规消息已删除')));
+ assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('违规消息已删除')));
+ const ban=fixture({timer:true});ban.settings.set(groupA,{dry_run:0,logs_enabled:1,logs_warn_only:1});
+ await ban.consume({kind:'ban_check',chat_id:groupA,user_id:22,message_id:42});
+ assert.ok(ban.telegram.some(c=>c.method==='banChatMember'));
+ assert.ok(ban.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('封禁已执行')));
+});
+await test('changing on to warn or off while administrator lookup waits suppresses allows',async()=>{
+ for(const mode of ['warn','off']) {
+  let enter,release;const entered=new Promise(r=>enter=r),held=new Promise(r=>release=r);
+  const f=fixture({pauseAdmins:async()=>{enter();await held;}});f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:0});
+  const pending=f.consume(message(groupA,2600));await entered;
+  await f.consume(command(`/logs ${groupA} ${mode}`));release();await pending;
+  assert.equal(f.telegram.some(c=>c.method==='sendMessage'&&c.args.text.includes('审核摘要')),false,mode);
+ }
+});
+await test('warn suppresses routine scan completion while command replies remain visible',async()=>{
+ for(const warn of [0,1]) {
+  const f=fixture();f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:warn});
+  await f.consume(command(`/scan_all ${groupA} audit`));
+  assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('历史扫描')));
+  f.telegram.length=0;await f.tick();
+  const completed=f.telegram.some(c=>c.method==='sendMessage'&&c.args.text.includes('历史审查完成'));
+  assert.equal(completed,!warn);
+ }
 });
 await test('dry_run on cancels pending bans in that group', async()=>{
  const f=fixture(); await f.consume(command(`/dry_run ${groupA} on`));
@@ -987,7 +1089,7 @@ await test('policy cache does not retain failed lookups or cross a membership ch
  const fail=fixture({policyFail:true});
  const outcomes=await fail.consumeBatch([message(groupA,1900),message(groupA,1901)]);
  assert.ok(outcomes.every(o=>o.retried&&!o.acked));
- assert.equal(fail.telegram.filter(c=>c.method==='getChat').length,2);
+ assert.equal(fail.telegram.filter(c=>c.method==='getChat').length,4,'two policy attempts plus two best-effort admin log metadata lookups');
  const f=fixture();
  await f.consumeBatch([message(groupA,1902),{update_id:1903,chat_member:{chat:{id:groupA}}},message(groupA,1904)]);
  assert.equal(f.telegram.filter(c=>c.method==='getChat').length,3);
