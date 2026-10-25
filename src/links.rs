@@ -7,7 +7,10 @@ use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url}
 use crate::body::response_bytes;
 use crate::util::field_str;
 
+// At most two safe targets may use network fetches per message.
 const MAX_URLS: usize = 2;
+// Blocked URLs are status-only evidence and must not consume fetch slots.
+const MAX_BLOCKED_URLS: usize = 2;
 const MAX_URL_LEN: usize = 2048;
 const MAX_PAGE_BYTES: usize = 256 * 1024;
 const MAX_EXCERPT: usize = 2400;
@@ -56,11 +59,21 @@ fn utf16_span(text: &str, offset: usize, length: usize) -> Option<String> {
 fn collect(msg: &Value) -> Vec<Url> {
     let mut seen=BTreeSet::new();
     let mut urls=Vec::new();
+    let mut safe_count=0;
+    let mut blocked_count=0;
     let mut add=|raw:&str, bare:bool| {
-        if urls.len()>=MAX_URLS {return;}
+        // Entity counts (32) and whitespace tokens (256) below bound the scan.
+        // Rejected targets can add a limited status, but never spend a fetch slot.
+        if safe_count>=MAX_URLS && blocked_count>=MAX_BLOCKED_URLS {return;}
         if let Some(url)=parse_url(raw,bare) {
+            let safe=safe_target(&url);
+            if (safe && safe_count>=MAX_URLS) ||
+                (!safe && blocked_count>=MAX_BLOCKED_URLS) {return;}
             let key=url.as_str().to_string();
-            if seen.insert(key) { urls.push(url); }
+            if seen.insert(key) {
+                if safe {safe_count+=1;} else {blocked_count+=1;}
+                urls.push(url);
+            }
         }
     };
     for (text_key, entities_key) in [("text","entities"),("caption","caption_entities")] {
