@@ -35,9 +35,10 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false, clock = null, onPendingRun = null } = {}) {
+function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false, clock = null, onPendingRun = null, onCleanupDelete = null, failCleanup = null } = {}) {
   context.Date = clock ? class FakeDate extends Date { static now() { return clock.value; } } : Date;
   const settings = new Map(), archives = new Map(), jobs = new Map();
+  const cleanupState = { last_success_day: -1, lease_id: 0, lease_until: 0 };
   const deliveries = [], statements = [], telegram = [], completed = new Set(), strikes = new Set(), reviews = new Map(), errors = [], aiCalls = [];
   const pageRequests = [];
   const warningAdjustments = new Map(), strikeEvents = [], warningReceiptIds = new Set();
@@ -56,6 +57,20 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
         bind(...args) { values = args; return this; },
         async first() {
           statements.push({ sql, values, operation: 'read' });
+          if (sql.startsWith('INSERT INTO cleanup_state')) {
+            const now = Math.floor(context.Date.now() / 1000);
+            if (cleanupState.last_success_day >= values[0] || cleanupState.lease_until > now) return null;
+            cleanupState.lease_id += 1;
+            cleanupState.lease_until = now + 1200;
+            return {lease_id: cleanupState.lease_id};
+          }
+          if (sql.startsWith('UPDATE cleanup_state SET last_success_day=')) {
+            const now = Math.floor(context.Date.now() / 1000);
+            if (cleanupState.lease_id !== values[1] || cleanupState.lease_until <= now) return null;
+            cleanupState.last_success_day = Math.max(cleanupState.last_success_day, values[0]);
+            cleanupState.lease_until = 0;
+            return {lease_id: cleanupState.lease_id};
+          }
           if ((flipAfterClaim || timer) && sql.includes('pending_bans')) {
             if(flipAfterClaim && sql.startsWith('UPDATE')) settings.set(groupA,{dry_run:1,logs_enabled:0});
             return {chat_id:groupA,user_id:22,message_id:42,due_at:Math.floor(Date.now()/1000)-5};
@@ -164,6 +179,15 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
         async run() {
           statements.push({ sql, values, operation: 'write' });
           if (onPendingRun && sql.startsWith("UPDATE pending_bans SET status='canceled'")) await onPendingRun();
+          if (sql.startsWith('UPDATE cleanup_state SET lease_until=')) {
+            const now = Math.floor(context.Date.now() / 1000);
+            if (cleanupState.lease_id === values[0] && cleanupState.lease_until > now)
+              cleanupState.lease_until = now + 300;
+          }
+          if (sql.startsWith('DELETE FROM processed_updates')) {
+            if (onCleanupDelete) await onCleanupDelete();
+            if (failCleanup?.value) throw new Error('synthetic D1 cleanup failure');
+          }
           if (sql.includes('INSERT INTO group_settings')) {
             const row = settings.get(values[0]) || { dry_run: null, logs_enabled: 1 };
             row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
@@ -273,7 +297,7 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
     assert.equal(outcome.acked,!retry);
   }
   async function tick(scheduledTime=Date.now()){await worker.scheduled({cron:'* * * * *',scheduledTime});}
-  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls, pageRequests,
+  return { worker, tick, deliveries, statements, telegram, completed, errors, aiCalls, pageRequests, cleanupState,
     settings, reviews, archives, jobs, warningAdjustments, warningReceiptIds, consume, consumeBatch, env };
 }
 
@@ -291,6 +315,94 @@ await test('daily cleanup is not lost when pending work crosses the midnight min
   const f = fixture({clock, onPendingRun: () => {clock.value = midnight + 61_000;}});
   await f.tick(midnight);
   assert.equal(f.statements.filter(s => s.sql.startsWith('DELETE FROM processed_updates')).length, 1);
+});
+
+await test('daily cleanup performs once per UTC day and retains ARCHIVE_DAYS=0 archive rows', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock = {value: midnight};
+  const f = fixture({clock});
+  f.archives.set('-100:1', {message_id:1});
+  await f.tick(midnight);
+  clock.value += 60_000;
+  await f.tick(midnight + 60_000);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM archived_messages')).length,0);
+  assert.equal(f.archives.size,1);
+  assert.equal(f.cleanupState.last_success_day,Math.floor(midnight / 86_400_000));
+  clock.value += 86_400_000;
+  await f.tick(midnight + 86_460_000);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,2);
+});
+
+await test('failure does not record success and retries after a bounded backoff', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock = {value: midnight + 62_000}, failCleanup={value:true};
+  const f = fixture({clock,failCleanup});
+  await f.tick(midnight);
+  assert.ok(f.errors.some(e=>e.includes('cleanup_failed:')));
+  assert.equal(f.cleanupState.last_success_day,-1);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
+  failCleanup.value=false;
+  clock.value += 299_000;
+  await f.tick(midnight);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
+  clock.value += 1_000;
+  await f.tick(midnight);
+  assert.equal(f.cleanupState.last_success_day,Math.floor(clock.value / 86_400_000));
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,2);
+});
+
+await test('overlapping Cron invocations only perform one live cleanup', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock = {value: midnight + 62_000};
+  let started, release;
+  const begun = new Promise(resolve=>{started=resolve;});
+  const pause = new Promise(resolve=>{release=resolve;});
+  const f = fixture({clock,onCleanupDelete:async()=>{started();await pause;}});
+  const active=f.tick(midnight);
+  await begun;
+  clock.value+=60_000;
+  await f.tick(midnight+60_000);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
+  release();
+  await active;
+  assert.equal(f.cleanupState.lease_id,1);
+  assert.ok(f.cleanupState.last_success_day>=0);
+});
+
+await test('interrupted cleanup lease expires and stale completion is fenced', async () => {
+  const midnight = Date.parse('2026-10-25T00:00:00Z');
+  const clock={value:midnight+62_000};
+  let started, release, first=true;
+  const begun=new Promise(resolve=>{started=resolve;});
+  const pause=new Promise(resolve=>{release=resolve;});
+  const f=fixture({clock,onCleanupDelete:async()=>{
+    if(first){first=false;started();await pause;}
+  }});
+  const stale=f.tick(midnight);
+  await begun;
+  clock.value+=1_199_000;
+  await f.tick(midnight);
+  assert.equal(f.cleanupState.lease_id,1);
+  clock.value+=1_000;
+  await f.tick(midnight);
+  assert.equal(f.cleanupState.lease_id,2);
+  assert.ok(f.cleanupState.last_success_day>=0);
+  release();
+  await stale;
+  assert.ok(f.errors.some(e=>e.includes('cleanup_completion_lost_lease')));
+  assert.equal(f.cleanupState.lease_id,2);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,2);
+});
+
+await test('cleanup finishing after midnight credits the completion UTC day', async () => {
+  const next = Date.parse('2026-10-26T00:00:00Z');
+  const clock={value:next-1_000};
+  const f=fixture({clock,onCleanupDelete:()=>{clock.value=next+1_000;}});
+  await f.tick(next-60_000);
+  assert.equal(f.cleanupState.last_success_day,Math.floor(next/86_400_000));
+  await f.tick(next);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
 });
 
 await test('webhook preserves nested payload and IDs through JSON queue delivery', async () => {

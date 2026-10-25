@@ -324,6 +324,25 @@ fn wrong_scan_column_is_not_migratable() {
     assert_eq!(check(&db, true).status, Status::Incompatible);
 }
 #[test]
+fn cleanup_schema_is_additive_idempotent_and_strictly_checked() {
+    let db = db();
+    batch(&db,"DROP TABLE cleanup_state");
+    assert_eq!(check(&db, true).status, Status::MigrationRequired);
+    assert_eq!(check(&db, false).status, Status::Incompatible);
+    let migration = additive_migrations(&inspect_sqlite(&db).unwrap());
+    assert_eq!(migration.len(), 1);
+    assert!(migration[0].starts_with("CREATE TABLE IF NOT EXISTS cleanup_state"));
+    migrate(&db);
+    migrate(&db);
+    assert_eq!(check(&db, false).status, Status::Ready);
+    assert!(empty(&sql(&db,"SELECT * FROM cleanup_state",json!([]))));
+
+    batch(&db,"DROP TABLE cleanup_state; CREATE TABLE cleanup_state (singleton INTEGER PRIMARY KEY, last_success_day INTEGER NOT NULL DEFAULT -1, lease_id INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0)");
+    assert_eq!(check(&db, true).status, Status::Incompatible);
+    assert_eq!(check(&db, false).status, Status::Incompatible);
+}
+
+#[test]
 fn bootstrap_is_for_an_empty_database_only() {
     let db = db();
     assert!(db.execute_batch(SCHEMA).is_err());

@@ -342,7 +342,7 @@ fn archive_cutoff(raw: &str, current_time: i64) -> Result<Option<i64>> {
 struct CleanupLease { lease_id: i64 }
 
 pub async fn claim_daily_cleanup(env: &Env) -> Result<Option<i64>> {
-    let today = now().div_euclid(86_400);
+    let today = crate::util::utc_day(now());
     let claimed = env.d1("DB")?.prepare(
         "INSERT INTO cleanup_state(singleton,last_success_day,lease_id,lease_until) \
          VALUES(1,-1,1,unixepoch()+1200) \
@@ -356,10 +356,10 @@ pub async fn claim_daily_cleanup(env: &Env) -> Result<Option<i64>> {
 /// Mark success only for the current lease. Use the completion day to avoid
 /// immediately re-running when an earlier-day cleanup finishes past midnight.
 pub async fn complete_daily_cleanup(env: &Env, lease_id: i64) -> Result<bool> {
-    let today = now().div_euclid(86_400);
+    let today = crate::util::utc_day(now());
     let completed = env.d1("DB")?.prepare(
-        "UPDATE cleanup_state SET last_success_day=MAX(last_success_day,?1),lease_until=0 \
-         WHERE singleton=1 AND lease_id=?2 AND lease_until>unixepoch() \
+        "UPDATE cleanup_state SET last_success_day=MAX(last_success_day,?),lease_until=0 \
+         WHERE singleton=1 AND lease_id=? AND lease_until>unixepoch() \
          RETURNING lease_id"
     ).bind(&[js_i64(today),js_i64(lease_id)])?.first::<CleanupLease>(None).await?;
     Ok(completed.is_some())
