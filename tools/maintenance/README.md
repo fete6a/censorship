@@ -35,6 +35,7 @@ extract actual Rust string literals, so edits to production queries are tested.
 
 | Rust target | Replaced Python coverage |
 | --- | --- |
+| `cleanup` | Daily UTC claim, delayed and cross-day execution, repeated/concurrent claims, lease expiry, failure backoff and fenced completion on real SQLite statements |
 | `schema_release` | Legacy/additive/partial schema migrations, preservation and idempotence, trigger definitions and string semantics, unsafe receipt states, strict metadata parsing and read-only inspection |
 | `store` | Actual archive/digest/anchor SQL, warning baselines and receipt replay, rowid retention, delayed-ban boundaries, fair retry/backoff, cancellation and group isolation, scan generations/expired leases and historical writes |
 | `contracts` | Deployment isolation, configuration, command ordering, administrator exemptions, notification defaults/recipients, bilingual privacy/permission documentation, importer/transcoder integration |
