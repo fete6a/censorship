@@ -232,4 +232,41 @@ mod tests {
         assert_eq!(public_url(&relative),"https://example.org/end");
     }
 
+
+    #[test]
+    fn blocked_links_do_not_hide_later_safe_links() {
+        let msg=json!({"text":
+            "http://127.0.0.1/ https://u:p@example.org/private https://safe.example.org/article"});
+        let urls=collect(&msg);
+        assert!(urls.iter().any(|u|u.as_str()=="https://safe.example.org/article"),
+            "rejected links must not exhaust the safe page-fetch budget");
+    }
+    #[test]
+    fn hidden_rejected_entities_do_not_hide_safe_caption_urls() {
+        let msg=json!({"caption":"Read https://safe.example.org/article",
+            "caption_entities":[
+                {"type":"text_link","offset":0,"length":4,"url":"http://127.0.0.1/"},
+                {"type":"text_link","offset":0,"length":4,"url":"https://u:p@example.org/private"}
+            ]});
+        assert!(collect(&msg).iter()
+            .any(|u|u.as_str()=="https://safe.example.org/article"));
+    }
+    #[test]
+    fn continuous_rejected_links_and_duplicates_do_not_starve_safe_links() {
+        let blocked=(0..220).map(|i|format!("http://127.0.0.1/{i}"))
+            .collect::<Vec<_>>().join(" ");
+        let msg=json!({"text":format!("{blocked} https://safe.example.org/article \
+            https://safe.example.org/article https://second.example.org/news \
+            https://third.example.org/ignored")});
+        let urls=collect(&msg);
+        assert_eq!(urls.iter().filter(|u|u.host_str()==Some("safe.example.org")).count(),1);
+        assert!(urls.iter().any(|u|u.host_str()==Some("second.example.org")));
+    }
+    #[test]
+    fn text_scan_stops_at_existing_token_limit() {
+        let text=format!("{} https://safe.example.org/article",
+            vec!["filler";256].join(" "));
+        assert!(collect(&json!({"text":text})).is_empty(),
+            "the link budget fix must not remove bounded scanning");
+    }
 }
