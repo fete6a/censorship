@@ -104,7 +104,7 @@ Passive review digests read final statuses with one D1 query per group and Queue
 
 GitHub Actions runs builds and tests, then retains the Worker artifact with SHA-256 checksums. Neither pushes nor manual workflow dispatch deploy to Cloudflare. Actions does not use `CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_ACCOUNT_ID` secrets.
 
-To release, download the successful main-branch artifact and verify its checksums and source commit. Record the current Worker version and a D1 Time Travel recovery bookmark. Use the authenticated Cloudflare MCP connection to run the read-only metadata/PRAGMA batch printed by `python3 tools/check_d1_schema.py --print-inspection-sql`, save its successful statement results as JSON, and validate with `--from-json response.json --pre-migration`. Apply only the indicated additive migrations and recheck without `--pre-migration` (exit 0 required), then upload the unchanged `index.js` and binary `index_bg.wasm` as Worker modules. Preserve existing bindings, secrets, variables, compatibility settings and observability. Check the active deployment and `/healthz` after upload. Database contents, Queue consumers, Cron triggers and Telegram webhook configuration remain in place.
+To release, download the successful main-branch artifact and verify its checksums and source commit. Record the current Worker version and a D1 Time Travel recovery bookmark. Use the authenticated Cloudflare MCP connection to run the read-only metadata/PRAGMA batch printed by `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --print-inspection-sql`, save its successful statement results as JSON, and validate with `--from-json response.json --pre-migration`. Apply only the indicated additive migrations and recheck without `--pre-migration` (exit 0 required), then upload the unchanged `index.js` and binary `index_bg.wasm` as Worker modules. Preserve existing bindings, secrets, variables, compatibility settings and observability. Check the active deployment and `/healthz` after upload. Database contents, Queue consumers, Cron triggers and Telegram webhook configuration remain in place.
 
 Private administrator digests and action logs include the current group name, numeric ID and a clickable group link. Public groups use their username; private groups use an existing Telegram invite link when available, otherwise a surviving reviewed-message link accessible to group members. No new invitations are generated. If Telegram metadata is unavailable, logs fall back to the group ID and available message link. Group titles are Markdown-escaped, and recipients remain the exact group's current human administrators. Probability scores use ten-step Markdown bars with exact percentages. Missing policy or inference errors show no fabricated score; empty categories and repeated group IDs are omitted. Each log also identifies the current creator by their escaped display name and a numeric `tg://user?id=...` profile link, using the same administrator snapshot without extra API requests. Missing creator metadata is labelled unavailable; a missing name falls back to the numeric user ID. Digest chunks reserve space for both headings.
 
@@ -115,10 +115,24 @@ Within a Queue delivery, successful policy lookups are reused separately for eac
 
 ## Mandatory D1 release preflight
 
-Before manually uploading a Worker, follow [the production D1 schema release gate](docs/manual-d1-release.md). The read-only check `python3 tools/check_d1_schema.py --remote` must exit 0 after the additive migration and immediately before upload. Green GitHub Actions does not establish production migration status. Never run `schema/current.sql` against existing D1 data.
+Before manually uploading a Worker, follow [the production D1 schema release gate](docs/manual-d1-release.md). The read-only check `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote` must exit 0 after the additive migration and immediately before upload. Green GitHub Actions does not establish production migration status. Never run `schema/current.sql` against existing D1 data.
 
 The release check includes `warning_edit_receipts` table and `apply_warning_edit_receipt` trigger. Its DDL is compared with the canonical schema and its behavior verified only against dummy in-memory data. Existing receipt tables without the trigger require manual reconciliation (not automatic migration).
 
 Release preflight also requires the scan-fencing columns. With `--pre-migration`, apply only the missing scan `ALTER` statements printed by the checker; do not blindly repeat the one-time scan migration. See [manual release gate](docs/manual-d1-release.md).
 
 Warning edits are replay-safe by Telegram update ID. Retention cleanup cannot hide newer strikes by reusing rowids below a surviving manual baseline. Do not independently rebuild or VACUUM the violations table without preserving its ordering relative to warning baselines.
+
+## Implementation languages and local checks
+
+The deployed moderation logic, history importer and transcoder are Rust. D1
+release checks and offline SQLite/source/documentation regressions are also
+native Rust in [`tools/maintenance`](tools/maintenance/README.md); Python is not
+required. Run `cargo test --manifest-path tools/maintenance/Cargo.toml --locked`.
+
+The remaining handwritten JavaScript is `tests/worker_runtime.mjs`, which tests
+the actual compiled JS/Wasm artifact and Cloudflare host boundary. Generated
+`build/index.js` is the SDK's required Wasm loader/glue. Node/Wrangler remain
+build/development tools; replacing those boundary tests with native Rust would
+lose integration coverage. The native maintenance dependencies are isolated from
+the production Worker crate.
