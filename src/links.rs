@@ -7,7 +7,10 @@ use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url}
 use crate::body::response_bytes;
 use crate::util::field_str;
 
+// At most two safe targets may use network fetches per message.
 const MAX_URLS: usize = 2;
+// Blocked URLs are status-only evidence and must not consume fetch slots.
+const MAX_BLOCKED_URLS: usize = 2;
 const MAX_URL_LEN: usize = 2048;
 const MAX_PAGE_BYTES: usize = 256 * 1024;
 const MAX_EXCERPT: usize = 2400;
@@ -56,11 +59,21 @@ fn utf16_span(text: &str, offset: usize, length: usize) -> Option<String> {
 fn collect(msg: &Value) -> Vec<Url> {
     let mut seen=BTreeSet::new();
     let mut urls=Vec::new();
+    let mut safe_count=0;
+    let mut blocked_count=0;
     let mut add=|raw:&str, bare:bool| {
-        if urls.len()>=MAX_URLS {return;}
+        // Entity counts (32) and whitespace tokens (256) below bound the scan.
+        // Rejected targets can add a limited status, but never spend a fetch slot.
+        if safe_count>=MAX_URLS && blocked_count>=MAX_BLOCKED_URLS {return;}
         if let Some(url)=parse_url(raw,bare) {
+            let safe=safe_target(&url);
+            if (safe && safe_count>=MAX_URLS) ||
+                (!safe && blocked_count>=MAX_BLOCKED_URLS) {return;}
             let key=url.as_str().to_string();
-            if seen.insert(key) { urls.push(url); }
+            if seen.insert(key) {
+                if safe {safe_count+=1;} else {blocked_count+=1;}
+                urls.push(url);
+            }
         }
     };
     for (text_key, entities_key) in [("text","entities"),("caption","caption_entities")] {
@@ -232,4 +245,41 @@ mod tests {
         assert_eq!(public_url(&relative),"https://example.org/end");
     }
 
+
+    #[test]
+    fn blocked_links_do_not_hide_later_safe_links() {
+        let msg=json!({"text":
+            "http://127.0.0.1/ https://u:p@example.org/private https://safe.example.org/article"});
+        let urls=collect(&msg);
+        assert!(urls.iter().any(|u|u.as_str()=="https://safe.example.org/article"),
+            "rejected links must not exhaust the safe page-fetch budget");
+    }
+    #[test]
+    fn hidden_rejected_entities_do_not_hide_safe_caption_urls() {
+        let msg=json!({"caption":"Read https://safe.example.org/article",
+            "caption_entities":[
+                {"type":"text_link","offset":0,"length":4,"url":"http://127.0.0.1/"},
+                {"type":"text_link","offset":0,"length":4,"url":"https://u:p@example.org/private"}
+            ]});
+        assert!(collect(&msg).iter()
+            .any(|u|u.as_str()=="https://safe.example.org/article"));
+    }
+    #[test]
+    fn continuous_rejected_links_and_duplicates_do_not_starve_safe_links() {
+        let blocked=(0..220).map(|i|format!("http://127.0.0.1/{i}"))
+            .collect::<Vec<_>>().join(" ");
+        let msg=json!({"text":format!("{blocked} https://safe.example.org/article \
+            https://safe.example.org/article https://second.example.org/news \
+            https://third.example.org/ignored")});
+        let urls=collect(&msg);
+        assert_eq!(urls.iter().filter(|u|u.host_str()==Some("safe.example.org")).count(),1);
+        assert!(urls.iter().any(|u|u.host_str()==Some("second.example.org")));
+    }
+    #[test]
+    fn text_scan_stops_at_existing_token_limit() {
+        let text=format!("{} https://safe.example.org/article",
+            vec!["filler";256].join(" "));
+        assert!(collect(&json!({"text":text})).is_empty(),
+            "the link budget fix must not remove bounded scanning");
+    }
 }
