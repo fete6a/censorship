@@ -89,6 +89,45 @@ fn cli_ready_missing_and_pre_migration_exit_codes() {
         .contains("MIGRATION_REQUIRED"));
 }
 #[test]
+fn cli_cleanup_only_migration_prints_actionable_create_and_reaches_ready() {
+    let temp = Temp::new();
+    let db = canonical_db().unwrap();
+    db.execute_batch("DROP TABLE cleanup_state").unwrap();
+    let file = temp.file(
+        "cleanup-missing.json",
+        &json!([{"success":true,"results":inspect_sqlite(&db).unwrap()}]).to_string(),
+    );
+    let out = command()
+        .arg("--from-json")
+        .arg(&file)
+        .arg("--pre-migration")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("cleanup-state table"));
+    assert!(text.contains("Apply only the missing additive SQL statements printed above"));
+    assert!(!text.contains("only the missing ALTERs"));
+    let statements: Vec<_> = text.lines()
+        .filter(|line| line.starts_with("CREATE TABLE ") || line.starts_with("ALTER TABLE "))
+        .collect();
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0].starts_with("CREATE TABLE IF NOT EXISTS cleanup_state"));
+    // Execute the CLI's actual migration advice on disposable SQLite, then
+    // inspect afresh and require the normal post-migration CLI to accept it.
+    for statement in statements {
+        db.execute_batch(statement).unwrap();
+        db.execute_batch(statement).unwrap();
+    }
+    temp.file(
+        "cleanup-missing.json",
+        &json!([{"success":true,"results":inspect_sqlite(&db).unwrap()}]).to_string(),
+    );
+    let out = command().arg("--from-json").arg(&file).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("SCHEMA_READY"));
+}
+#[test]
 fn cli_invalid_arguments_missing_files_and_bad_json_fail_closed() {
     for args in [
         vec![],

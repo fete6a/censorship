@@ -111,7 +111,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Status::MigrationRequired => {
-            println!("MIGRATION_REQUIRED: known additive warning objects, scan-fencing or log-filter columns are absent.");
+            println!("MIGRATION_REQUIRED: known additive warning objects, cleanup-state table, scan-fencing or log-filter columns are absent.");
             if ![
                 ("table", "warning_adjustments"),
                 ("table", "warning_edit_receipts"),
@@ -128,7 +128,7 @@ fn run() -> Result<i32> {
                 println!("{sql}");
             }
             println!(
-                "Apply only the missing ALTERs printed above, then rerun without --pre-migration."
+                "Apply only the missing additive SQL statements printed above (CREATE TABLE or ALTER TABLE), then rerun without --pre-migration."
             );
             Ok(3)
         }
