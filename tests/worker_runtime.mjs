@@ -1634,6 +1634,72 @@ await test('transient command failures keep their source messages for successful
 });
 
 
+
+await test('blocked visible URLs cannot exhaust safe page-fetch slots', async()=>{
+  const f=fixture({pageFetch:request=>new Response('<main>Page body '+new URL(request.url).pathname+'</main>',
+    {headers:{'Content-Type':'text/html'}})});
+  const update=message(groupA,4110);
+  update.message.text='http://127.0.0.1/ https://u:p@example.org/private '+
+    'https://safe.example.org/article https://second.example.org/news https://third.example.org/ignored';
+  await f.consume(update);
+  assert.deepEqual(f.pageRequests.map(r=>new URL(r.url).hostname),['safe.example.org','second.example.org']);
+  assert.ok(f.pageRequests.every(r=>r.redirect==='manual'));
+  const evidence=f.aiCalls[0].input.state.link_evidence;
+  assert.deepEqual(evidence.map(e=>e.status),['blocked_target','blocked_target','fetched','fetched']);
+  assert.deepEqual(evidence.filter(e=>e.status==='fetched').map(e=>e.excerpt),
+    ['Page body /article','Page body /news']);
+  assert.ok(evidence.filter(e=>e.status==='blocked_target').every(e=>e.url===undefined));
+});
+
+await test('hidden text_link rejections and repeated visible URLs do not starve valid evidence', async()=>{
+  for(const field of ['text','caption']) {
+    const f=fixture({pageFetch:()=>new Response('<p>Valid page body</p>',
+      {headers:{'Content-Type':'text/html'}})});
+    const update=message(groupA,4111);
+    const visible='Read https://safe.example.org/article https://safe.example.org/article';
+    const entities=[
+      {type:'text_link',offset:0,length:4,url:'http://127.0.0.1/'},
+      {type:'text_link',offset:0,length:4,url:'https://hidden:HiddenSecret@example.org/private?token=secret'},
+      {type:'text_link',offset:0,length:4,url:'https://safe.example.org/article'},
+    ];
+    delete update.message.text;
+    update.message[field]=visible;
+    update.message[field==='text'?'entities':'caption_entities']=entities;
+    await f.consume(update);
+    assert.deepEqual(f.pageRequests.map(r=>r.url),['https://safe.example.org/article']);
+    const input=f.aiCalls[0].input;
+    assert.deepEqual(input.state.link_evidence.map(e=>e.status),['blocked_target','blocked_target','fetched']);
+    assert.equal(input.state.link_evidence[2].excerpt,'Valid page body');
+    assert.ok(!JSON.stringify(input).includes('HiddenSecret'));
+    assert.ok(!JSON.stringify(input).includes('token=secret'));
+  }
+});
+
+await test('many rejected URLs stay bounded and blocked redirects cannot consume a further fetch', async()=>{
+  const f=fixture({pageFetch:request=>new URL(request.url).pathname==='/redirect'
+    ? new Response(null,{status:302,headers:{Location:'https://u:p@example.org/private'}})
+    : new Response('<p>After rejected targets</p>',{headers:{'Content-Type':'text/html'}})});
+  const update=message(groupA,4112);
+  update.message.text=Array.from({length:96},(_,i)=>'http://127.0.0.1/'+i).join(' ')+
+    ' https://safe.example.org/redirect https://safe.example.org/article';
+  await f.consume(update);
+  assert.deepEqual(f.pageRequests.map(r=>new URL(r.url).pathname),['/redirect','/article']);
+  assert.ok(f.pageRequests.every(r=>r.redirect==='manual'));
+  const evidence=f.aiCalls[0].input.state.link_evidence;
+  assert.deepEqual(evidence.map(e=>e.status),
+    ['blocked_target','blocked_target','blocked_redirect','fetched']);
+  assert.equal(evidence[3].excerpt,'After rejected targets');
+  assert.ok(evidence.every(e=>e.url===undefined || !e.url.includes('u:p@')));
+  const scanCap=fixture({pageFetch:()=>new Response('should not fetch',
+    {headers:{'Content-Type':'text/plain'}})});
+  const beyond=message(groupA,4113);
+  beyond.message.text=Array(256).fill('filler').join(' ')+
+    ' https://safe.example.org/after-limit';
+  await scanCap.consume(beyond);
+  assert.equal(scanCap.pageRequests.length,0,'text token scan remains bounded');
+  assert.deepEqual(scanCap.aiCalls[0].input.state.link_evidence,[]);
+});
+
 await test('hidden credentialed text links never add credentials to model input or fetches', async () => {
   for (const caption of [false, true]) {
     const f = fixture();
