@@ -895,8 +895,8 @@ await test('high violation score with category none is needs_review instead of a
  assert.equal(f.telegram.some(c=>c.method==='deleteMessage'),false);
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'needs_review');
 });
-await test('other and adult categories behave like none, without punishment or distinct stored categories',async()=>{
-  for(const categoryChoice of ['none','other','adult']) for(const [score,expected] of [[0.99,'needs_review'],[0.6,'allow']]){
+await test('other category behaves like none, without punishment or a distinct stored category',async()=>{
+  for(const categoryChoice of ['none','other']) for(const [score,expected] of [[0.99,'needs_review'],[0.6,'allow']]){
     const f=fixture({remove:true,score,categoryChoice});
     f.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.8});
     await f.consume(message(groupA,1707));
@@ -909,6 +909,57 @@ await test('other and adult categories behave like none, without punishment or d
     assert.ok(!digest.includes('其他违反群规'));
     assert.ok(!digest.includes('不当成人内容'));
   }
+});
+await test('adult category follows the inclusive group threshold and retains its category in reviews and notices',async()=>{
+  for(const [score,status] of [[0.7999,'allow'],[0.8,'deleted'],[0.99,'deleted']]) {
+    const f=fixture({remove:true,score,categoryChoice:'adult',categoryConfidence:0.2,
+      rules:'Explicit sexual content is prohibited in this group'});
+    f.settings.set(groupA,{dry_run:0,logs_enabled:1,remove_threshold:0.8});
+    await f.consume(message(groupA,1708));
+    assert.deepEqual(f.reviews.get(`${groupA}:1708`),
+      {last_status:status,last_category:'adult',last_probability:score});
+    assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),
+      status==='deleted'?[1708]:[]);
+    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,
+      status==='deleted'?1:0);
+    const digest=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id>0)?.args.text||'';
+    assert.ok(digest.includes('不当成人内容'));
+    assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
+  }
+});
+await test('adult category still respects dry-run, audit, missing rules and the deletion age limit',async()=>{
+  for(const mode of ['dry-run','audit','missing-rules','too-old']) {
+    const f=fixture({remove:true,score:0.99,categoryChoice:'adult',
+      rules:mode==='missing-rules'?'':'Explicit sexual content is prohibited in this group'});
+    f.settings.set(groupA,{dry_run:mode==='dry-run'?1:0,logs_enabled:0});
+    const update=message(groupA,1709);
+    if(mode==='too-old')update.message.date=Math.floor(Date.now()/1000)-48*3600-1;
+    if(mode==='audit') {
+      const scan=command('/scan audit',{id:groupA,type:'supergroup'});
+      scan.message.reply_to_message=update.message;
+      await f.consume(scan);
+      assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.text.includes('审计命中 · 不当成人内容')));
+    } else await f.consume(update);
+    assert.equal(f.telegram.some(c=>c.method==='deleteMessage'&&c.args.message_id===1709),false,mode);
+    assert.equal(f.telegram.some(c=>['restrictChatMember','banChatMember'].includes(c.method)),false,mode);
+    assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,0,mode);
+    const expected={'dry-run':'dry_run_flag',audit:'audit_flag','missing-rules':'no_group_description','too-old':'too_old_to_delete'}[mode];
+    assert.equal(f.reviews.get(`${groupA}:1709`)?.last_status,expected,mode);
+  }
+});
+await test('adult edits keep one deletion and strike while third-strike escalation remains cancellable',async()=>{
+  const f=fixture({remove:true,score:0.99,categoryChoice:'adult',strikeCount:3,
+    rules:'Explicit sexual content is prohibited in this group'});
+  f.settings.set(groupA,{dry_run:0,logs_enabled:0});
+  const original=message(groupA,1710);
+  await f.consume(original);
+  await f.consume({update_id:1711,edited_message:{...original.message,text:'Edited synthetic message'}});
+  assert.deepEqual(f.telegram.filter(c=>c.method==='deleteMessage').map(c=>c.args.message_id),[1710]);
+  assert.equal(f.statements.filter(s=>s.sql.includes('INSERT INTO violations')).length,1);
+  assert.equal(f.reviews.get(`${groupA}:1710`)?.last_status,'previously_deleted');
+  assert.equal(f.telegram.some(c=>c.method==='banChatMember'),false);
+  assert.ok(f.telegram.some(c=>c.method==='restrictChatMember'));
+  assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.text.includes('/cancel 22')));
 });
 await test('score below threshold is allow as computed by Rust, not a model label',async()=>{
  const f=fixture({remove:true,score:0.6,categoryChoice:'harassment'});
