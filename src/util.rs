@@ -10,6 +10,11 @@ pub fn now() -> i64 {
     (js_sys::Date::now() / 1000.0).floor() as i64
 }
 
+/// UTC calendar day of an epoch timestamp, independent of Cron's minute.
+pub fn utc_day(seconds: i64) -> i64 {
+    seconds.div_euclid(86_400)
+}
+
 pub fn field_int(value: &Value, name: &str) -> Option<i64> {
     int(&value[name])
 }
@@ -60,6 +65,17 @@ pub fn safe_equal(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn utc_day_has_no_one_minute_midnight_window() {
+        let midnight = 20_000 * 86_400;
+        assert_eq!(utc_day(midnight - 1), 19_999);
+        assert_eq!(utc_day(midnight), 20_000);
+        assert_eq!(utc_day(midnight + 59), 20_000);
+        assert_eq!(utc_day(midnight + 61), 20_000);
+        assert_eq!(utc_day(midnight + 86_399), 20_000);
+        assert_eq!(utc_day(midnight + 86_400), 20_001);
+        assert_eq!(utc_day(-1), -1);
+    }
     #[test]
     fn safe_equal_handles_mismatches() {
         assert!(safe_equal("s3cRet", "s3cRet"));

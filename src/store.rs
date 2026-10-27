@@ -335,6 +335,47 @@ fn archive_cutoff(raw: &str, current_time: i64) -> Result<Option<i64>> {
     Ok(Some(cutoff))
 }
 
+/// One D1 singleton fences concurrent Cron invocations. The lease exceeds
+/// Cloudflare's 15-minute scheduled-handler limit; interrupted runs recover
+/// after 20 minutes. Successful UTC days never need another full cleanup.
+#[derive(Debug, Deserialize)]
+struct CleanupLease { lease_id: i64 }
+
+pub async fn claim_daily_cleanup(env: &Env) -> Result<Option<i64>> {
+    let today = crate::util::utc_day(now());
+    let claimed = env.d1("DB")?.prepare(
+        "INSERT INTO cleanup_state(singleton,last_success_day,lease_id,lease_until) \
+         VALUES(1,-1,1,unixepoch()+1200) \
+         ON CONFLICT(singleton) DO UPDATE SET lease_id=lease_id+1,lease_until=unixepoch()+1200 \
+         WHERE last_success_day<? AND lease_until<=unixepoch() \
+         RETURNING lease_id"
+    ).bind(&[js_i64(today)])?.first::<CleanupLease>(None).await?;
+    Ok(claimed.map(|row| row.lease_id))
+}
+
+/// Mark success only for the current lease. Use the completion day to avoid
+/// immediately re-running when an earlier-day cleanup finishes past midnight.
+pub async fn complete_daily_cleanup(env: &Env, lease_id: i64) -> Result<bool> {
+    let today = crate::util::utc_day(now());
+    let completed = env.d1("DB")?.prepare(
+        "UPDATE cleanup_state SET last_success_day=MAX(last_success_day,?),lease_until=0 \
+         WHERE singleton=1 AND lease_id=? AND lease_until>unixepoch() \
+         RETURNING lease_id"
+    ).bind(&[js_i64(today),js_i64(lease_id)])?.first::<CleanupLease>(None).await?;
+    Ok(completed.is_some())
+}
+
+/// Cleanup DELETEs are idempotent, including partially completed runs.
+/// On failure keep a five-minute retry backoff; an interrupted Worker falls
+/// back to the 20-minute lease expiry without trusting volatile state.
+pub async fn defer_daily_cleanup(env: &Env, lease_id: i64) -> Result<()> {
+    env.d1("DB")?.prepare(
+        "UPDATE cleanup_state SET lease_until=unixepoch()+300 \
+         WHERE singleton=1 AND lease_id=? AND lease_until>unixepoch()"
+    ).bind(&[js_i64(lease_id)])?.run().await?;
+    Ok(())
+}
+
 pub async fn cleanup(env: &Env) -> Result<()> {
     env.d1("DB")?.prepare("DELETE FROM processed_updates WHERE processed_at<?")
         .bind(&[js_i64(now()-14*86400)])?.run().await?;

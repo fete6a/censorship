@@ -4,9 +4,9 @@ GitHub Actions builds and tests only. Green CI never proves that production D1 w
 
 1. Confirm production Cloudflare account and D1 DB binding against wrangler.jsonc. Record a D1 Time Travel recovery bookmark and the currently deployed Worker version; a full data export is a separate operation requiring appropriate authorization. Do not apply schema/current.sql on existing data.
 2. On an authenticated operator machine, run: cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote --pre-migration
-   Exit 0 = required warning objects, scan-fencing columns and log-filter constraints ready; exit 3 = known additive migration needed; exit 2 = incompatible or ambiguous schema, STOP.
+   Exit 0 = required warning objects, cleanup-state table, scan-fencing columns and log-filter constraints ready; exit 3 = known additive migration needed; exit 2 = incompatible or ambiguous schema, STOP.
 3. Only after exit 3, run the additive idempotent schema/ensure_warning_adjustments.sql manually via authorized Cloudflare connector or: npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql
-   Also apply exactly the missing ALTER statements printed by the preflight. Scan columns come from schema/ensure_scan_fencing.sql; the group log filter comes from schema/ensure_log_filter.sql. The full scan migration is one-time, not idempotent: do not repeat existing columns. A partially applied scan migration is resumable using only the remaining printed statements. Historical jobs and messages are preserved.
+   Also apply `schema/ensure_cleanup_state.sql` if the `cleanup_state` table is missing (additive and idempotent; does not alter existing rows). Also apply exactly the missing ALTER statements printed by the preflight. Scan columns come from schema/ensure_scan_fencing.sql; the group log filter comes from schema/ensure_log_filter.sql. The full scan migration is one-time, not idempotent: do not repeat existing columns. A partially applied scan migration is resumable using only the remaining printed statements. Historical jobs and messages are preserved.
 4. Verify: cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote ; exit 0 is MANDATORY. Recheck immediately before Worker upload. An existing wrong-shape table or trigger is not repaired by CREATE IF NOT EXISTS.
 5. Verify the exact main commit, green Rust/SQLite/Wasm tests, and downloaded artifact SHA-256. Manually upload unchanged modules with Cloudflare MCP. Keep bindings, Secrets, Queues, Cron, and webhook. Do not enable production deployment in GitHub Actions.
 6. Verify active version, /healthz, Queue errors and a harmless dry-run review. If rollout fails, return to previous Worker artifact, not a destructive database rollback.
@@ -37,6 +37,8 @@ Run cargo test --manifest-path tools/maintenance/Cargo.toml and the existing Rus
 | Wrong required table shape or core schema | 2 | 2 | STOP: investigate structural mismatch |
 
 If the receipt table exists without the trigger, adding the missing trigger does not apply historical receipt rows. Do not automatically classify this state as migratable or rerun Telegram commands to repair it. The read-only preflight intentionally cannot prove whether old receipt rows were processed.
+
+The release gate also verifies the exact `cleanup_state` table definition. A missing table is an approved additive migration only in `--pre-migration` mode; an incompatible table or trigger is never auto-repaired. The singleton row is created by the first successful Worker claim; do not initialize or inspect production cleanup state in this PR. No Cloudflare deployment or production D1 migration is authorized here.
 
 The combined release also requires scan_jobs.generation, lease_id and lease_until. In pre-migration mode only missing known scan columns are migratable; existing wrong column types, defaults or constraints still block release. Normal mode requires every column. A ready warning schema with missing scan columns is not deployment-ready.
 

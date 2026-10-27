@@ -47,6 +47,10 @@ CREATE TABLE processed_updates (
   processed_at INTEGER NOT NULL
 );
 
+-- Persistent singleton for once-per-UTC-day, fenced and retryable cleanup.
+-- Missing row is initialized atomically by the Worker on its first Cron claim.
+CREATE TABLE IF NOT EXISTS cleanup_state (singleton INTEGER PRIMARY KEY CHECK (singleton=1), last_success_day INTEGER NOT NULL DEFAULT -1 CHECK (last_success_day>=-1), lease_id INTEGER NOT NULL DEFAULT 0 CHECK (lease_id>=0), lease_until INTEGER NOT NULL DEFAULT 0);
+
 CREATE TABLE scan_jobs (
   chat_id INTEGER PRIMARY KEY,
   cursor_message_id INTEGER NOT NULL DEFAULT 0,

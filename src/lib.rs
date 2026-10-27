@@ -107,12 +107,24 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     if let Err(error) = moderation::process_scan_tick(&env).await {
         console_error!("historical_scan_failed: {}", error);
     }
-    // Daily cleanup, keeping retention configurable.
-    if crate::util::now().div_euclid(60).rem_euclid(1440) == 0 {
-        match store::cleanup(&env).await {
-            Ok(()) => console_log!("cleaned_up_expired_records"),
-            Err(error) => console_error!("cleanup_failed: {}", error),
-        }
+    // Claim the current UTC day even if midnight delivery or preceding work was delayed.
+    // D1 records successful days and fences concurrent/overlapping Cron attempts.
+    match store::claim_daily_cleanup(&env).await {
+        Ok(Some(lease_id)) => match store::cleanup(&env).await {
+            Ok(()) => match store::complete_daily_cleanup(&env, lease_id).await {
+                Ok(true) => console_log!("cleaned_up_expired_records"),
+                Ok(false) => console_error!("cleanup_completion_lost_lease"),
+                Err(error) => console_error!("cleanup_completion_failed: {}", error),
+            },
+            Err(error) => {
+                console_error!("cleanup_failed: {}", error);
+                if let Err(retry_error) = store::defer_daily_cleanup(&env, lease_id).await {
+                    console_error!("cleanup_retry_defer_failed: {}", retry_error);
+                }
+            }
+        },
+        Ok(None) => {},
+        Err(error) => console_error!("cleanup_claim_failed: {}", error),
     }
 }
 

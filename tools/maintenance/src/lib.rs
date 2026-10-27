@@ -10,6 +10,7 @@ pub const SCHEMA: &str = include_str!("../../../schema/current.sql");
 pub const ENSURE_WARNINGS: &str = include_str!("../../../schema/ensure_warning_adjustments.sql");
 pub const ENSURE_SCAN: &str = include_str!("../../../schema/ensure_scan_fencing.sql");
 pub const ENSURE_LOG_FILTER: &str = include_str!("../../../schema/ensure_log_filter.sql");
+pub const ENSURE_CLEANUP: &str = include_str!("../../../schema/ensure_cleanup_state.sql");
 pub const METADATA_SQL: &str = "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type,name";
 const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.type,p.\"notnull\",p.pk,p.dflt_value FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS p ON m.type='table' WHERE m.type IN ('table','index','trigger') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.type,m.name,p.cid";
 const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
@@ -270,6 +271,9 @@ pub fn additive_migrations(rows: &[Row]) -> Vec<&'static str> {
                 .filter(|line| line.starts_with("ALTER TABLE ")),
         );
     }
+    if !rows.iter().any(|r| r.object_type == "table" && r.object_name == "cleanup_state") {
+        statements.extend(ENSURE_CLEANUP.lines().filter(|line| line.starts_with("CREATE TABLE ")));
+    }
     statements
 }
 
@@ -296,7 +300,7 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
             if pre_migration
                 && matches!(
                     (kind, name),
-                    ("table", "warning_adjustments" | "warning_edit_receipts")
+                    ("table", "warning_adjustments" | "warning_edit_receipts" | "cleanup_state")
                         | ("trigger", "apply_warning_edit_receipt")
                 )
             {
@@ -362,7 +366,7 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         if got_cols.keys().any(|c| !exp_cols.contains_key(c)) {
             errors.push(format!("unexpected table columns: {name}"));
         }
-        if matches!(name, "warning_adjustments" | "warning_edit_receipts")
+        if matches!(name, "warning_adjustments" | "warning_edit_receipts" | "cleanup_state")
             && normalized_ddl(got[0].definition.as_deref().unwrap_or(""))
                 != normalized_ddl(exp[0].definition.as_deref().unwrap_or(""))
         {
@@ -375,7 +379,7 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
             && observed.iter().any(|r| {
                 matches!(
                     r.table_name.as_str(),
-                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans"
+                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans" | "cleanup_state"
                 )
             })
         {
