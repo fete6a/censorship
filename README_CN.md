@@ -83,7 +83,7 @@ strip = "debuginfo"
 panic = "abort"
 ```
 
-GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。新建空 D1 仍用 `schema/current.sql` 一次性初始化；现有数据库需在部署前**手动**执行幂等的 `schema/ensure_warning_adjustments.sql`，建立 `warning_adjustments`、`warning_edit_receipts` 及 `apply_warning_edit_receipt` 触发器，保留原始违规历史。收据触发器原子应用后续警告调整和待封禁取消。还需按预检输出补齐扫描租约字段；扫描 ALTER 不可重复执行。GitHub Actions 不自动更改生产数据库。
+GitHub Workflow 只构建、测试并保存带 SHA-256 校验文件的产物；推送 main 或手动触发 Workflow 都不会部署 Cloudflare，不再使用 Actions 的 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。发布改用已连接的 Cloudflare MCP。不要把 Bot Token 写入公开 Git 仓库或 Actions YAML。Cloudflare 端的 `BOT_TOKEN`、`WEBHOOK_SECRET` 等现有密钥保留。新建空 D1 使用 `schema/current.sql` 一次性初始化；**已有 D1 必须先进行只读预检，仅处理预检确认缺失的结构**：`schema/ensure_warning_adjustments.sql` 用于警告调整表、收据表及触发器，`schema/ensure_cleanup_state.sql` 用于每日清理状态表 `cleanup_state`。扫描租约和日志过滤字段分别参考 `schema/ensure_scan_fencing.sql` 与 `schema/ensure_log_filter.sql`，**只执行预检打印的缺失 ALTER**；这些 ALTER 不幂等，不能重复执行。收据触发器原子应用后续警告调整和待封禁取消。普通预检必须退出码 `0` 才能发布 Worker；CI 成功不等于生产 D1 已迁移，GitHub Actions 不自动更改生产数据库。
 
 首次启动所需资源（本地命令，或由有权限的 Cloudflare connector 创建）：
 
@@ -95,7 +95,7 @@ npx wrangler queues create telegram-clef-moderation-dlq
 npx wrangler d1 execute DB --remote --file schema/current.sql
 ```
 
-上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**，绝不能用于已有数据的数据库。已运行旧版本的 D1 应先执行 `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql` 或通过 Cloudflare MCP 执行该文件中的完整增量 SQL（包含收据触发器），并仅补齐预检输出的扫描 ALTER；不能只建立一张表就部署。已有收据表却缺少触发器时必须先人工对账，禁止直接补建后重放处罚。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
+上面 `schema/current.sql` **仅允许对新建空 D1 数据库执行一次**，绝不能用于已有数据的数据库。旧数据库先运行只读 `--pre-migration` 预检；只有确认缺少相应结构时，才通过 Cloudflare MCP 或 `npx wrangler d1 execute DB --remote --file schema/ensure_warning_adjustments.sql`、`npx wrangler d1 execute DB --remote --file schema/ensure_cleanup_state.sql` 执行对应幂等迁移。扫描及日志过滤仅执行预检打印的缺失 ALTER，不得重复运行整份 `schema/ensure_scan_fencing.sql` 或 `schema/ensure_log_filter.sql`。预检退出码 `2` 时必须停止；已有收据表却缺少触发器需人工对账，禁止直接补建后重放处罚。普通预检退出码 `0` 后才可部署。设置完 Cloudflare Secrets 与 Worker URL 后，用自己的终端注册 Webhook（`drop_pending_updates=false` 避免遗漏待处理更新）：
 
 ```sh
 read -r -s -p 'BOT_TOKEN: ' BOT_TOKEN; echo
@@ -142,7 +142,17 @@ unset BOT_TOKEN WEBHOOK_SECRET
 
 ## 生产 D1 发布前校验
 
-GitHub Actions 只构建测试，不修改生产 D1 或自动发布。发布 Worker 前，先确认生产数据库绑定及备份，在已授权操作机运行 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote --pre-migration`。退出码 3 表示经过验证的旧版结构只缺少可安全添加的警告相关对象或扫描租约字段（包括 PR #11 之后缺少收据表和触发器的情况），此时手工运行 `schema/ensure_warning_adjustments.sql`；退出码 2 表示其它结构错误或校验失败，必须阻止发布。迁移后以及上传 Worker 前，再运行 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote`，必须退出 0。不要在旧数据库运行完整 `schema/current.sql`。如果原版本已在 Telegram 删除后写入违规但查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
+GitHub Actions 只构建测试，不修改生产 D1 或自动发布；**CI 成功不能证明生产 D1 已迁移**。发布 Worker 前确认 Cloudflare 账户与目标 `DB` 绑定、现有 Worker 版本和 D1 Time Travel 恢复书签。在已授权操作机运行只读检查 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote --pre-migration`；也可通过 Cloudflare MCP 执行 `--print-inspection-sql` 输出的元数据/PRAGMA 查询，将成功结果保存为 JSON 后用 `--from-json response.json --pre-migration` 校验。检查不读取消息正文，也不更改生产数据库。
+
+| 退出码 | 含义 | 处理 |
+| --- | --- | --- |
+| `0` | 所要求的数据库结构就绪 | 继续发布流程；上传前仍需再运行普通预检 |
+| `3` | 仅在 `--pre-migration` 模式：确认只缺少已支持的增量结构 | 仅执行确认缺失的增量迁移，再检查 |
+| `2` | 不兼容结构、查询/输入错误，或普通模式下仍缺少所需结构 | 停止发布并调查，不能盲目补建 |
+
+退出码 `3` 可能涉及警告对象（`warning_adjustments`、`warning_edit_receipts`、`apply_warning_edit_receipt`）、`cleanup_state` 清理状态表、`scan_jobs` 的 `generation`/`lease_id`/`lease_until` 列、`group_settings.logs_warn_only`。**仅按预检确认的缺失项处理**：缺少警告对象时应用幂等的 `schema/ensure_warning_adjustments.sql`；缺少清理状态表时应用幂等的 `schema/ensure_cleanup_state.sql`（不会改变现有数据行，首个 Worker 清理领取会创建单例行）。对于 `schema/ensure_scan_fencing.sql` 和 `schema/ensure_log_filter.sql`，仅执行预检打印的缺失 ALTER；ALTER 不幂等，不得对已有字段重复执行。同名表/触发器结构不符、额外影响警告/待封禁/清理表的触发器，或已有收据表却缺少触发器，均属于不兼容（退出码 `2`），不能靠 `CREATE IF NOT EXISTS` 自动修复。
+
+迁移后以及上传 Worker 前，运行普通只读检查 `cargo run --manifest-path tools/maintenance/Cargo.toml --bin check-d1-schema -- --remote`（或不带 `--pre-migration` 的等价 `--from-json` 检查），**必须退出码 `0`**。不要在已有数据的数据库运行 `schema/current.sql`。原版本若曾在 Telegram 删除后写入违规但后续查询失败，不能简单重放处罚，需要人工对账。详情见 [手工发布检查](docs/manual-d1-release.md)。
 
 发布预检同时检查 `warning_edit_receipts` 和 `apply_warning_edit_receipt` 的结构及定义，并在本地临时 SQLite 数据库中验证触发器行为。已有收据表却缺少触发器时，可能存在已写入但未生效的命令，必须返回不兼容（退出码 2），禁止直接当作普通增量迁移。详情见 [迁移兼容性矩阵](docs/manual-d1-release.md)。
 

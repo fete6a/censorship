@@ -261,6 +261,47 @@ fn docs_describe_privacy_permissions_and_rust_release_gate() {
     contains(&source("README_CN.md"), &["D1 归档"]);
 }
 #[test]
+fn chinese_d1_release_docs_track_supported_migrations_and_exit_codes() {
+    let cn = source("README_CN.md");
+    let setup = between(&cn, "## GitHub Actions 构建", "## 数据与风险");
+    let gate = between(
+        &cn,
+        "## 生产 D1 发布前校验",
+        "### 历史扫描的代次隔离与取消边界",
+    );
+    let guide = source("docs/manual-d1-release.md");
+    let checker = source("tools/maintenance/src/lib.rs");
+    let migration_paths: Vec<_> = checker
+        .lines()
+        .filter(|line| line.starts_with("pub const ENSURE_"))
+        .map(|line| line.split_once("../../../").unwrap().1.split('"').next().unwrap())
+        .collect();
+    assert!(migration_paths.len() >= 4, "expected all four additive migration families");
+    for path in migration_paths {
+        assert!(root().join(path).is_file(), "missing migration: {path}");
+        for document in [setup, gate, guide.as_str()] {
+            contains(document, &[path]);
+        }
+    }
+    contains(setup, &["新建空 D1", "已有 D1", "只执行预检打印的缺失 ALTER"]);
+    contains(
+        gate,
+        &[
+            "退出码 `0`",
+            "退出码 `2`",
+            "退出码 `3`",
+            "--remote --pre-migration",
+            "`schema/current.sql`",
+            "`cleanup_state`",
+            "`group_settings.logs_warn_only`",
+            "ALTER 不幂等",
+            "CI 成功",
+        ],
+    );
+    excludes(gate, &["只缺少可安全添加的警告相关对象或扫描租约字段"]);
+}
+
+#[test]
 fn warning_schema_guard_precedes_telegram_deletion_and_cleanup_propagates_errors() {
     let m = source("src/moderation.rs");
     let live = between(&m, "async fn review_with_policy_cache(", "fn command_parts");
