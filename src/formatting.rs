@@ -153,7 +153,7 @@ pub fn scan_result(row: &ReviewLine) -> String {
     if matches!(row.status.as_str(),"review_error"|"policy_unavailable"|"no_group_description") {
         return format!("{header}\n⚠️ 未获得有效审核结果，未执行处罚。");
     }
-    let category=if matches!(row.category.as_str(),"none"|"other"|"adult") {
+    let category=if matches!(row.category.as_str(),"none"|"other") {
         String::new()
     } else {format!(" · {}",category_name(&row.category))};
     let suffix=match row.status.as_str() {
@@ -186,7 +186,7 @@ fn row_markdown(chat_id: i64, row: &ReviewLine) -> String {
     if matches!(row.status.as_str(),"review_error"|"policy_unavailable"|"no_group_description") {
         return format!("{icon} {target} · *{label}*");
     }
-    let cat=if matches!(row.category.as_str(),"none"|"other"|"adult") {String::new()} else {format!(" · {}",escape_md(category_name(&row.category)))};
+    let cat=if matches!(row.category.as_str(),"none"|"other") {String::new()} else {format!(" · {}",escape_md(category_name(&row.category)))};
     let percent=escape_md(&format!("{:.1}%",100.0*row.probability.clamp(0.0,1.0)));
     format!("{icon} {target} · *{label}*{cat}\n📊 违规概率：`{}` *{percent}*",progress_bar(row.probability,1.0,10))
 }
@@ -345,13 +345,22 @@ mod tests {
         let ok=ReviewLine{message_id:8,status:"audit_flag".into(),category:"spam".into(),probability:0.95};
         assert!(scan_result(&ok).contains("📊 违规概率："));
         assert!(scan_result(&ok).contains("审计命中 · 广告"));
-        for kind in ["none","other","adult"] {
+        for kind in ["none","other"] {
             let clean=ReviewLine{category:kind.into(),..ok.clone()};
             assert!(!scan_result(&clean).contains(" · "));
         }
         let error=ReviewLine{message_id:8,status:"review_error".into(),category:"none".into(),probability:0.0};
         assert!(!scan_result(&error).contains("违规概率"));
         assert!(scan_result(&error).contains("未获得有效审核结果"));
+    }
+    #[test]
+    fn adult_category_is_visible_in_scan_and_digest_results() {
+        for status in ["allow","audit_flag","dry_run_flag","deleted"] {
+            let row=ReviewLine{message_id:8,status:status.into(),category:"adult".into(),probability:0.95};
+            assert!(scan_result(&row).contains(" · 不当成人内容"));
+            let digest=review_digest(-100123,&[row]).join("\n");
+            assert!(digest.contains(" · 不当成人内容"));
+        }
     }
 
 }

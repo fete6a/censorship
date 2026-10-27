@@ -82,10 +82,9 @@ fn parse_decision(raw: Value) -> Result<Decision> {
     let remove_probability=probability(&violation["noul"])?;
     let (category, _, _) = parse_choice(body, "category",
         &["none", "spam", "fraud", "harassment", "hate", "adult", "threat", "other"])?;
-    // "other" and "adult" are not actionable categories. Normalize them at
-    // the model boundary so status selection, persisted reviews, and
-    // notifications match "none".
-    let category = if matches!(category, "other" | "adult") { "none" } else { category };
+    // Only "other" is non-actionable. "adult" follows the same group-policy
+    // and score gates as the other actionable categories.
+    let category = if category == "other" { "none" } else { category };
     let (_, _, severity_probs) = parse_choice(body, "severity", &["none", "minor", "major", "critical"])?;
     let critical_probability = probability(&severity_probs["critical"])?;
     Ok(Decision { remove_probability, category: category.to_owned(), critical_probability })
@@ -1089,7 +1088,7 @@ mod tests {
     }
     #[test]
     fn non_actionable_categories_are_normalized_to_none() {
-        for category in ["none", "other", "adult"] {
+        for category in ["none", "other"] {
             let mut raw=model_response();
             raw["answers"]["category"]["choice"]=json!(category);
             let mut decision=parse_decision(raw).unwrap();
@@ -1099,6 +1098,18 @@ mod tests {
             decision.remove_probability=0.60;
             assert!(!decision.clear_violation(0.80));
             assert_eq!(decision.status_without_removal(0.80), "allow");
+        }
+    }
+    #[test]
+    fn adult_category_is_preserved_and_uses_the_inclusive_threshold() {
+        for (score, actionable) in [(0.9299, false), (0.93, true), (0.99, true)] {
+            let mut raw=model_response();
+            raw["answers"]["category"]["choice"]=json!("adult");
+            raw["answers"]["violation"]["noul"]=json!(score);
+            let decision=parse_decision(raw).unwrap();
+            assert_eq!(decision.category,"adult");
+            assert_eq!(decision.clear_violation(0.93),actionable);
+            if !actionable {assert_eq!(decision.status_without_removal(0.93),"allow");}
         }
     }
     #[test]
