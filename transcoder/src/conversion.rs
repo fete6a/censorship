@@ -4,7 +4,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     sync::oneshot,
-    time::{timeout, Duration},
+    time::{timeout_at, Duration, Instant},
 };
 
 use crate::MAX_OUTPUT;
@@ -41,6 +41,8 @@ pub(crate) async fn run(
     bytes: Bytes,
     deadline: Duration,
 ) -> Result<Vec<u8>, Error> {
+    // Use one absolute deadline, including spawn and supervisor scheduling time.
+    let deadline = Instant::now() + deadline;
     let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -66,7 +68,7 @@ mod tests;
 async fn supervise(
     mut child: Child,
     bytes: Bytes,
-    deadline: Duration,
+    deadline: Instant,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<Vec<u8>, Error> {
     let result = {
@@ -96,7 +98,7 @@ async fn supervise(
             Ok(audio)
         };
         tokio::select! {
-            result = timeout(deadline, work) => result.unwrap_or(Err((
+            result = timeout_at(deadline, work) => result.unwrap_or(Err((
                 StatusCode::GATEWAY_TIMEOUT, "audio conversion timeout",
             ))),
             _ = &mut cancelled => Err((StatusCode::BAD_GATEWAY, "conversion cancelled")),

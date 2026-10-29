@@ -2,6 +2,7 @@ use super::*;
 use std::{path::PathBuf, sync::OnceLock};
 #[cfg(unix)]
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 const TEST_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -160,6 +161,7 @@ fn assert_reaped(pid: u32) {
 // cleanup assertions, independent of procfs availability or PID namespaces.
 #[cfg(unix)]
 async fn supervised(mode: &str, size: usize, deadline: Duration) -> (u32, Result<Vec<u8>, Error>) {
+    let deadline = Instant::now() + deadline;
     let child = fixture(mode, size)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -184,6 +186,34 @@ async fn supervised(mode: &str, size: usize, deadline: Duration) -> (u32, Result
     drop(cancel);
     assert_reaped(pid);
     (pid, result)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn supervisor_does_not_restart_an_expired_deadline() {
+    let child = fixture("hang", 0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let (cancel, cancelled) = oneshot::channel();
+    let result = timeout(
+        Duration::from_secs(1),
+        supervise(
+            child,
+            Bytes::new(),
+            Instant::now() - Duration::from_secs(1),
+            cancelled,
+        ),
+    )
+    .await
+    .expect("expired deadline was restarted");
+    drop(cancel);
+    assert_eq!(result.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+    assert_reaped(pid);
 }
 
 #[cfg(unix)]

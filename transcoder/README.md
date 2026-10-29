@@ -21,7 +21,8 @@ error. stderr remains discarded rather than buffered.
 If the request future is dropped, its cancellation sender is dropped too. A
 separate supervisor retains the child long enough to kill and reap it; there is
 no detached stdin writer retaining the request body. `kill_on_drop(true)` remains
-as a fallback. The 25-second deadline covers conversion I/O and process exit;
+as a fallback. One absolute 25-second deadline starts before spawning FFmpeg,
+including supervisor scheduling time, conversion I/O and process exit;
 cleanup waits for reaping afterward. A client disconnect only triggers this path
 if the server drops the handler future.
 
@@ -45,7 +46,8 @@ output before stdin consumption, broken stdin, stdout read failure, abnormal
 exit and a missing executable. Unix tests also use `kill(pid, 0)` and
 `waitpid(..., WNOHANG)`/`ECHILD` to check child termination and reaping, even
 when stdin is blocked or stdout has already closed. Timeout tests inject a
-100 ms deadline; the HTTP handler continues to supply 25 seconds. The `libc`
+100 ms deadline and verify that an already expired deadline is not restarted;
+the HTTP handler continues to supply 25 seconds. The `libc`
 dependency is used only by these Unix tests and is not added to production code.
 
 The finite legacy reproduction is opt-in:
@@ -62,3 +64,16 @@ reproduction with Tokio 1.54.1 returned stdout length **33,554,432** and `Vec`
 capacity **67,108,864** bytes, against an 8,388,608-byte limit. Vec capacity is
 allocation evidence, not a measurement of resident physical memory. This test
 does not attempt OOM, and establishes no production outage or exploitation.
+
+## Container build and release prerequisites
+
+Build from the repository root with `docker build -t audio-transcoder ./transcoder`.
+The build context excludes local Cargo targets and test fixtures. Publish the
+image to the existing container host, preserve its `TRANSCODER_TOKEN`, and verify
+the HTTPS `/transcode` endpoint with synthetic audio before routing traffic.
+The Worker needs matching `TRANSCODER_URL` and `TRANSCODER_TOKEN` bindings.
+Deploying only the Worker does not update this native FFmpeg service.
+
+Cloudflare Containers requires Workers Paid. If no existing container host or
+transcoder bindings are configured, choose and provision the hosting target
+before release; merging this PR alone does not enable audio transcoding.
