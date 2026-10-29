@@ -1954,3 +1954,39 @@ await test('explicit text and caption URLs remain original moderation content, b
     assert.deepEqual(f.aiCalls[0].input.state.link_evidence,[{status:'blocked_target'}]);
   }
 });
+
+await test('slow link timeout preserves later groups and ordinary message evidence', async()=>{
+  const f=fixture({pageFetch:request=>{
+    if (new URL(request.url).pathname==='/stalled') return new Promise(()=>{});
+    return new Response('<main>Normal article evidence</main>',{headers:{'Content-Type':'text/html'}});
+  }});
+  const slow=message(groupA,52001);
+  slow.message.text='https://slow.example.org/stalled';
+  const normal=message(groupB,52002);
+  normal.message.text='https://fast.example.org/article';
+  const results=await f.consumeBatch([slow,normal]);
+  assert.deepEqual(results,[{acked:true,retried:false},{acked:true,retried:false}]);
+  assert.deepEqual(f.pageRequests.map(r=>new URL(r.url).hostname),
+    ['slow.example.org','fast.example.org']);
+  assert.deepEqual(f.aiCalls[0].input.state.link_evidence.map(e=>e.status),['timeout']);
+  assert.deepEqual(f.aiCalls[1].input.state.link_evidence.map(e=>e.status),['fetched']);
+  assert.equal(f.aiCalls[1].input.state.link_evidence[0].excerpt,'Normal article evidence');
+  assert.ok(f.completed.has(52001) && f.completed.has(52002));
+});
+
+await test('batch link fanout stays bounded without starving later group evidence',async()=>{
+  const f=fixture({pageFetch:request=>new Response(null,{
+    status:302,headers:{Location:'/another-hop'}})});
+  const updates=Array.from({length:20},(_,i)=>{
+    const m=message(i%2===0?groupA:groupB,53000+i);
+    m.message.text='https://first.example.org/start https://second.example.org/start';
+    return m;
+  });
+  const results=await f.consumeBatch(updates);
+  assert.equal(f.pageRequests.length,120);
+  assert.ok(f.pageRequests.every(r=>r.redirect==='manual'));
+  assert.equal(f.aiCalls.length,20);
+  assert.ok(f.aiCalls.every(call=>call.input.state.link_evidence.length===2));
+  assert.ok(f.aiCalls.every(call=>call.input.state.link_evidence.every(e=>e.status==='redirect_limit')));
+  assert.ok(results.every(x=>x.acked && !x.retried));
+});
