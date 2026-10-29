@@ -172,6 +172,8 @@ GitHub Actions 只构建测试，不修改生产 D1 或自动发布；**CI 成�
 
 生产审核逻辑、历史导入器、转码服务均使用 Rust。D1 发布预检及离线 SQLite、源码和文档回归测试也已迁入独立的 [Rust 维护工具包](tools/maintenance/README.md)，不再需要 Python。运行 `cargo test --manifest-path tools/maintenance/Cargo.toml --locked` 即可执行。维护工具的本地 SQLite 等依赖不会链接进生产 Wasm。
 
+音频转码服务改为在读取期间限制 stdout 为 8 MiB；超限、超时或处理请求的 future 被取消时，终止并回收子进程。该限制针对单次输出缓冲区，不代表整个服务或 FFmpeg 的总内存上限。实现说明与合成测试见[转码资源限制文档](transcoder/README.md)，运行 `cargo test --manifest-path transcoder/Cargo.toml` 即可回归验证。
+
 保留的手写 JavaScript 是 `tests/worker_runtime.mjs`，用于加载真实编译产物，验证 Cloudflare 的 JS/Wasm 边界及模拟外部服务；改为纯原生 Rust 测试会失去这部分集成覆盖。`build/index.js` 由 SDK 自动生成，是当前部署路径所需的 Wasm 加载胶水。Node/Wrangler 仍用于构建及本地开发，不承担手写的审核业务逻辑。
 
 ### 管理员日志模式

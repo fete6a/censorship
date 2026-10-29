@@ -133,6 +133,10 @@ release checks and offline SQLite/source/documentation regressions are also
 native Rust in [`tools/maintenance`](tools/maintenance/README.md); Python is not
 required. Run `cargo test --manifest-path tools/maintenance/Cargo.toml --locked`.
 
+The audio transcoder's [resource limits and regression checks](transcoder/README.md)
+describe its bounded 8 MiB stdout reader and child cleanup on overflow, timeout
+or request cancellation. Run `cargo test --manifest-path transcoder/Cargo.toml`.
+
 The remaining handwritten JavaScript is `tests/worker_runtime.mjs`, which tests
 the actual compiled JS/Wasm artifact and Cloudflare host boundary. Generated
 `build/index.js` is the SDK's required Wasm loader/glue. Node/Wrangler remain
