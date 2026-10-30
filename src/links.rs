@@ -200,68 +200,72 @@ fn html_tag_end(input: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Raw/auxiliary elements contain no useful article text. Look for the exact
-/// closing tag, not just its name prefix; scan each skipped byte at most once.
-fn html_skipped_end(input: &str, mut from: usize, tag: &str) -> usize {
-    // Script, style and title have raw/RCDATA semantics: apparent tags in
-    // their text cannot open nested HTML elements.
-    let raw = ["script", "style", "title"].iter()
-        .any(|name| tag.eq_ignore_ascii_case(name));
-    let mut depth = 1usize;
+/// HTML accepts abrupt empty comments and the --!> terminator; XML does not.
+fn html_comment_end(input: &str, from: usize, xml: bool) -> usize {
+    if !xml {
+        if input[from..].starts_with('>') { return from + 1; }
+        if input[from..].starts_with("->") { return from + 2; }
+    }
+    let bytes = input.as_bytes();
+    for i in from..bytes.len() {
+        if bytes[i..].starts_with(b"-->") { return i + 3; }
+        if !xml && bytes[i..].starts_with(b"--!>") { return i + 4; }
+    }
+    input.len()
+}
+
+fn self_closing(input: &str, after_name: usize, end: usize, name: &str, xml: bool) -> bool {
+    // A slash on HTML non-void elements is ignored. SVG roots use foreign
+    // content semantics; XML permits self-closing syntax on every element.
+    (xml || name.eq_ignore_ascii_case("svg")) &&
+        input[after_name..end - 1].trim_end().ends_with('/')
+}
+
+/// Scan ignored elements iteratively. A template creates its own delimiter
+/// scope, so fake parent closings inside inert content cannot end the skip.
+fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool) -> usize {
+    let mut stack = vec![tag];
     while let Some(offset) = input[from..].find('<') {
         let lt = from + offset;
+        let current = *stack.last().expect("ignored element scope");
+        let raw = ["script", "style", "title", "iframe", "noscript"].iter()
+            .any(|name| current.eq_ignore_ascii_case(name));
         if !raw && input[lt..].starts_with("<!--") {
-            let Some(end) = input[lt + 4..].find("-->") else { return input.len(); };
-            from = lt + 4 + end + 3;
+            from = html_comment_end(input, lt + 4, xml);
             continue;
         }
         if let Some((closing, name, after_name)) = html_tag_name(input, lt) {
             let delimiter = input.as_bytes().get(after_name).is_some_and(|byte|
                 *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace());
-            if delimiter {
-                if raw {
-                    if closing && name.eq_ignore_ascii_case(tag) {
-                        return html_tag_end(input, after_name).unwrap_or(input.len());
+            if delimiter && (!raw || closing && name.eq_ignore_ascii_case(current)) {
+                let Some(end) = html_tag_end(input, after_name) else { return input.len(); };
+                if closing && name.eq_ignore_ascii_case(current) {
+                    stack.pop();
+                    if stack.is_empty() { return end; }
+                } else if !closing && !raw {
+                    if stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
+                        name.eq_ignore_ascii_case("body") { return lt; }
+                    if !self_closing(input, after_name, end, name, xml) &&
+                        (name.eq_ignore_ascii_case(current) ||
+                         ["template", "script", "style", "title", "iframe", "noscript"].iter()
+                            .any(|nested| name.eq_ignore_ascii_case(nested))) {
+                        stack.push(name);
                     }
-                } else {
-                    let Some(end) = html_tag_end(input, after_name) else {
-                        return input.len();
-                    };
-                    if name.eq_ignore_ascii_case(tag) {
-                        if closing {
-                            depth -= 1;
-                            if depth == 0 { return end; }
-                        } else if !input[after_name..end - 1].trim_end().ends_with('/') {
-                            depth += 1;
-                        }
-                    } else if !closing {
-                        // Recover a missing </head> when the real body begins.
-                        if tag.eq_ignore_ascii_case("head") && name.eq_ignore_ascii_case("body") {
-                            return lt;
-                        }
-                        // Do not interpret fake </head> or </nav> text in
-                        // nested JS/CSS as the closing element.
-                        if ["script", "style", "title"].iter()
-                            .any(|raw_tag| name.eq_ignore_ascii_case(raw_tag)) &&
-                            !input[after_name..end - 1].trim_end().ends_with('/') {
-                            from = html_skipped_end(input, end, name);
-                            continue;
-                        }
-                    }
-                    from = end;
-                    continue;
                 }
+                from = end;
+                continue;
             }
         }
         from = lt + 1;
     }
     input.len()
 }
-fn excerpt(bytes: &[u8], html: bool) -> String {
+fn excerpt(bytes: &[u8], mime: &str) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     let mut space = false;
-    if !html {
+    let xml = mime == "application/xhtml+xml";
+    if mime != "text/html" && !xml {
         append_excerpt(&mut out, &mut space, &text, false);
         return out.trim().to_owned();
     }
@@ -277,9 +281,8 @@ fn excerpt(bytes: &[u8], html: bool) -> String {
 
         if text[lt..].starts_with("<!--") {
             // Unterminated comments never leak their payload into evidence.
-            let Some(end) = text[lt + 4..].find("-->") else { break; };
-            i = lt + 4 + end + 3;
-        } else if text[lt..].starts_with("<![CDATA[") {
+            i = html_comment_end(&text, lt + 4, xml);
+        } else if xml && text[lt..].starts_with("<![CDATA[") {
             let Some(end) = text[lt + 9..].find("]]>") else { break; };
             let raw = &text[lt + 9..lt + 9 + end];
             if !append_excerpt(&mut out, &mut space, raw, false) { break; }
@@ -289,12 +292,12 @@ fn excerpt(bytes: &[u8], html: bool) -> String {
             i = end;
         } else if let Some((closing, name, after_name)) = html_tag_name(&text, lt) {
             let Some(end) = html_tag_end(&text, after_name) else { break; };
-            let self_closing = text[after_name..end - 1].trim_end().ends_with('/');
+            let self_closing = self_closing(&text, after_name, end, name, xml);
             if !closing && !self_closing && [
                 "head", "title", "script", "style", "noscript", "template",
                 "nav", "aside", "footer", "svg", "canvas", "iframe", "object",
             ].iter().any(|ignored| name.eq_ignore_ascii_case(ignored)) {
-                i = html_skipped_end(&text, end, name);
+                i = html_skipped_end(&text, end, name, xml);
             } else {
                 i = end;
             }
@@ -367,7 +370,7 @@ pub async fn evidence(msg: &Value) -> Vec<Value> {
             match response_bytes(&mut response,MAX_PAGE_BYTES).await {
                 Ok(bytes)=>{
                     result["status"]=json!("fetched");
-                    result["excerpt"]=json!(excerpt(&bytes,mime=="text/html" || mime=="application/xhtml+xml"));
+                    result["excerpt"]=json!(excerpt(&bytes,&mime));
                 }
                 Err(_)=>result["status"]=json!("response_too_large_or_unreadable"),
             }
@@ -480,31 +483,31 @@ mod tests {
             "CSS_POISON { display: none; }".repeat(500),
             "if (x < y) { JAVASCRIPT_POISON(); }".repeat(500),
         );
-        assert_eq!(excerpt(html.as_bytes(), true), "Useful & verified News 🌍 today.");
+        assert_eq!(excerpt(html.as_bytes(), "text/html"), "Useful & verified News 🌍 today.");
     }
     #[test]
     fn html_comments_attributes_and_unclosed_tags_do_not_leak_markup() {
         let html = "<!-- HEADER_POISON > --><DIV data-title=\"a > b\">Alpha&nbsp; &amp; beta\
             <p>Second &#39;quoted&#39; line</p><broken";
-        assert_eq!(excerpt(html.as_bytes(), true), "Alpha & beta Second 'quoted' line");
-        assert_eq!(excerpt(b"<script>evil <p>bad</p>", true), "");
-        assert_eq!(excerpt(b"<!-- unterminated", true), "");
-        assert_eq!(excerpt(b"Price < 5 &gt; 3", true), "Price < 5 > 3");
-        assert_eq!(excerpt(b"<p>&unknown; &#0; &#x110000;</p>", true),
+        assert_eq!(excerpt(html.as_bytes(), "text/html"), "Alpha & beta Second 'quoted' line");
+        assert_eq!(excerpt(b"<script>evil <p>bad</p>", "text/html"), "");
+        assert_eq!(excerpt(b"<!-- unterminated", "text/html"), "");
+        assert_eq!(excerpt(b"Price < 5 &gt; 3", "text/html"), "Price < 5 > 3");
+        assert_eq!(excerpt(b"<p>&unknown; &#0; &#x110000;</p>", "text/html"),
             "&unknown; \u{fffd} \u{fffd}");
     }
     #[test]
     fn html_handles_case_insensitive_raw_tags_and_xhtml() {
         let html = "<STYLE type='text/css'>CSS_POISON</StYlE ><SCRIPT>JS_POISON</SCRIPT>\
             <main>Visible&nbsp; body<br/>paragraph &lt;tag&gt;</main>";
-        assert_eq!(excerpt(html.as_bytes(), true), "Visible body paragraph <tag>");
+        assert_eq!(excerpt(html.as_bytes(), "text/html"), "Visible body paragraph <tag>");
     }
     #[test]
     fn excerpts_respect_utf8_byte_budget_and_plain_text_is_unchanged() {
         let many = "🌍".repeat(700);
         let html = format!("<main>{many}</main>");
-        assert_eq!(excerpt(html.as_bytes(), true), "🌍".repeat(MAX_EXCERPT / 4));
-        assert_eq!(excerpt(b"Plain <tag> &amp; text\nnext", false),
+        assert_eq!(excerpt(html.as_bytes(), "text/html"), "🌍".repeat(MAX_EXCERPT / 4));
+        assert_eq!(excerpt(b"Plain <tag> &amp; text\nnext", "text/plain"),
             "Plain <tag> &amp; text next");
     }
 
@@ -513,11 +516,39 @@ mod tests {
         let adversarial = "<head><script>let fake = '</head>';</script>\
             <!-- another </head> fake --><title>private metadata</title></head>\
             <body><main>Actual article</main></body>";
-        assert_eq!(excerpt(adversarial.as_bytes(), true), "Actual article");
+        assert_eq!(excerpt(adversarial.as_bytes(), "text/html"), "Actual article");
         let malformed = "<head><title>Hidden metadata</title><body><main>Readable body</main>";
-        assert_eq!(excerpt(malformed.as_bytes(), true), "Readable body");
+        assert_eq!(excerpt(malformed.as_bytes(), "text/html"), "Readable body");
         let nested = "<nav><nav>Menu</nav>Still a menu</nav><main>Real content</main>";
-        assert_eq!(excerpt(nested.as_bytes(), true), "Real content");
+        assert_eq!(excerpt(nested.as_bytes(), "text/html"), "Real content");
+    }
+
+    #[test]
+    fn html_non_void_slashes_and_nested_templates_do_not_leak() {
+        for html in [
+            "<script/>POISON</script><style/>POISON</style><main>Article</main>",
+            "<head/><script/>let x = '</head>';</script><title>POISON</title></head><main>Article</main>",
+            "<nav><template></nav>POISON<template>POISON</template></template></nav><main>Article</main>",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article");
+        }
+        let deep = format!("<nav>{}</nav>POISON{}</nav><main>Article</main>",
+            "<template>".repeat(5000), "</template>".repeat(5000));
+        assert_eq!(excerpt(deep.as_bytes(), "text/html"), "Article");
+        assert_eq!(excerpt(b"<script/><style/><main>Article</main>", "application/xhtml+xml"), "Article");
+        assert_eq!(excerpt(b"<svg/><main>Article</main>", "text/html"), "Article");
+    }
+
+    #[test]
+    fn html_comment_recovery_preserves_article_and_ignored_scopes() {
+        for comment in ["<!-->", "<!--->", "<!-- hidden --!>", "<!-- hidden -->"] {
+            let html = format!("{comment}<main>Article</main>");
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article");
+            let nested = format!("<nav>{comment}POISON</nav><main>Article</main>");
+            assert_eq!(excerpt(nested.as_bytes(), "text/html"), "Article");
+        }
+        assert_eq!(excerpt(b"<!--><main>Article</main>", "application/xhtml+xml"), "");
+        assert_eq!(excerpt(b"<![CDATA[Article <text>]]>", "application/xhtml+xml"), "Article <text>");
     }
 
 }

@@ -2024,3 +2024,25 @@ await test('HTML evidence tolerates misleading head closing text and malformed h
     assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('METADATA_POISON'));
   }
 });
+
+await test('HTML parser review regressions exclude inert payloads and recover comments', async () => {
+  const poison = 'POISON '.repeat(500);
+  const cases = [
+    ['text/html', `<script/>${poison}</script><style/>${poison}</style><main>Article</main>`],
+    ['text/html', `<nav><template></nav>${poison}<template>${poison}</template></template></nav><main>Article</main>`],
+    ['text/html', '<!--><main>Article</main>'],
+    ['text/html', '<!---><main>Article</main>'],
+    ['text/html', '<!-- hidden --!><main>Article</main>'],
+    ['text/html', '<nav><!-- hidden --!>POISON</nav><main>Article</main>'],
+    ['application/xhtml+xml', '<script/><style/><main>Article</main>'],
+    ['application/xhtml+xml', '<main><![CDATA[Article]]></main>'],
+  ];
+  for (const [mime, html] of cases) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': mime}})});
+    const update = message(groupA, 4119);
+    update.message.text = 'https://safe.example.org/article';
+    await f.consume(update);
+    assert.equal(f.aiCalls[0].input.state.link_evidence[0].excerpt, 'Article');
+    assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('POISON'));
+  }
+});
