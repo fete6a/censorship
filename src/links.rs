@@ -209,7 +209,7 @@ pub async fn evidence(msg: &Value) -> Vec<Value> {
                 controller.abort();
                 results.push(json!({"url":displayed,"status":"timeout"}));
             }
-        }
+        };
     }
     results
 }

@@ -240,11 +240,11 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
       } };
     }
   }
-  context.fetch = async request => {
+  context.fetch = async (request, init) => {
     if (new URL(request.url).hostname !== "api.telegram.org") {
       pageRequests.push(request);
       if (!pageFetch) throw new Error("Unexpected page fetch");
-      return pageFetch(request);
+      return pageFetch(request, init);
     }
     if (new URL(request.url).pathname.startsWith('/file/'))
       return new Response(new Uint8Array([1,2,3,4]));
@@ -1956,8 +1956,12 @@ await test('explicit text and caption URLs remain original moderation content, b
 });
 
 await test('slow link timeout preserves later groups and ordinary message evidence', async()=>{
-  const f=fixture({pageFetch:request=>{
-    if (new URL(request.url).pathname==='/stalled') return new Promise(()=>{});
+  let stalledSignal;
+  const f=fixture({pageFetch:(request, init)=>{
+    if (new URL(request.url).pathname==='/stalled') {
+      stalledSignal = init?.signal ?? request.signal;
+      return new Promise(()=>{});
+    }
     return new Response('<main>Normal article evidence</main>',{headers:{'Content-Type':'text/html'}});
   }});
   const slow=message(groupA,52001);
@@ -1972,6 +1976,7 @@ await test('slow link timeout preserves later groups and ordinary message eviden
   assert.deepEqual(f.aiCalls[1].input.state.link_evidence.map(e=>e.status),['fetched']);
   assert.equal(f.aiCalls[1].input.state.link_evidence[0].excerpt,'Normal article evidence');
   assert.ok(f.completed.has(52001) && f.completed.has(52002));
+  assert.equal(stalledSignal.aborted, true);
 });
 
 await test('batch link fanout stays bounded without starving later group evidence',async()=>{
@@ -1989,4 +1994,26 @@ await test('batch link fanout stays bounded without starving later group evidenc
   assert.ok(f.aiCalls.every(call=>call.input.state.link_evidence.length===2));
   assert.ok(f.aiCalls.every(call=>call.input.state.link_evidence.every(e=>e.status==='redirect_limit')));
   assert.ok(results.every(x=>x.acked && !x.retried));
+});
+
+await test('link deadline covers a stalled body after redirects and aborts the fetch', async () => {
+  let signal;
+  const f = fixture({pageFetch: (request, init) => {
+    if (new URL(request.url).pathname === '/start')
+      return new Response(null, {status: 302, headers: {Location: '/body'}});
+    signal = init?.signal ?? request.signal;
+    const body = new ReadableStream({start(controller) {
+      controller.enqueue(new TextEncoder().encode('partial evidence'));
+      signal.addEventListener('abort', () => controller.error(new Error('aborted')), {once: true});
+    }});
+    return new Response(body, {headers: {'Content-Type': 'text/plain'}});
+  }});
+  const update = message(groupA, 54001);
+  update.message.text = 'https://slow.example.org/start';
+  await f.consume(update);
+  assert.equal(f.pageRequests.length, 2);
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(f.aiCalls[0].input.state.link_evidence,
+    [{url: 'https://slow.example.org/start', status: 'timeout'}]);
+  assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('partial evidence'));
 });
