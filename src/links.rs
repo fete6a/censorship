@@ -105,21 +105,167 @@ fn public_url(url:&Url)->String {
     safe.as_str().chars().take(350).collect()
 }
 
-fn excerpt(bytes:&[u8], html:bool)->String {
-    let text=String::from_utf8_lossy(bytes);
-    let mut out=String::new();
-    let mut in_tag=false;
-    let mut space=false;
-    for ch in text.chars() {
-        if html && ch=='<' {in_tag=true;continue;}
-        if html && ch=='>' {in_tag=false;space=true;continue;}
-        if in_tag {continue;}
-        if ch.is_control() || ch.is_whitespace() {
-            if !space && !out.is_empty() {out.push(' ');space=true;}
+// Keep both the decoded evidence and the scanned input bounded. The caller
+// already caps fetched pages at 256 KiB, so this parser needs no DOM or regex.
+fn html_entity(name: &str) -> Option<char> {
+    if let Some(number) = name.strip_prefix('#') {
+        let (digits, radix) = number.strip_prefix('x')
+            .or_else(|| number.strip_prefix('X'))
+            .map(|digits| (digits, 16))
+            .unwrap_or((number, 10));
+        let value = u32::from_str_radix(digits, radix).ok()?;
+        return Some(char::from_u32(value).filter(|ch| *ch != '\0')
+            .unwrap_or('\u{fffd}'));
+    }
+    Some(match name {
+        "amp" | "AMP" => '&',
+        "lt" | "LT" => '<',
+        "gt" | "GT" => '>',
+        "quot" | "QUOT" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{a0}',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "euro" => '€',
+        "ndash" => '–',
+        "mdash" => '—',
+        "hellip" => '…',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "bull" => '•',
+        _ => return None,
+    })
+}
+
+/// Append Unicode characters without cutting a UTF-8 sequence at 2400 bytes.
+fn append_excerpt(out: &mut String, space: &mut bool, input: &str, entities: bool) -> bool {
+    let mut i = 0;
+    while i < input.len() {
+        let rest = &input[i..];
+        let ch = rest.chars().next().expect("nonempty UTF-8 suffix");
+        let (ch, consumed) = if entities && ch == '&' {
+            rest.as_bytes()[1..].iter().take(16).position(|b| *b == b';')
+                .and_then(|end| html_entity(&rest[1..end + 1])
+                    .map(|decoded| (decoded, end + 2)))
+                .unwrap_or((ch, 1))
         } else {
-            out.push(ch);space=false;
+            (ch, ch.len_utf8())
+        };
+        if out.len() >= MAX_EXCERPT { return false; }
+        if ch.is_control() || ch.is_whitespace() {
+            if !*space && !out.is_empty() {
+                out.push(' ');
+                *space = true;
+            }
+        } else {
+            if out.len() + ch.len_utf8() > MAX_EXCERPT { return false; }
+            out.push(ch);
+            *space = false;
         }
-        if out.len()>=MAX_EXCERPT {break;}
+        i += consumed;
+    }
+    true
+}
+
+/// Read a tag name and distinguish opening from closing tags. Stray '<'
+/// characters in ordinary text (for example "price < 5") are not tags.
+fn html_tag_name(input: &str, lt: usize) -> Option<(bool, &str, usize)> {
+    let bytes = input.as_bytes();
+    let mut i = lt + 1;
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing { i += 1; }
+    let first = i;
+    if !bytes.get(i)?.is_ascii_alphabetic() { return None; }
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() ||
+        matches!(bytes[i], b'-' | b':')) {
+        i += 1;
+    }
+    Some((closing, &input[first..i], i))
+}
+
+/// A '>' within a quoted attribute is not a tag terminator.
+fn html_tag_end(input: &str, from: usize) -> Option<usize> {
+    let mut quote = 0u8;
+    for (offset, byte) in input.as_bytes()[from..].iter().enumerate() {
+        match *byte {
+            b'\'' | b'"' if quote == 0 => quote = *byte,
+            b if quote != 0 && byte == &quote => quote = 0,
+            b'>' if quote == 0 => return Some(from + offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Raw/auxiliary elements contain no useful article text. Look for the exact
+/// closing tag, not just its name prefix; scan each skipped byte at most once.
+fn html_skipped_end(input: &str, mut from: usize, tag: &str) -> usize {
+    while let Some(offset) = input[from..].find('<') {
+        let lt = from + offset;
+        if let Some((true, name, after_name)) = html_tag_name(input, lt) {
+            if name.eq_ignore_ascii_case(tag) &&
+                input.as_bytes().get(after_name).is_some_and(|byte|
+                    *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace()) {
+                return html_tag_end(input, after_name).unwrap_or(input.len());
+            }
+        }
+        from = lt + 1;
+    }
+    input.len()
+}
+
+fn excerpt(bytes: &[u8], html: bool) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::new();
+    let mut space = false;
+    if !html {
+        append_excerpt(&mut out, &mut space, &text, false);
+        return out.trim().to_owned();
+    }
+
+    let mut i = 0;
+    while i < text.len() && out.len() < MAX_EXCERPT {
+        let Some(next) = text[i..].find('<') else {
+            append_excerpt(&mut out, &mut space, &text[i..], true);
+            break;
+        };
+        let lt = i + next;
+        if !append_excerpt(&mut out, &mut space, &text[i..lt], true) { break; }
+
+        if text[lt..].starts_with("<!--") {
+            // Unterminated comments never leak their payload into evidence.
+            let Some(end) = text[lt + 4..].find("-->") else { break; };
+            i = lt + 4 + end + 3;
+        } else if text[lt..].starts_with("<![CDATA[") {
+            let Some(end) = text[lt + 9..].find("]]>") else { break; };
+            let raw = &text[lt + 9..lt + 9 + end];
+            if !append_excerpt(&mut out, &mut space, raw, false) { break; }
+            i = lt + 9 + end + 3;
+        } else if text[lt..].starts_with("<!") || text[lt..].starts_with("<?") {
+            let Some(end) = html_tag_end(&text, lt + 2) else { break; };
+            i = end;
+        } else if let Some((closing, name, after_name)) = html_tag_name(&text, lt) {
+            let Some(end) = html_tag_end(&text, after_name) else { break; };
+            let self_closing = text[after_name..end - 1].trim_end().ends_with('/');
+            if !closing && !self_closing && [
+                "head", "title", "script", "style", "noscript", "template",
+                "nav", "aside", "footer", "svg", "canvas", "iframe", "object",
+            ].iter().any(|ignored| name.eq_ignore_ascii_case(ignored)) {
+                i = html_skipped_end(&text, end, name);
+            } else {
+                i = end;
+            }
+        } else {
+            // '<' by itself is ordinary text, not the start of a tag.
+            if !append_excerpt(&mut out, &mut space, "<", false) { break; }
+            i = lt + 1;
+            continue;
+        }
+        // Preserve a word boundary between adjacent HTML elements.
+        if !append_excerpt(&mut out, &mut space, " ", false) { break; }
     }
     out.trim().to_owned()
 }
@@ -282,4 +428,44 @@ mod tests {
         assert!(collect(&json!({"text":text})).is_empty(),
             "the link budget fix must not remove bounded scanning");
     }
+
+    #[test]
+    fn html_body_skips_large_scripts_styles_and_auxiliary_elements() {
+        let html = format!(
+            "<!doctype html><html><head><title>HEAD_POISON</title>\
+            <style>{}</style><script>{}</script></head><body>\
+            <nav>MENU_POISON</nav><template>TEMPLATE_POISON</template>\
+            <main><h1>Useful &amp; verified</h1><p>News &#x1f30d; today.</p></main>\
+            <footer>FOOTER_POISON</footer></body></html>",
+            "CSS_POISON { display: none; }".repeat(500),
+            "if (x < y) { JAVASCRIPT_POISON(); }".repeat(500),
+        );
+        assert_eq!(excerpt(html.as_bytes(), true), "Useful & verified News 🌍 today.");
+    }
+    #[test]
+    fn html_comments_attributes_and_unclosed_tags_do_not_leak_markup() {
+        let html = "<!-- HEADER_POISON > --><DIV data-title=\"a > b\">Alpha&nbsp; &amp; beta\
+            <p>Second &#39;quoted&#39; line</p><broken";
+        assert_eq!(excerpt(html.as_bytes(), true), "Alpha & beta Second 'quoted' line");
+        assert_eq!(excerpt(b"<script>evil <p>bad</p>", true), "");
+        assert_eq!(excerpt(b"<!-- unterminated", true), "");
+        assert_eq!(excerpt(b"Price < 5 &gt; 3", true), "Price < 5 > 3");
+        assert_eq!(excerpt(b"<p>&unknown; &#0; &#x110000;</p>", true),
+            "&unknown; \u{fffd} \u{fffd}");
+    }
+    #[test]
+    fn html_handles_case_insensitive_raw_tags_and_xhtml() {
+        let html = "<STYLE type='text/css'>CSS_POISON</StYlE ><SCRIPT>JS_POISON</SCRIPT>\
+            <main>Visible&nbsp; body<br/>paragraph &lt;tag&gt;</main>";
+        assert_eq!(excerpt(html.as_bytes(), true), "Visible body paragraph <tag>");
+    }
+    #[test]
+    fn excerpts_respect_utf8_byte_budget_and_plain_text_is_unchanged() {
+        let many = "🌍".repeat(700);
+        let html = format!("<main>{many}</main>");
+        assert_eq!(excerpt(html.as_bytes(), true), "🌍".repeat(MAX_EXCERPT / 4));
+        assert_eq!(excerpt(b"Plain <tag> &amp; text\nnext", false),
+            "Plain <tag> &amp; text next");
+    }
+
 }
