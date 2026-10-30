@@ -203,20 +203,60 @@ fn html_tag_end(input: &str, from: usize) -> Option<usize> {
 /// Raw/auxiliary elements contain no useful article text. Look for the exact
 /// closing tag, not just its name prefix; scan each skipped byte at most once.
 fn html_skipped_end(input: &str, mut from: usize, tag: &str) -> usize {
+    // Script, style and title have raw/RCDATA semantics: apparent tags in
+    // their text cannot open nested HTML elements.
+    let raw = ["script", "style", "title"].iter()
+        .any(|name| tag.eq_ignore_ascii_case(name));
+    let mut depth = 1usize;
     while let Some(offset) = input[from..].find('<') {
         let lt = from + offset;
-        if let Some((true, name, after_name)) = html_tag_name(input, lt) {
-            if name.eq_ignore_ascii_case(tag) &&
-                input.as_bytes().get(after_name).is_some_and(|byte|
-                    *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace()) {
-                return html_tag_end(input, after_name).unwrap_or(input.len());
+        if !raw && input[lt..].starts_with("<!--") {
+            let Some(end) = input[lt + 4..].find("-->") else { return input.len(); };
+            from = lt + 4 + end + 3;
+            continue;
+        }
+        if let Some((closing, name, after_name)) = html_tag_name(input, lt) {
+            let delimiter = input.as_bytes().get(after_name).is_some_and(|byte|
+                *byte == b'>' || *byte == b'/' || byte.is_ascii_whitespace());
+            if delimiter {
+                if raw {
+                    if closing && name.eq_ignore_ascii_case(tag) {
+                        return html_tag_end(input, after_name).unwrap_or(input.len());
+                    }
+                } else {
+                    let Some(end) = html_tag_end(input, after_name) else {
+                        return input.len();
+                    };
+                    if name.eq_ignore_ascii_case(tag) {
+                        if closing {
+                            depth -= 1;
+                            if depth == 0 { return end; }
+                        } else if !input[after_name..end - 1].trim_end().ends_with('/') {
+                            depth += 1;
+                        }
+                    } else if !closing {
+                        // Recover a missing </head> when the real body begins.
+                        if tag.eq_ignore_ascii_case("head") && name.eq_ignore_ascii_case("body") {
+                            return lt;
+                        }
+                        // Do not interpret fake </head> or </nav> text in
+                        // nested JS/CSS as the closing element.
+                        if ["script", "style", "title"].iter()
+                            .any(|raw_tag| name.eq_ignore_ascii_case(raw_tag)) &&
+                            !input[after_name..end - 1].trim_end().ends_with('/') {
+                            from = html_skipped_end(input, end, name);
+                            continue;
+                        }
+                    }
+                    from = end;
+                    continue;
+                }
             }
         }
         from = lt + 1;
     }
     input.len()
 }
-
 fn excerpt(bytes: &[u8], html: bool) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
@@ -466,6 +506,18 @@ mod tests {
         assert_eq!(excerpt(html.as_bytes(), true), "🌍".repeat(MAX_EXCERPT / 4));
         assert_eq!(excerpt(b"Plain <tag> &amp; text\nnext", false),
             "Plain <tag> &amp; text next");
+    }
+
+    #[test]
+    fn skipped_head_ignores_fake_closings_and_recovers_missing_end_tag() {
+        let adversarial = "<head><script>let fake = '</head>';</script>\
+            <!-- another </head> fake --><title>private metadata</title></head>\
+            <body><main>Actual article</main></body>";
+        assert_eq!(excerpt(adversarial.as_bytes(), true), "Actual article");
+        let malformed = "<head><title>Hidden metadata</title><body><main>Readable body</main>";
+        assert_eq!(excerpt(malformed.as_bytes(), true), "Readable body");
+        let nested = "<nav><nav>Menu</nav>Still a menu</nav><main>Real content</main>";
+        assert_eq!(excerpt(nested.as_bytes(), true), "Real content");
     }
 
 }
