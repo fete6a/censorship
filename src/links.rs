@@ -2,8 +2,10 @@
 //! A link/page is untrusted data, never a source of moderation instructions.
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::time::Duration;
+use futures_util::future::{select, Either};
 use serde_json::{json, Value};
-use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url};
+use worker::{AbortController, AbortSignal, Delay, Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url};
 use crate::body::response_bytes;
 use crate::util::field_str;
 
@@ -15,6 +17,8 @@ const MAX_URL_LEN: usize = 2048;
 const MAX_PAGE_BYTES: usize = 256 * 1024;
 const MAX_EXCERPT: usize = 2400;
 const MAX_REDIRECTS: usize = 2;
+// An individual page may not hold later Queue messages indefinitely.
+const MAX_PAGE_DURATION_SECS: u64 = 8;
 
 fn parse_url(input: &str, allow_bare: bool) -> Option<Url> {
     let trimmed = input.trim_matches(|c: char| matches!(c,
@@ -313,8 +317,65 @@ fn excerpt(bytes: &[u8], mime: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Return a JSON array of bounded page evidence. Network errors and
-/// blocked/unsupported URLs cannot prevent reviewing the original message.
+/// Fetch a safe URL with its original SSRF, redirect, and response size checks.
+/// The caller's signal applies to the entire redirect chain and streamed body.
+async fn fetch_page(url: Url, displayed: String, signal: &AbortSignal) -> Value {
+    let mut current=url;
+    let mut result=json!({"url":displayed,"status":"unavailable"});
+    for hop in 0..=MAX_REDIRECTS {
+        let headers=Headers::new();
+        if headers.set("Accept","text/html,text/plain,application/json;q=0.8").is_err() ||
+            headers.set("Range","bytes=0-262143").is_err() {break;}
+        let mut init=RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers).with_redirect(RequestRedirect::Manual);
+        let Ok(request)=Request::new_with_init(current.as_str(),&init) else {break;};
+        let Ok(mut response)=Fetch::Request(request).send_with_signal(signal).await else {break;};
+        let code=response.status_code();
+        if (300..400).contains(&code) {
+            if hop==MAX_REDIRECTS {
+                result["status"]=json!("redirect_limit");
+                break;
+            }
+            let next=response.headers().get("Location").ok().flatten()
+                .and_then(|location|current.join(&location).ok());
+            if let Some(next)=next {
+                if !safe_target(&next) {
+                    result["status"]=json!("blocked_redirect");
+                    break;
+                }
+                current=next;
+                continue;
+            }
+            result["status"]=json!("invalid_redirect");
+            break;
+        }
+        result["final_url"]=json!(public_url(&current));
+        result["http_status"]=json!(code);
+        if !(200..300).contains(&code) {
+            result["status"]=json!("http_error");break;
+        }
+        let mime=response.headers().get("Content-Type").ok().flatten().unwrap_or_default();
+        let mime=mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if !(mime.starts_with("text/") || mime=="application/json" ||
+            mime=="application/xhtml+xml") {
+            result["status"]=json!("non_text_content");
+            break;
+        }
+        result["mime"]=json!(mime);
+        match response_bytes(&mut response,MAX_PAGE_BYTES).await {
+            Ok(bytes)=>{
+                result["status"]=json!("fetched");
+                result["excerpt"]=json!(excerpt(&bytes,&mime));
+            }
+            Err(_)=>result["status"]=json!("response_too_large_or_unreadable"),
+        }
+        break;
+    }
+    result
+}
+
+/// Return bounded best-effort page evidence. A slow page must not hold a
+/// Queue batch (and other groups in that batch) indefinitely.
 pub async fn evidence(msg: &Value) -> Vec<Value> {
     let mut results=Vec::new();
     for url in collect(msg) {
@@ -325,58 +386,19 @@ pub async fn evidence(msg: &Value) -> Vec<Value> {
             continue;
         }
         let displayed=public_url(&url);
-        let mut current=url;
-        let mut result=json!({"url":displayed,"status":"unavailable"});
-        for hop in 0..=MAX_REDIRECTS {
-            let headers=Headers::new();
-            if headers.set("Accept","text/html,text/plain,application/json;q=0.8").is_err() ||
-                headers.set("Range","bytes=0-262143").is_err() {break;}
-            let mut init=RequestInit::new();
-            init.with_method(Method::Get).with_headers(headers).with_redirect(RequestRedirect::Manual);
-            let Ok(request)=Request::new_with_init(current.as_str(),&init) else {break;};
-            let Ok(mut response)=Fetch::Request(request).send().await else {break;};
-            let code=response.status_code();
-            if (300..400).contains(&code) {
-                if hop==MAX_REDIRECTS {
-                    result["status"]=json!("redirect_limit");
-                    break;
-                }
-                let next=response.headers().get("Location").ok().flatten()
-                    .and_then(|location|current.join(&location).ok());
-                if let Some(next)=next {
-                    if !safe_target(&next) {
-                        result["status"]=json!("blocked_redirect");
-                        break;
-                    }
-                    current=next;
-                    continue;
-                }
-                result["status"]=json!("invalid_redirect");
-                break;
+        let controller=AbortController::default();
+        let signal=controller.signal();
+        // Bound redirects AND body streaming with one deadline per safe URL.
+        // The per-message 2-link budget remains independent across groups.
+        let fetched=fetch_page(url,displayed.clone(),&signal);
+        let deadline=Delay::from(Duration::from_secs(MAX_PAGE_DURATION_SECS));
+        match select(Box::pin(fetched),Box::pin(deadline)).await {
+            Either::Left((result,_))=>results.push(result),
+            Either::Right((_,_))=>{
+                controller.abort();
+                results.push(json!({"url":displayed,"status":"timeout"}));
             }
-            result["final_url"]=json!(public_url(&current));
-            result["http_status"]=json!(code);
-            if !(200..300).contains(&code) {
-                result["status"]=json!("http_error");break;
-            }
-            let mime=response.headers().get("Content-Type").ok().flatten().unwrap_or_default();
-            let mime=mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-            if !(mime.starts_with("text/") || mime=="application/json" ||
-                mime=="application/xhtml+xml") {
-                result["status"]=json!("non_text_content");
-                break;
-            }
-            result["mime"]=json!(mime);
-            match response_bytes(&mut response,MAX_PAGE_BYTES).await {
-                Ok(bytes)=>{
-                    result["status"]=json!("fetched");
-                    result["excerpt"]=json!(excerpt(&bytes,&mime));
-                }
-                Err(_)=>result["status"]=json!("response_too_large_or_unreadable"),
-            }
-            break;
-        }
-        results.push(result);
+        };
     }
     results
 }
