@@ -1959,8 +1959,9 @@ await test('HTML evidence skips large script, style, metadata and template befor
   const script = 'const JAVASCRIPT_POISON = 1; '.repeat(550);
   const style = 'CSS_POISON {display: none} '.repeat(250);
   const html = '<!doctype html><html><head><title>HEAD_POISON</title>' +
-    '<style>' + style + '</style><script type="module">' + script + '</script></head>' +
-    '<body><template>TEMPLATE_POISON</template><main><h1>Known facts &amp; verified report.</h1>' +
+    '<style>' + style + '</style></head>' +
+    '<body><script type="module">' + script + '</script><style>' + style +
+    '</style><template>TEMPLATE_POISON</template><main><h1>Known facts &amp; verified report.</h1>' +
     '<p>Price &#x3c; 5 &nbsp; and safe &#39;quotes&#39;.</p></main></body></html>';
   const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': 'text/html'}})});
   const update = message(groupA, 4114);
@@ -2007,4 +2008,19 @@ await test('oversized HTML responses cannot become partial moderation evidence',
   assert.equal(f.aiCalls.length, 1);
   assert.equal(f.aiCalls[0].input.state.link_evidence[0].status, 'response_too_large_or_unreadable');
   assert.equal(f.aiCalls[0].input.state.link_evidence[0].excerpt, undefined);
+});
+
+await test('HTML evidence tolerates misleading head closing text and malformed head', async () => {
+  for (const html of [
+    '<head><script>const misleading = "</head>";</script><!-- fake </head> -->' +
+      '<title>METADATA_POISON</title></head><body><main>Grounded article</main></body>',
+    '<head><title>METADATA_POISON</title><body><main>Grounded article</main>'
+  ]) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': 'text/html'}})});
+    const update = message(groupA, 4118);
+    update.message.text = 'https://safe.example.org/grounded';
+    await f.consume(update);
+    assert.equal(f.aiCalls[0].input.state.link_evidence[0].excerpt, 'Grounded article');
+    assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('METADATA_POISON'));
+  }
 });
