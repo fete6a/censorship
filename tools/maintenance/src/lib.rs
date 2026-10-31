@@ -397,7 +397,7 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
             })
         {
             errors.push(format!(
-                "unexpected trigger on warning/pending table: {name}"
+                "unexpected trigger on policy-sensitive table: {name}"
             ));
         }
     }
