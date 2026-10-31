@@ -523,3 +523,24 @@ fn earlier_column_constraint_cannot_restrict_log_filter() {
         }
     }
 }
+
+#[test]
+fn sqlite_like_prefix_triggers_are_visible_in_both_inspection_paths() {
+    for name in ["sqliteX_group_logs", "sqlite-group_logs", "SQLITEX_group_logs"] {
+        let db = db();
+        batch(&db, &format!("CREATE TRIGGER \"{name}\" AFTER INSERT ON group_settings BEGIN UPDATE group_settings SET logs_warn_only=0 WHERE chat_id=NEW.chat_id; END"));
+        let direct = inspect_sqlite(&db).unwrap();
+        let imported = parse_inspection_json(&serde_json::to_string(&inspection_batch(&db)).unwrap()).unwrap();
+        for rows in [&direct, &imported] {
+            assert!(rows.iter().any(|r| r.object_name == name));
+            for pre in [true, false] {
+                let result = validate(rows, pre).unwrap();
+                assert_eq!(result.status, Status::Incompatible);
+                assert!(result.errors.iter().any(|e| e.contains(name)));
+            }
+        }
+    }
+    let db = db();
+    assert_eq!(check(&db, false).status, Status::Ready);
+    assert!(inspect_sqlite(&db).unwrap().iter().all(|r| !r.object_name.starts_with("sqlite_")));
+}
