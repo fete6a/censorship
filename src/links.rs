@@ -1,6 +1,6 @@
 //! Bounded, best-effort link evidence obtained with the Worker's native fetch.
 //! A link/page is untrusted data, never a source of moderation instructions.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::time::Duration;
 use futures_util::future::{select, Either};
@@ -218,24 +218,45 @@ fn html_comment_end(input: &str, from: usize, xml: bool) -> usize {
     input.len()
 }
 
-fn self_closing(input: &str, after_name: usize, end: usize, name: &str, xml: bool) -> bool {
-    // A slash on HTML non-void elements is ignored. SVG roots use foreign
-    // content semantics; XML permits self-closing syntax on every element.
-    (xml || name.eq_ignore_ascii_case("svg")) &&
+fn self_closing(input: &str, after_name: usize, end: usize, name: &str,
+                xml: bool, svg_foreign: bool) -> bool {
+    // In text/html, a trailing slash is ignored on HTML non-void elements,
+    // but honored in SVG foreign content, including its descendants.
+    (xml || svg_foreign || name.eq_ignore_ascii_case("svg")) &&
         input[after_name..end - 1].trim_end().ends_with('/')
 }
 
-/// Scan ignored elements iteratively. A template creates its own delimiter
-/// scope, so fake parent closings inside inert content cannot end the skip.
+/// Scan ignored elements iteratively. Template and SVG nodes keep delimiter
+/// scopes separate, so descendants cannot close their ignored parent.
 fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool) -> usize {
     let mut stack = vec![tag];
+    // Track SVG foreign-content mode alongside ignored scopes in O(1) per tag.
+    // foreignObject, desc, and title are HTML integration points.
+    let mut svg_modes = vec![tag.eq_ignore_ascii_case("svg")];
     while let Some(offset) = input[from..].find('<') {
         let lt = from + offset;
         let current = *stack.last().expect("ignored element scope");
-        let raw = ["script", "style", "title", "iframe", "noscript"].iter()
-            .any(|name| current.eq_ignore_ascii_case(name));
+        let svg_foreign = *svg_modes.last().expect("SVG mode scope");
+        // SVG title is an HTML integration point, not HTML's raw/RCDATA
+        // <title>: nested HTML script elements must retain their own scope.
+        let svg_title = current.eq_ignore_ascii_case("title") &&
+            svg_modes.len() > 1 && svg_modes[svg_modes.len() - 2] && !svg_foreign;
+        let raw = ["script", "style", "iframe", "noscript", "noframes"].iter()
+            .any(|name| current.eq_ignore_ascii_case(name)) ||
+            (current.eq_ignore_ascii_case("title") && !svg_title);
+        if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
+            input[from..lt].chars().any(|ch| !ch.is_whitespace()) {
+            // Text also implicitly ends an HTML head when </head> is omitted.
+            return from;
+        }
         if !raw && input[lt..].starts_with("<!--") {
             from = html_comment_end(input, lt + 4, xml);
+            continue;
+        }
+        if (xml || svg_foreign) && input[lt..].starts_with("<![CDATA[") {
+            // The apparent </script> inside SVG CDATA is not an end tag.
+            let Some(end) = input[lt + 9..].find("]]>") else { return input.len(); };
+            from = lt + 9 + end + 3;
             continue;
         }
         if let Some((closing, name, after_name)) = html_tag_name(input, lt) {
@@ -245,15 +266,36 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
                 let Some(end) = html_tag_end(input, after_name) else { return input.len(); };
                 if closing && name.eq_ignore_ascii_case(current) {
                     stack.pop();
+                    svg_modes.pop();
                     if stack.is_empty() { return end; }
                 } else if !closing && !raw {
-                    if stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
-                        name.eq_ignore_ascii_case("body") { return lt; }
-                    if !self_closing(input, after_name, end, name, xml) &&
+                    if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
+                        !["html", "base", "basefont", "bgsound", "link", "meta",
+                          "noframes", "script", "style", "template", "title", "noscript"]
+                            .iter().any(|allowed| name.eq_ignore_ascii_case(allowed)) {
+                        // HTML's "in head" insertion mode reprocesses a
+                        // body-starting element after implicitly closing head.
+                        return lt;
+                    }
+                    if !self_closing(input, after_name, end, name, xml, svg_foreign) &&
                         (name.eq_ignore_ascii_case(current) ||
-                         ["template", "script", "style", "title", "iframe", "noscript"].iter()
-                            .any(|nested| name.eq_ignore_ascii_case(nested))) {
+                         ["template", "script", "style", "title", "iframe", "noscript",
+                          "noframes", "svg"].iter()
+                            .any(|nested| name.eq_ignore_ascii_case(nested)) ||
+                         svg_foreign && ["foreignobject", "desc", "title"].iter()
+                            .any(|point| name.eq_ignore_ascii_case(point))) {
+                        let html_integration = svg_foreign &&
+                            ["foreignobject", "desc", "title"].iter()
+                                .any(|point| name.eq_ignore_ascii_case(point));
+                        let next_svg = if name.eq_ignore_ascii_case("svg") {
+                            true
+                        } else if html_integration {
+                            false
+                        } else {
+                            svg_foreign
+                        };
                         stack.push(name);
+                        svg_modes.push(next_svg);
                     }
                 }
                 from = end;
@@ -262,13 +304,199 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
         }
         from = lt + 1;
     }
+    // No further markup: non-whitespace text after omitted </head> starts body.
+    if !xml && stack.len() == 1 && stack[0].eq_ignore_ascii_case("head") &&
+        input[from..].chars().any(|ch| !ch.is_whitespace()) {
+        return from;
+    }
     input.len()
 }
+// XHTML is XML, not HTML: namespaces are scoped, names are case-sensitive,
+// CDATA is opaque, and every element can be self-closing. Track only open
+// element names and xmlns attributes; no DOM or unbounded parser lookahead.
+fn xml_tag_name(input: &str, lt: usize) -> Option<(bool, &str, usize)> {
+    let mut i = lt + 1;
+    let closing = input.as_bytes().get(i) == Some(&b'/');
+    if closing { i += 1; }
+    let mut chars = input[i..].char_indices();
+    let (_, first) = chars.next()?;
+    if first != '_' && !first.is_alphabetic() { return None; }
+    let mut end = i + first.len_utf8();
+    for (offset, ch) in chars {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':') {
+            end = i + offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((closing, &input[i..end], end))
+}
+
+struct XmlBinding<'a> {
+    prefix: &'a str,
+    previous: Option<&'a str>,
+    depth: usize,
+}
+
+/// Keep one active URI per prefix, recording overwritten values for O(1)
+/// expected-cost scope restoration. Each declaration is inserted and removed
+/// once; nested unrelated declarations cannot make lookups quadratic.
+fn xml_namespace_attrs<'a>(input: &'a str, mut i: usize, end: usize,
+                            depth: usize, bindings: &mut Vec<XmlBinding<'a>>,
+                            active: &mut HashMap<&'a str, &'a str>) {
+    let bytes = input.as_bytes();
+    while i < end - 1 {
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || bytes[i] == b'/' { break; }
+        let start = i;
+        while i < end - 1 && !bytes[i].is_ascii_whitespace() &&
+            !matches!(bytes[i], b'=' | b'/' | b'>') { i += 1; }
+        if i == start { i += 1; continue; }
+        let attr = &input[start..i];
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || bytes[i] != b'=' { continue; }
+        i += 1;
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || !matches!(bytes[i], b'\'' | b'"') { continue; }
+        let quote = bytes[i];
+        i += 1;
+        let value_start = i;
+        while i < end - 1 && bytes[i] != quote { i += 1; }
+        if i >= end - 1 { break; }
+        let value = &input[value_start..i];
+        i += 1;
+        if attr == "xmlns" {
+            let previous = active.insert("", value);
+            bindings.push(XmlBinding {prefix: "", previous, depth});
+        } else if let Some(prefix) = attr.strip_prefix("xmlns:") {
+            let previous = active.insert(prefix, value);
+            bindings.push(XmlBinding {prefix, previous, depth});
+        }
+    }
+}
+
+fn xml_restore_bindings<'a>(bindings: &mut Vec<XmlBinding<'a>>,
+                            active: &mut HashMap<&'a str, &'a str>, depth: usize) {
+    while bindings.last().is_some_and(|binding| binding.depth >= depth) {
+        let binding = bindings.pop().expect("namespace binding at depth");
+        if let Some(previous) = binding.previous {
+            active.insert(binding.prefix, previous);
+        } else {
+            active.remove(binding.prefix);
+        }
+    }
+}
+
+// XML namespace values may use character references, including numeric ones.
+// Compare against fixed known namespace URIs without allocating decoded copies.
+fn xml_namespace_eq(raw: &str, expected: &str) -> bool {
+    let mut chars = expected.chars();
+    let mut i = 0;
+    while i < raw.len() {
+        let rest = &raw[i..];
+        let first = rest.chars().next().expect("nonempty XML namespace");
+        let (ch, consumed) = if first == '&' {
+            let Some(end) = rest.as_bytes()[1..].iter().take(16).position(|b| *b == b';')
+                else { return false; };
+            let Some(decoded) = html_entity(&rest[1..end + 1]) else { return false; };
+            (decoded, end + 2)
+        } else {
+            (first, first.len_utf8())
+        };
+        if chars.next() != Some(ch) { return false; }
+        i += consumed;
+    }
+    chars.next().is_none()
+}
+
+fn xml_excerpt(text: &str) -> String {
+    const XHTML: &str = "http://www.w3.org/1999/xhtml";
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    struct Frame<'a> {
+        name: &'a str,
+        skip: bool,
+    }
+    let mut out = String::new();
+    let mut space = false;
+    let mut frames: Vec<Frame<'_>> = Vec::new();
+    let mut bindings = Vec::new();
+    let mut active = HashMap::new();
+    let mut i = 0;
+    while i < text.len() && out.len() < MAX_EXCERPT {
+        let skipping = frames.last().is_some_and(|frame| frame.skip);
+        let Some(offset) = text[i..].find('<') else {
+            if !skipping { append_excerpt(&mut out, &mut space, &text[i..], true); }
+            break;
+        };
+        let lt = i + offset;
+        if !skipping && !append_excerpt(&mut out, &mut space, &text[i..lt], true) {
+            break;
+        }
+
+        if text[lt..].starts_with("<!--") {
+            i = html_comment_end(text, lt + 4, true);
+        } else if text[lt..].starts_with("<![CDATA[") {
+            let Some(end) = text[lt + 9..].find("]]>") else { break; };
+            if !skipping && !append_excerpt(&mut out, &mut space,
+                                            &text[lt + 9..lt + 9 + end], false) { break; }
+            i = lt + 9 + end + 3;
+        } else if text[lt..].starts_with("<?") {
+            let Some(end) = text[lt + 2..].find("?>") else { break; };
+            i = lt + 2 + end + 2;
+        } else if text[lt..].starts_with("<!") {
+            let Some(end) = html_tag_end(text, lt + 2) else { break; };
+            i = end;
+        } else if let Some((closing, name, after_name)) = xml_tag_name(text, lt) {
+            let Some(end) = html_tag_end(text, after_name) else { break; };
+            if closing {
+                // Valid XML closes the innermost element. Do not scan the
+                // entire stack for malformed end tags (quadratic nesting).
+                if frames.last().is_some_and(|frame| frame.name == name) {
+                    frames.pop();
+                    xml_restore_bindings(&mut bindings, &mut active, frames.len() + 1);
+                }
+            } else {
+                let depth = frames.len() + 1;
+                xml_namespace_attrs(text, after_name, end, depth, &mut bindings, &mut active);
+                let (prefix, local) = name.rsplit_once(':').unwrap_or(("", name));
+                let uri = active.get(prefix).copied();
+                // For compatibility with XHTML fragments without xmlns, bare
+                // HTML names are treated as XHTML when no default is declared.
+                let xhtml = uri.is_some_and(|uri| xml_namespace_eq(uri, XHTML)) ||
+                    (uri.is_none() && prefix.is_empty());
+                let svg = uri.is_some_and(|uri| xml_namespace_eq(uri, SVG)) ||
+                    (uri.is_none() && prefix.is_empty() && local == "svg");
+                let ignored = (xhtml && [
+                    "head", "title", "script", "style", "noscript", "template",
+                    "nav", "aside", "footer", "canvas", "iframe", "object",
+                ].contains(&local)) || (svg && local == "svg");
+                let self_closed = text[after_name..end - 1].trim_end().ends_with('/');
+                if self_closed {
+                    xml_restore_bindings(&mut bindings, &mut active, depth);
+                } else {
+                    frames.push(Frame {name, skip: skipping || ignored});
+                }
+            }
+            i = end;
+        } else {
+            // Invalid XML syntax is ordinary text outside ignored elements.
+            if !skipping && !append_excerpt(&mut out, &mut space, "<", false) { break; }
+            i = lt + 1;
+            continue;
+        }
+        if !frames.last().is_some_and(|frame| frame.skip) {
+            if !append_excerpt(&mut out, &mut space, " ", false) { break; }
+        }
+    }
+    out.trim().to_owned()
+}
+
 fn excerpt(bytes: &[u8], mime: &str) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     let mut space = false;
     let xml = mime == "application/xhtml+xml";
+    if xml { return xml_excerpt(&text); }
     if mime != "text/html" && !xml {
         append_excerpt(&mut out, &mut space, &text, false);
         return out.trim().to_owned();
@@ -296,10 +524,11 @@ fn excerpt(bytes: &[u8], mime: &str) -> String {
             i = end;
         } else if let Some((closing, name, after_name)) = html_tag_name(&text, lt) {
             let Some(end) = html_tag_end(&text, after_name) else { break; };
-            let self_closing = self_closing(&text, after_name, end, name, xml);
+            let self_closing = self_closing(&text, after_name, end, name, xml, false);
             if !closing && !self_closing && [
                 "head", "title", "script", "style", "noscript", "template",
                 "nav", "aside", "footer", "svg", "canvas", "iframe", "object",
+                "noframes",
             ].iter().any(|ignored| name.eq_ignore_ascii_case(ignored)) {
                 i = html_skipped_end(&text, end, name, xml);
             } else {
@@ -573,4 +802,147 @@ mod tests {
         assert_eq!(excerpt(b"<![CDATA[Article <text>]]>", "application/xhtml+xml"), "Article <text>");
     }
 
+
+    #[test]
+    fn html_recovers_implicit_body_after_head_without_explicit_end_tags() {
+        for html in [
+            "<head><title>HEAD_POISON</title><main>Article</main>",
+            "<head><meta name='description' content='HEAD_POISON'><div>Article</div>",
+            "<head><script>const x = '</head>';</script><!-- fake <body> -->\
+             <nav>MENU_POISON</nav><main>Article</main>",
+            "<head><title>HEAD_POISON</title>Article",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{html}");
+        }
+    }
+
+    #[test]
+    fn svg_foreign_self_closing_elements_do_not_swallow_later_body() {
+        for html in [
+            "<svg><script/></svg><main>Article</main>",
+            "<svg><style/><title/></svg><main>Article</main>",
+            "<nav><svg><script/><title/></svg>MENU_POISON</nav><main>Article</main>",
+            // foreignObject is an HTML integration point: script/ is not void there.
+            "<svg><foreignObject><script/>INERT_POISON</script></foreignObject>\
+             </svg><main>Article</main>",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{html}");
+        }
+    }
+
+    #[test]
+    fn xhtml_cdata_is_opaque_in_scripts_styles_and_nested_skips() {
+        for html in [
+            "<script><![CDATA[const x='</script>'; CDATA_POISON;]]></script><main>Article</main>",
+            "<style><![CDATA[.x{content:'</style>'} CSS_POISON]]></style><main>Article</main>",
+            "<nav><script><![CDATA[const x='</script>'; CDATA_POISON]]></script>\
+             MENU_POISON</nav><main>Article</main>",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article", "{html}");
+        }
+        assert_eq!(excerpt(b"<script><![CDATA[const x='</script>'; POISON",
+            "application/xhtml+xml"), "");
+    }
+
+    #[test]
+    fn xhtml_namespace_bindings_match_local_names_and_obey_rebinding() {
+        let ns = "http://www.w3.org/1999/xhtml";
+        let html = format!(
+            "<h:html xmlns:h='{ns}'><h:script>{}</h:script><h:main>Article</h:main></h:html>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article");
+        let local = format!(
+            "<h:script xmlns:h='{ns}'>{}</h:script><main>Article</main>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(local.as_bytes(), "application/xhtml+xml"), "Article");
+        // XML character references in xmlns must not bypass script filtering.
+        let encoded = format!(
+            "<h:script xmlns:h='http://www.w3.org/1999/x&#104;tml'>{}</h:script>\
+             <main>Article</main>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(encoded.as_bytes(), "application/xhtml+xml"), "Article");
+        let nested = format!(
+            "<h:html xmlns:h='{ns}'><h:nav><h:template><h:nav>POISON</h:nav></h:template>\
+             MENU_POISON</h:nav><h:main>Article</h:main></h:html>"
+        );
+        assert_eq!(excerpt(nested.as_bytes(), "application/xhtml+xml"), "Article");
+        let rebound = format!(
+            "<h:html xmlns:h='{ns}'><h:div xmlns:h='urn:foreign'>\
+             <h:script>Foreign visible</h:script></h:div>\
+             <h:script>SCRIPT_POISON</h:script><h:main>Article</h:main></h:html>"
+        );
+        assert_eq!(excerpt(rebound.as_bytes(), "application/xhtml+xml"),
+            "Foreign visible Article");
+        assert_eq!(excerpt(
+            b"<f:script xmlns:f='urn:foreign'>Visible</f:script><main>Article</main>",
+            "application/xhtml+xml"), "Visible Article");
+    }
+
+    #[test]
+    fn parser_review_boundaries_remain_bounded_and_keep_plain_text() {
+        let html = format!(
+            "<head><title>HEAD_POISON</title><main>{}</main>",
+            "🌍".repeat(700)
+        );
+        assert_eq!(excerpt(html.as_bytes(), "text/html"),
+            "🌍".repeat(MAX_EXCERPT / 4));
+        assert_eq!(excerpt(b"<script>not markup</script> Article", "text/plain"),
+            "<script>not markup</script> Article");
+    }
+
+
+    #[test]
+    fn html_svg_integration_points_keep_raw_script_payloads_out_of_evidence() {
+        for (element, html) in [
+            ("foreignObject",
+             "<svg><foreignObject><script/></svg>SVG_POISON</script></foreignObject></svg><main>Article</main>"),
+            ("desc",
+             "<svg><desc><script/></svg>SVG_POISON</script></desc></svg><main>Article</main>"),
+            // An SVG title is an integration point, not HTML title RCDATA.
+            ("title",
+             "<svg><title><script/></title></svg>SVG_POISON</script></title></svg><main>Article</main>"),
+            ("nested svg",
+             "<svg><desc><svg><script/></svg></desc></svg><main>Article</main>"),
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{element}: {html}");
+        }
+    }
+
+    #[test]
+    fn html_noframes_remains_opaque_across_implicit_head_end() {
+        for html in [
+            "<head><noframes>HEAD_POISON</noframes><main>Article</main>",
+            "<head><noframes>HEAD_POISON<body>BODY_POISON</body></noframes><main>Article</main>",
+            "<noframes>HEAD_POISON</noframes><main>Article</main>",
+            "<head><noframes>HEAD_POISON</noframes>Article",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{html}");
+        }
+    }
+
+    #[test]
+    fn xhtml_namespace_scopes_remain_bounded_near_page_limit() {
+        // Before the active-prefix index, this input required roughly 94M
+        // prefix comparisons to resolve the empty namespace.
+        let depth = 13_700;
+        let html = format!("<main>{}{}Article</main>",
+            "<a xmlns:p='u'>".repeat(depth), "</a>".repeat(depth));
+        assert!(html.len() > MAX_PAGE_BYTES * 95 / 100);
+        assert!(html.len() <= MAX_PAGE_BYTES);
+        assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article");
+
+        // Unrelated unique prefixes and scoped default namespace rebinding.
+        let mut html = String::from("<main xmlns='http://www.w3.org/1999/xhtml'>");
+        for n in 0..4_000 {
+            html.push_str(&format!("<a xmlns:p{n}='urn:unused'>"));
+        }
+        html.push_str("<script>NS_POISON</script>");
+        for _ in 0..4_000 { html.push_str("</a>"); }
+        html.push_str("<p>Article</p></main>");
+        assert!(html.len() <= MAX_PAGE_BYTES);
+        assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article");
+    }
 }

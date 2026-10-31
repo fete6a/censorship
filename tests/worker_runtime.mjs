@@ -2109,3 +2109,123 @@ await test('HTML parser review regressions exclude inert payloads and recover co
     assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('POISON'));
   }
 });
+
+
+await test('post-merge HTML/XHTML parser edges reach Workers AI without hidden payloads', async () => {
+  const poison = 'SCRIPT_POISON '.repeat(250);
+  const ns = 'http://www.w3.org/1999/xhtml';
+  const cases = [
+    ['text/html',
+      '<head><title>HEAD_POISON</title><main>Article</main>', 'Article'],
+    ['text/html',
+      '<head><meta name="description" content="HEAD_POISON"><div>Article</div>', 'Article'],
+    ['text/html',
+      "<head><script>const x='</head>';</script><nav>MENU_POISON</nav><main>Article</main>",
+      'Article'],
+    ['text/html',
+      '<svg><script/><title/></svg><main>Article</main>', 'Article'],
+    ['text/html',
+      '<nav><svg><script/><style/></svg>MENU_POISON</nav><main>Article</main>',
+      'Article'],
+    ['text/html',
+      '<svg><foreignObject><script/>' + poison + '</script></foreignObject></svg><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      "<script><![CDATA[const x='</script>'; " + poison + ']]></script><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<style><![CDATA[.x{content:"</style>"} ' + poison + ']]></style><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:script>' + poison + '</h:script>' +
+        '<h:main>Article</h:main></h:html>', 'Article'],
+    ['application/xhtml+xml',
+      '<h:script xmlns:h="' + ns + '">' + poison + '</h:script><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<h:script xmlns:h="http://www.w3.org/1999/x&#104;tml">' +
+        poison + '</h:script><main>Article</main>', 'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:nav><h:template><h:nav>' + poison + '</h:nav>' +
+        '</h:template>MENU_POISON</h:nav><h:main>Article</h:main></h:html>', 'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:div xmlns:h="urn:foreign">' +
+        '<h:script>Foreign visible</h:script></h:div>' +
+        '<h:script>' + poison + '</h:script><h:main>Article</h:main></h:html>',
+      'Foreign visible Article'],
+  ];
+  for (const [mime, html, expected] of cases) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': mime}})});
+    const update = message(groupA, 6128);
+    update.message.text = 'Review https://safe.example.org/article';
+    await f.consume(update);
+    assert.equal(f.pageRequests.length, 1);
+    assert.equal(f.aiCalls.length, 1);
+    const aiInput = f.aiCalls[0].input;
+    assert.equal(aiInput.state.link_evidence[0].status, 'fetched');
+    assert.equal(aiInput.state.link_evidence[0].excerpt, expected,
+      'Incorrect Workers AI evidence for ' + mime + ': ' + html.slice(0, 180));
+    assert.ok(Buffer.byteLength(aiInput.state.link_evidence[0].excerpt, 'utf8') <= 2400);
+    for (const marker of ['SCRIPT_POISON', 'HEAD_POISON', 'MENU_POISON']) {
+      assert.ok(!JSON.stringify(aiInput).includes(marker), marker + ': ' + mime);
+    }
+  }
+});
+
+
+await test('P1 HTML/SVG/noframes cases never enter Workers AI link evidence', async () => {
+  const cases = [
+    ['SVG foreignObject', '<svg><foreignObject><script/></svg>SVG_POISON</script></foreignObject></svg><main>Article</main>'],
+    ['SVG desc', '<svg><desc><script/></svg>SVG_POISON</script></desc></svg><main>Article</main>'],
+    ['SVG title', '<svg><title><script/></title></svg>SVG_POISON</script></title></svg><main>Article</main>'],
+    ['SVG nesting', '<svg><desc><svg><script/></svg></desc></svg><main>Article</main>'],
+    ['implicit head noframes', '<head><noframes>HEAD_POISON</noframes><main>Article</main>'],
+    ['raw noframes', '<head><noframes>HEAD_POISON<body>BODY_POISON</body></noframes><main>Article</main>'],
+    ['body noframes', '<noframes>HEAD_POISON</noframes><main>Article</main>'],
+  ];
+  for (const [label, html] of cases) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': 'text/html'}})});
+    const update = message(groupA, 6200);
+    update.message.text = 'Review https://safe.example.org/article';
+    await f.consume(update);
+    assert.equal(f.pageRequests.length, 1, label);
+    assert.equal(f.aiCalls.length, 1, label);
+    const aiInput = f.aiCalls[0].input;
+    const evidence = aiInput.state.link_evidence[0];
+    assert.equal(evidence.status, 'fetched', label);
+    assert.equal(evidence.excerpt, 'Article', label);
+    assert.ok(Buffer.byteLength(evidence.excerpt, 'utf8') <= 2400, label);
+    for (const marker of ['SVG_POISON', 'HEAD_POISON', 'BODY_POISON']) {
+      assert.ok(!JSON.stringify(aiInput).includes(marker), label + ' leaked ' + marker);
+    }
+  }
+});
+
+await test('P1 near-256KiB nested XHTML namespaces stay bounded through built Worker', async () => {
+  const depth = 13_700;
+  const html = '<main>' + "<a xmlns:p='u'>".repeat(depth) +
+    '</a>'.repeat(depth) + 'Article</main>';
+  const bytes = Buffer.byteLength(html, 'utf8');
+  assert.ok(bytes > 0.95 * 256 * 1024 && bytes <= 256 * 1024);
+  const f = fixture({pageFetch: () => new Response(html, {
+    headers: {'Content-Type': 'application/xhtml+xml'},
+  })});
+  const update = message(groupA, 6201);
+  update.message.text = 'Review https://safe.example.org/article';
+  const started = performance.now();
+  await f.consume(update);
+  const elapsedMs = performance.now() - started;
+  assert.equal(f.pageRequests.length, 1);
+  assert.equal(f.aiCalls.length, 1);
+  const aiInput = f.aiCalls[0].input;
+  const evidence = aiInput.state.link_evidence[0];
+  assert.equal(evidence.status, 'fetched');
+  assert.equal(evidence.excerpt, 'Article');
+  assert.ok(Buffer.byteLength(evidence.excerpt, 'utf8') <= 2400);
+  assert.ok(!JSON.stringify(aiInput).includes('NS_POISON'));
+  // The asynchronous fetch deadline cannot interrupt synchronous parsing.
+  // Keep a generous time budget on the actual built-Wasm extraction path.
+  assert.ok(elapsedMs < 8000, 'XHTML processing exceeded 8 s: ' + elapsedMs.toFixed(0) + ' ms');
+  console.log('Nested XHTML', bytes, 'bytes,', depth, 'bindings processed in',
+    elapsedMs.toFixed(1), 'ms by built Worker');
+});
