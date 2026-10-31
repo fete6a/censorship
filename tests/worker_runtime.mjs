@@ -2143,6 +2143,9 @@ await test('post-merge HTML/XHTML parser edges reach Workers AI without hidden p
       '<h:script xmlns:h="' + ns + '">' + poison + '</h:script><main>Article</main>',
       'Article'],
     ['application/xhtml+xml',
+      '<h:script xmlns:h="http://www.w3.org/1999/x&#104;tml">' +
+        poison + '</h:script><main>Article</main>', 'Article'],
+    ['application/xhtml+xml',
       '<h:html xmlns:h="' + ns + '"><h:nav><h:template><h:nav>' + poison + '</h:nav>' +
         '</h:template>MENU_POISON</h:nav><h:main>Article</h:main></h:html>', 'Article'],
     ['application/xhtml+xml',
