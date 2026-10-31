@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use futures_util::future::{select, Either};
 use serde_json::{json, Value};
+use html5gum::{Token, Tokenizer};
 use worker::{AbortController, AbortSignal, Delay, Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Url};
 use crate::body::response_bytes;
 use crate::util::field_str;
@@ -144,20 +145,9 @@ fn html_entity(name: &str) -> Option<char> {
     })
 }
 
-/// Append Unicode characters without cutting a UTF-8 sequence at 2400 bytes.
-fn append_excerpt(out: &mut String, space: &mut bool, input: &str, entities: bool) -> bool {
-    let mut i = 0;
-    while i < input.len() {
-        let rest = &input[i..];
-        let ch = rest.chars().next().expect("nonempty UTF-8 suffix");
-        let (ch, consumed) = if entities && ch == '&' {
-            rest.as_bytes()[1..].iter().take(16).position(|b| *b == b';')
-                .and_then(|end| html_entity(&rest[1..end + 1])
-                    .map(|decoded| (decoded, end + 2)))
-                .unwrap_or((ch, 1))
-        } else {
-            (ch, ch.len_utf8())
-        };
+/// Preserve whitespace normalization and the UTF-8 byte budget for all text.
+fn append_normalized(out: &mut String, space: &mut bool, input: &str) -> bool {
+    for ch in input.chars() {
         if out.len() >= MAX_EXCERPT { return false; }
         if ch.is_control() || ch.is_whitespace() {
             if !*space && !out.is_empty() {
@@ -169,7 +159,23 @@ fn append_excerpt(out: &mut String, space: &mut bool, input: &str, entities: boo
             out.push(ch);
             *space = false;
         }
-        i += consumed;
+    }
+    true
+}
+
+/// The existing HTML/XHTML scanners already isolate text from tags and inert
+/// elements. Apply the full HTML5 character-reference rules only to those
+/// visible text slices; do not re-tokenize the page or alter its structure.
+fn append_excerpt(out: &mut String, space: &mut bool, input: &str, entities: bool) -> bool {
+    if !entities || !input.contains('&') {
+        return append_normalized(out, space, input);
+    }
+    for token in Tokenizer::new(input).flatten() {
+        if let Token::String(decoded) = token {
+            if !append_normalized(out, space, &String::from_utf8_lossy(&decoded)) {
+                return false;
+            }
+        }
     }
     true
 }
@@ -924,7 +930,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "red phase: compile the unchanged Worker and reproduce its model input"]
     fn html5_character_references_decode_named_legacy_and_multicodepoint_text() {
         // Common named entities, semicolonless legacy names, HTML5 C1 numeric
         // remapping and a two-codepoint entity are not handled by small tables.
