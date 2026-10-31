@@ -357,7 +357,7 @@ fn bootstrap_is_for_an_empty_database_only() {
 #[test]
 fn log_filter_migration_is_additive_and_preserves_each_existing_mode() {
     let before = SCHEMA.replace(
-        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
         "",
     );
     let db = Connection::open_in_memory().unwrap();
@@ -392,9 +392,29 @@ fn log_filter_migration_is_additive_and_preserves_each_existing_mode() {
 }
 
 #[test]
+fn fresh_warn_default_and_legacy_all_default_both_pass_release_gate() {
+    let fresh=Connection::open_in_memory().unwrap();
+    batch(&fresh,SCHEMA);
+    batch(&fresh,"INSERT INTO group_settings(chat_id) VALUES(-100)");
+    assert_eq!(sql(&fresh,"SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-100",json!([])),json!([[1,1]]));
+    assert_eq!(check(&fresh,false).status,Status::Ready);
+
+    let old_schema=SCHEMA.replace(
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+    );
+    assert_ne!(old_schema,SCHEMA);
+    let legacy=Connection::open_in_memory().unwrap();
+    batch(&legacy,&old_schema);
+    batch(&legacy,"INSERT INTO group_settings(chat_id) VALUES(-200)");
+    assert_eq!(sql(&legacy,"SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-200",json!([])),json!([[1,0]]));
+    assert_eq!(check(&legacy,false).status,Status::Ready);
+}
+
+#[test]
 fn wrong_existing_log_filter_column_blocks_release_and_migration() {
     let before = SCHEMA.replace(
-        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
         "",
     );
     for column in [
@@ -417,7 +437,7 @@ fn wrong_existing_log_filter_column_blocks_release_and_migration() {
 #[test]
 fn log_filter_check_constraint_must_match_approved_addition() {
     let before = SCHEMA.replace(
-        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
         "",
     );
     // All variants have identical PRAGMA table_info column metadata. Only

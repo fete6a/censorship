@@ -16,8 +16,10 @@ const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.typ
 const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
 // PRAGMA table_info omits CHECK constraints. The canonical schema and approved
 // additive ALTER both place this exact column declaration last.
-const LOG_FILTER_COLUMN_DDL_SUFFIX: &str =
-    ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT0CHECK(LOGS_WARN_ONLYIN(0,1)))";
+const LOG_FILTER_COLUMN_DDL_SUFFIXES: [&str; 2] = [
+    ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT1CHECK(LOGS_WARN_ONLYIN(0,1)))",
+    ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT0CHECK(LOGS_WARN_ONLYIN(0,1)))",
+];
 
 fn approved_log_filter_ddl(sql: &str) -> bool {
     // Deliberately conservative: retain every quote/comment character. In
@@ -25,7 +27,9 @@ fn approved_log_filter_ddl(sql: &str) -> bool {
     // Unsupported equivalent spellings require operator investigation.
     let ddl: String = sql.chars().filter(|c| !c.is_whitespace())
         .flat_map(char::to_uppercase).collect();
-    let Some(prefix) = ddl.trim_end_matches(';').strip_suffix(LOG_FILTER_COLUMN_DDL_SUFFIX) else {
+    let ddl=ddl.trim_end_matches(';');
+    let Some(prefix) = LOG_FILTER_COLUMN_DDL_SUFFIXES.iter()
+        .find_map(|suffix| ddl.strip_suffix(suffix)) else {
         return false;
     };
     // Earlier column/table constraints can also restrict the new flag.
@@ -343,12 +347,18 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
                 }
                 continue;
             };
+            // The existing D1 additive migration intentionally has DEFAULT 0.
+            // Accept that legacy column without changing any persisted group mode.
+            let legacy_log_default = name=="group_settings"
+                && column==Some("logs_warn_only")
+                && e.default_value.as_deref()==Some("1")
+                && g.default_value.as_deref()==Some("0");
             if e.data_type.as_deref().unwrap_or("").to_uppercase()
                 != g.data_type.as_deref().unwrap_or("").to_uppercase()
                 || e.not_null != g.not_null
                 || e.primary_key != g.primary_key
-                || e.default_value.as_deref().unwrap_or("").to_uppercase()
-                    != g.default_value.as_deref().unwrap_or("").to_uppercase()
+                || (!legacy_log_default && e.default_value.as_deref().unwrap_or("").to_uppercase()
+                    != g.default_value.as_deref().unwrap_or("").to_uppercase())
             {
                 errors.push(format!(
                     "column type/constraint/default mismatch: {name}.{}",
