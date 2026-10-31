@@ -2132,6 +2132,27 @@ await test('link deadline covers a stalled body after redirects and aborts the f
   assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('partial evidence'));
 });
 
+await test('Workers AI receives complete HTML5 character references but no hidden script evidence', async () => {
+  const html = '<html><head><script>const SYNTHETIC_SCRIPT_POISON = 1;</script>' +
+    '<style>.SYNTHETIC_STYLE_POISON{display:none}</style></head>' +
+    '<body><!-- SYNTHETIC_COMMENT_POISON -->' +
+    '<main>Caf&eacute; &NotEqualTilde; &copy &amp done &#x80; and &lt;script&gt; is literal</main>' +
+    '</body></html>';
+  const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type':'text/html'}})});
+  const update = message(groupA, 4115);
+  update.message.text = 'Read this';
+  update.message.entities = [{type:'text_link',offset:0,length:4,url:'https://example.org/article'}];
+  await f.consume(update);
+  assert.equal(f.pageRequests.length, 1);
+  assert.equal(f.aiCalls.length, 1);
+  const input = f.aiCalls[0].input;
+  assert.equal(input.state.link_evidence[0].status, 'fetched');
+  assert.equal(input.state.link_evidence[0].excerpt,
+    'Café ≂̸ © & done € and <script> is literal');
+  for (const poison of ['SYNTHETIC_SCRIPT_POISON','SYNTHETIC_STYLE_POISON','SYNTHETIC_COMMENT_POISON'])
+    assert.ok(!JSON.stringify(input).includes(poison), poison);
+});
+
 await test('HTML evidence skips large script, style, metadata and template before article text', async () => {
   const script = 'const JAVASCRIPT_POISON = 1; '.repeat(550);
   const style = 'CSS_POISON {display: none} '.repeat(250);
