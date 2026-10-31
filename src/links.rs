@@ -573,4 +573,88 @@ mod tests {
         assert_eq!(excerpt(b"<![CDATA[Article <text>]]>", "application/xhtml+xml"), "Article <text>");
     }
 
+
+    #[test]
+    fn html_recovers_implicit_body_after_head_without_explicit_end_tags() {
+        for html in [
+            "<head><title>HEAD_POISON</title><main>Article</main>",
+            "<head><meta name='description' content='HEAD_POISON'><div>Article</div>",
+            "<head><script>const x = '</head>';</script><!-- fake <body> -->\
+             <nav>MENU_POISON</nav><main>Article</main>",
+            "<head><title>HEAD_POISON</title>Article",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{html}");
+        }
+    }
+
+    #[test]
+    fn svg_foreign_self_closing_elements_do_not_swallow_later_body() {
+        for html in [
+            "<svg><script/></svg><main>Article</main>",
+            "<svg><style/><title/></svg><main>Article</main>",
+            "<nav><svg><script/><title/></svg>MENU_POISON</nav><main>Article</main>",
+            // foreignObject is an HTML integration point: script/ is not void there.
+            "<svg><foreignObject><script/>INERT_POISON</script></foreignObject>\
+             </svg><main>Article</main>",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "text/html"), "Article", "{html}");
+        }
+    }
+
+    #[test]
+    fn xhtml_cdata_is_opaque_in_scripts_styles_and_nested_skips() {
+        for html in [
+            "<script><![CDATA[const x='</script>'; CDATA_POISON;]]></script><main>Article</main>",
+            "<style><![CDATA[.x{content:'</style>'} CSS_POISON]]></style><main>Article</main>",
+            "<nav><script><![CDATA[const x='</script>'; CDATA_POISON]]></script>\
+             MENU_POISON</nav><main>Article</main>",
+        ] {
+            assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article", "{html}");
+        }
+        assert_eq!(excerpt(b"<script><![CDATA[const x='</script>'; POISON",
+            "application/xhtml+xml"), "");
+    }
+
+    #[test]
+    fn xhtml_namespace_bindings_match_local_names_and_obey_rebinding() {
+        let ns = "http://www.w3.org/1999/xhtml";
+        let html = format!(
+            "<h:html xmlns:h='{ns}'><h:script>{}</h:script><h:main>Article</h:main></h:html>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(html.as_bytes(), "application/xhtml+xml"), "Article");
+        let local = format!(
+            "<h:script xmlns:h='{ns}'>{}</h:script><main>Article</main>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(local.as_bytes(), "application/xhtml+xml"), "Article");
+        let nested = format!(
+            "<h:html xmlns:h='{ns}'><h:nav><h:template><h:nav>POISON</h:nav></h:template>\
+             MENU_POISON</h:nav><h:main>Article</h:main></h:html>"
+        );
+        assert_eq!(excerpt(nested.as_bytes(), "application/xhtml+xml"), "Article");
+        let rebound = format!(
+            "<h:html xmlns:h='{ns}'><h:div xmlns:h='urn:foreign'>\
+             <h:script>Foreign visible</h:script></h:div>\
+             <h:script>SCRIPT_POISON</h:script><h:main>Article</h:main></h:html>"
+        );
+        assert_eq!(excerpt(rebound.as_bytes(), "application/xhtml+xml"),
+            "Foreign visible Article");
+        assert_eq!(excerpt(
+            b"<f:script xmlns:f='urn:foreign'>Visible</f:script><main>Article</main>",
+            "application/xhtml+xml"), "Visible Article");
+    }
+
+    #[test]
+    fn parser_review_boundaries_remain_bounded_and_keep_plain_text() {
+        let html = format!(
+            "<head><title>HEAD_POISON</title><main>{}</main>",
+            "🌍".repeat(700)
+        );
+        assert_eq!(excerpt(html.as_bytes(), "text/html"),
+            "🌍".repeat(MAX_EXCERPT / 4));
+        assert_eq!(excerpt(b"<script>not markup</script> Article", "text/plain"),
+            "<script>not markup</script> Article");
+    }
+
 }
