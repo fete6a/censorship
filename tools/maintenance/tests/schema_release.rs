@@ -610,7 +610,7 @@ fn case_variant_sensitive_trigger_targets_block_release() {
 }
 
 #[test]
-fn internal_sqlite_objects_and_unrelated_triggers_are_still_allowed() {
+fn internal_sqlite_objects_are_filtered_but_unrelated_triggers_block() {
     let db = db();
     batch(
         &db,
@@ -636,7 +636,59 @@ fn internal_sqlite_objects_and_unrelated_triggers_are_still_allowed() {
         assert!(!rows.iter().any(|r| r.object_name == "sqlite_sequence"));
         for pre in [true, false] {
             let result = validate(rows, pre).unwrap();
-            assert_eq!(result.status, Status::Ready, "{:?}", result.errors);
+            assert_eq!(result.status, Status::Incompatible, "{:?}", result.errors);
+            assert!(result.errors.iter().any(|e| e.contains("unexpected trigger") && e.contains("user_archive_audit")));
+        }
+    }
+}
+
+#[test]
+fn extra_table_without_triggers_does_not_block_release() {
+    let db = db();
+    batch(&db, "CREATE TABLE extra_autoincrement(id INTEGER PRIMARY KEY AUTOINCREMENT);");
+    for rows in [
+        inspect_sqlite(&db).unwrap(),
+        parse_inspection_json(&serde_json::to_string(&inspection_batch(&db)).unwrap()).unwrap(),
+    ] {
+        assert!(!rows.iter().any(|r| r.object_name == "sqlite_sequence"));
+        for pre in [true, false] {
+            assert_eq!(validate(&rows, pre).unwrap().status, Status::Ready);
+        }
+    }
+}
+
+#[test]
+fn non_sensitive_target_trigger_can_flip_logs_and_must_block_release() {
+    // An app archive INSERT can fire a trigger on archived_messages that
+    // changes the group log mode, despite the target being non-sensitive.
+    let db = db();
+    batch(&db,
+        "CREATE TRIGGER sqliteX_archive_policy AFTER INSERT ON archived_messages
+         BEGIN UPDATE group_settings SET logs_warn_only=0 WHERE chat_id=NEW.chat_id; END;
+         INSERT INTO group_settings(chat_id,logs_enabled,logs_warn_only) VALUES(-999,1,1);"
+    );
+    assert_eq!(
+        sql(&db, "SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-999", json!([])),
+        json!([[1,1]])
+    );
+    batch(&db,
+        "INSERT INTO archived_messages(chat_id,message_id,user_id,sent_at,updated_at,payload)
+         VALUES(-999,42,22,1700000000,1700000000,'{}');"
+    );
+    assert_eq!(
+        sql(&db, "SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-999", json!([])),
+        json!([[1,0]])
+    );
+    let direct = inspect_sqlite(&db).unwrap();
+    let imported = parse_inspection_json(
+        &serde_json::to_string(&inspection_batch(&db)).unwrap()
+    ).unwrap();
+    for rows in [&direct, &imported] {
+        assert!(rows.iter().any(|r| r.object_name == "sqliteX_archive_policy" && r.table_name == "archived_messages"));
+        for pre in [true, false] {
+            let result = validate(rows, pre).unwrap();
+            assert_eq!(result.status, Status::Incompatible, "pre={pre}");
+            assert!(result.errors.iter().any(|e| e.contains("unexpected trigger") && e.contains("sqliteX_archive_policy")), "{:?}", result.errors);
         }
     }
 }
