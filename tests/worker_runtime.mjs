@@ -2171,3 +2171,61 @@ await test('post-merge HTML/XHTML parser edges reach Workers AI without hidden p
     }
   }
 });
+
+
+await test('P1 HTML/SVG/noframes cases never enter Workers AI link evidence', async () => {
+  const cases = [
+    ['SVG foreignObject', '<svg><foreignObject><script/></svg>SVG_POISON</script></foreignObject></svg><main>Article</main>'],
+    ['SVG desc', '<svg><desc><script/></svg>SVG_POISON</script></desc></svg><main>Article</main>'],
+    ['SVG title', '<svg><title><script/></title></svg>SVG_POISON</script></title></svg><main>Article</main>'],
+    ['SVG nesting', '<svg><desc><svg><script/></svg></desc></svg><main>Article</main>'],
+    ['implicit head noframes', '<head><noframes>HEAD_POISON</noframes><main>Article</main>'],
+    ['raw noframes', '<head><noframes>HEAD_POISON<body>BODY_POISON</body></noframes><main>Article</main>'],
+    ['body noframes', '<noframes>HEAD_POISON</noframes><main>Article</main>'],
+  ];
+  for (const [label, html] of cases) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': 'text/html'}})});
+    const update = message(groupA, 6200);
+    update.message.text = 'Review https://safe.example.org/article';
+    await f.consume(update);
+    assert.equal(f.pageRequests.length, 1, label);
+    assert.equal(f.aiCalls.length, 1, label);
+    const aiInput = f.aiCalls[0].input;
+    const evidence = aiInput.state.link_evidence[0];
+    assert.equal(evidence.status, 'fetched', label);
+    assert.equal(evidence.excerpt, 'Article', label);
+    assert.ok(Buffer.byteLength(evidence.excerpt, 'utf8') <= 2400, label);
+    for (const marker of ['SVG_POISON', 'HEAD_POISON', 'BODY_POISON']) {
+      assert.ok(!JSON.stringify(aiInput).includes(marker), label + ' leaked ' + marker);
+    }
+  }
+});
+
+await test('P1 near-256KiB nested XHTML namespaces stay bounded through built Worker', async () => {
+  const depth = 13_700;
+  const html = '<main>' + "<a xmlns:p='u'>".repeat(depth) +
+    '</a>'.repeat(depth) + 'Article</main>';
+  const bytes = Buffer.byteLength(html, 'utf8');
+  assert.ok(bytes > 0.95 * 256 * 1024 && bytes <= 256 * 1024);
+  const f = fixture({pageFetch: () => new Response(html, {
+    headers: {'Content-Type': 'application/xhtml+xml'},
+  })});
+  const update = message(groupA, 6201);
+  update.message.text = 'Review https://safe.example.org/article';
+  const started = performance.now();
+  await f.consume(update);
+  const elapsedMs = performance.now() - started;
+  assert.equal(f.pageRequests.length, 1);
+  assert.equal(f.aiCalls.length, 1);
+  const aiInput = f.aiCalls[0].input;
+  const evidence = aiInput.state.link_evidence[0];
+  assert.equal(evidence.status, 'fetched');
+  assert.equal(evidence.excerpt, 'Article');
+  assert.ok(Buffer.byteLength(evidence.excerpt, 'utf8') <= 2400);
+  assert.ok(!JSON.stringify(aiInput).includes('NS_POISON'));
+  // The asynchronous fetch deadline cannot interrupt synchronous parsing.
+  // Keep a generous time budget on the actual built-Wasm extraction path.
+  assert.ok(elapsedMs < 8000, 'XHTML processing exceeded 8 s: ' + elapsedMs.toFixed(0) + ' ms');
+  console.log('Nested XHTML', bytes, 'bytes,', depth, 'bindings processed in',
+    elapsedMs.toFixed(1), 'ms by built Worker');
+});
