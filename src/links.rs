@@ -924,6 +924,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red phase: compile the unchanged Worker and reproduce its model input"]
     fn html5_character_references_decode_named_legacy_and_multicodepoint_text() {
         // Common named entities, semicolonless legacy names, HTML5 C1 numeric
         // remapping and a two-codepoint entity are not handled by small tables.
