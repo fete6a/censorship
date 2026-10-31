@@ -2,7 +2,7 @@
 
 A **Rust/WebAssembly Cloudflare Worker** that discovers Telegram groups where it is an administrator, uses each group's `getChat.description` as its moderation policy, reviews text-only messages with `@cf/cloudflare/clef-flash` and media with `@cf/cloudflare/clef-omni`, archives Bot API updates in D1, and can delete messages, warn users, mute them for 60 seconds, and ban them after the administrator cancellation window.
 
-**This bot is not silent.** New groups without saved log settings receive warning-only private review notifications by default, including flagged dry-run results. Existing groups with saved log settings retain their selected mode; enforcement also triggers public notices. Successful enforcement also triggers public notices in the affected group. Commands reply in the chat and forum topic where they were issued. These are separate notification paths.
+**This bot is not silent.** New groups without saved log settings receive warning-only private review notifications by default, including flagged dry-run results. Existing groups with saved log settings retain their selected mode. Successful enforcement also triggers public notices in the affected group. Commands reply in the chat and forum topic where they were issued. These are separate notification paths.
 
 - **Group discovery:** `my_chat_member` updates and a first-message fallback. The Bot API cannot list every group the bot previously joined.
 - **Safe enforcement default:** `DRY_RUN=true` archives and classifies messages without deleting or banning; per-group `/dry-run off` enables enforcement.

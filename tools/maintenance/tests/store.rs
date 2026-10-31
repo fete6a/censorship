@@ -1,6 +1,8 @@
 //! Execute actual production SQL against isolated SQLite with a controlled clock.
 mod common;
 use common::*;
+use censorship_maintenance::{inspect_sqlite, validate, Status, SCHEMA};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, sync::atomic::Ordering};
 
@@ -168,15 +170,52 @@ fn threshold_updates_preserve_other_settings_and_enforce_ranges() {
 }
 #[test]
 fn first_unrelated_setting_uses_warn_on_legacy_d1_without_changing_saved_full_mode() {
-    let db=db();
-    batch(&db,"INSERT INTO group_settings(chat_id,logs_enabled,logs_warn_only) VALUES(-100,1,0)");
-    q(&db,"set_group_threshold",json!([-100,0.8]));
-    q(&db,"set_group_dry_run",json!([-100,1]));
-    assert_eq!(sql(&db,"SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-100",json!([])),json!([[1,0]]));
-
-    q(&db,"set_group_threshold",json!([-200,0.9]));
-    q(&db,"set_group_dry_run",json!([-300,0]));
-    assert_eq!(sql(&db,"SELECT chat_id,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id IN (-200,-300) ORDER BY chat_id",json!([])),json!([[-300,1,1],[-200,1,1]]));
+    const COLUMN: &str = ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))";
+    assert!(SCHEMA.contains(COLUMN));
+    for legacy in [false, true] {
+        // Old installations keep DEFAULT 0; Worker SQL must provide 1 on insert.
+        let schema = if legacy {
+            SCHEMA.replacen(
+                COLUMN,
+                ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+                1,
+            )
+        } else {
+            SCHEMA.to_string()
+        };
+        let db = Connection::open_in_memory().unwrap();
+        batch(&db, &schema);
+        assert_eq!(
+            validate(&inspect_sqlite(&db).unwrap(), false).unwrap().status,
+            Status::Ready
+        );
+        batch(&db, "INSERT INTO group_settings(chat_id,logs_enabled,logs_warn_only) VALUES
+            (-100,1,0),(-101,0,0),(-102,1,1)");
+        let saved = sql(&db,
+            "SELECT chat_id,logs_enabled,logs_warn_only FROM group_settings ORDER BY chat_id",
+            json!([]));
+        // All three persisted modes remain untouched by threshold/dry-run.
+        q(&db, "set_group_threshold", json!([-100, 0.8]));
+        q(&db, "set_group_dry_run", json!([-100, 1]));
+        q(&db, "set_group_threshold", json!([-101, 0.7]));
+        q(&db, "set_group_dry_run", json!([-102, 0]));
+        assert_eq!(
+            sql(&db,"SELECT chat_id,logs_enabled,logs_warn_only FROM group_settings ORDER BY chat_id",json!([])),
+            saved, "saved on/off/warn modes must survive (legacy={legacy})"
+        );
+        // The same actual production SQL must work with both column defaults.
+        q(&db, "set_group_threshold", json!([-200, 0.9]));
+        q(&db, "set_group_dry_run", json!([-300, 0]));
+        assert_eq!(
+            sql(&db,"SELECT chat_id,logs_enabled,logs_warn_only,remove_threshold,dry_run FROM group_settings WHERE chat_id IN (-200,-300) ORDER BY chat_id",json!([])),
+            json!([[-300,1,1,null,0],[-200,1,1,0.9,null]]),
+            "first unrelated write must save warn even when DEFAULT 0 (legacy={legacy})"
+        );
+        assert_eq!(
+            sql(&db,"SELECT chat_id,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id IN (-100,-101,-102) ORDER BY chat_id",json!([])),
+            saved
+        );
+    }
 }
 
 #[test]

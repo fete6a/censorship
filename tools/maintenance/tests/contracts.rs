@@ -99,32 +99,40 @@ fn wrangler_bindings_queue_delay_and_lto_defaults() {
 #[test]
 fn private_log_defaults_match_schema_and_both_readmes() {
     let store = source("src/store.rs");
-    let group = between(
-        &store,
-        "pub async fn group_logs(",
-        "pub async fn group_threshold(",
-    );
-    contains(group, &["unwrap_or(true)"]);
-    contains(
-        &source("schema/current.sql"),
-        &["logs_enabled INTEGER NOT NULL DEFAULT 1"],
-    );
-    for (path, on, off) in [
-        (
-            "README.md",
-            "**Private administrator logs are on by default.**",
-            "**Private administrator logs are off by default.**",
-        ),
-        (
-            "README_CN.md",
-            "**管理员私人审核日志默认开启。**",
-            "**管理员私人审核日志默认关闭。**",
-        ),
-    ] {
-        let text = source(path);
-        contains(&text, &[on]);
-        excludes(&text, &[off]);
-    }
+    let mode = between(&store, "fn log_mode_from_settings(", "pub async fn group_log_mode(");
+    contains(mode, &[
+        "Some(s) if s.logs_enabled==0 => LogMode::Off",
+        "Some(s) if s.logs_warn_only!=0 => LogMode::Warn",
+        "Some(_) => LogMode::All",
+        "None => LogMode::Warn",
+    ]);
+    // group_logs only gates the digest; group_log_mode controls content.
+    let gate = between(&store, "pub async fn group_logs(", "fn log_mode_from_settings(");
+    contains(gate, &["unwrap_or(true)"]);
+    contains(&source("src/tg.rs"), &[
+        "group_log_mode(env,chat_id)",
+        "formatting::is_warning_status(&row.status)",
+    ]);
+    contains(&source("schema/current.sql"), &[
+        "logs_enabled INTEGER NOT NULL DEFAULT 1",
+        "logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
+    ]);
+    contains(&source("schema/ensure_log_filter.sql"), &[
+        "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+    ]);
+    let en = source("README.md");
+    contains(&en, &[
+        "**Privacy-first default for groups without saved settings:**",
+        "Existing settings rows retain",
+        "ARCHIVE_DAYS=0",
+    ]);
+    excludes(&en, &["**Private administrator logs are on by default.**"]);
+    let cn = source("README_CN.md");
+    contains(&cn, &[
+        "**未保存日志设置的群默认仅发送警告级私人审核日志。**",
+        "旧数据库仍允许 `DEFAULT 0`",
+    ]);
+    excludes(&cn, &["**管理员私人审核日志默认开启。**"]);
 }
 #[test]
 fn private_logs_target_current_human_admins_and_group_switch_is_documented() {
@@ -455,40 +463,35 @@ fn media_transcoder_and_history_import_stay_native_rust() {
 #[test]
 fn group_option_updates_are_partial_and_isolated() {
     let db = db();
-    batch(&db,"INSERT INTO group_settings(chat_id,dry_run,logs_enabled,remove_threshold) VALUES(-1001,0,1,0.8); INSERT INTO group_settings(chat_id) VALUES(-1002)");
+    batch(&db, "INSERT INTO group_settings(chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold) VALUES
+        (-1001,0,1,0,0.8),(-1002,NULL,1,1,NULL),(-1003,NULL,0,0,NULL),(-1004,NULL,1,1,NULL)");
     q(&db, "set_group_log_mode", json!([-1001, 1, 1]));
-    assert_eq!(sql(&db,"SELECT chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings ORDER BY chat_id DESC",json!([])),json!([[-1001,0,1,1,0.8],[-1002,null,1,0,null]]));
-    q(&db, "set_group_dry_run", json!([-1001, 1]));
     assert_eq!(
-        sql(
-            &db,
-            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
-            json!([])
-        ),
-        json!([[1, 1, 1]])
+        sql(&db,"SELECT chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings WHERE chat_id IN (-1001,-1002,-1003,-1004) ORDER BY chat_id DESC",json!([])),
+        json!([[-1001,0,1,1,0.8],[-1002,null,1,1,null],[-1003,null,0,0,null],[-1004,null,1,1,null]])
+    );
+    // Unrelated settings must preserve explicit on, warn and off.
+    q(&db, "set_group_dry_run", json!([-1001, 1]));
+    q(&db, "set_group_threshold", json!([-1003, 0.75]));
+    q(&db, "set_group_dry_run", json!([-1004, 0]));
+    assert_eq!(
+        sql(&db,"SELECT chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings WHERE chat_id IN (-1001,-1003,-1004) ORDER BY chat_id DESC",json!([])),
+        json!([[-1001,1,1,1,0.8],[-1003,null,0,0,0.75],[-1004,0,1,1,null]])
+    );
+    // Both first-write commands explicitly initialize the warning-only mode.
+    q(&db, "set_group_threshold", json!([-1005, 0.9]));
+    q(&db, "set_group_dry_run", json!([-1006, 0]));
+    assert_eq!(
+        sql(&db,"SELECT chat_id,dry_run,logs_enabled,logs_warn_only,remove_threshold FROM group_settings WHERE chat_id IN (-1005,-1006) ORDER BY chat_id DESC",json!([])),
+        json!([[-1005,null,1,1,0.9],[-1006,0,1,1,null]])
+    );
+    assert_eq!(
+        sql(&db,"SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1002",json!([])),
+        json!([[null,1,1]])
     );
     q(&db, "set_group_log_mode", json!([-1001, 0, 0]));
-    assert_eq!(
-        sql(
-            &db,
-            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
-            json!([])
-        ),
-        json!([[1, 0, 0]])
-    );
+    assert_eq!(sql(&db,"SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",json!([])),json!([[1,0,0]]));
     q(&db, "set_group_log_mode", json!([-1001, 1, 0]));
-    assert_eq!(
-        sql(
-            &db,
-            "SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",
-            json!([])
-        ),
-        json!([[1, 1, 0]])
-    );
-    assert!(try_sql(
-        &db,
-        "UPDATE group_settings SET logs_warn_only=2 WHERE chat_id=-1001",
-        json!([])
-    )
-    .is_err());
+    assert_eq!(sql(&db,"SELECT dry_run,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-1001",json!([])),json!([[1,1,0]]));
+    assert!(try_sql(&db,"UPDATE group_settings SET logs_warn_only=2 WHERE chat_id=-1001",json!([])).is_err());
 }

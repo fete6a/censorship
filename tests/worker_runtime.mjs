@@ -35,7 +35,7 @@ const secret = 'runtime-test-webhook-secret';
 const groupA = -100100;
 const groupB = -100200;
 
-function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false, clock = null, onPendingRun = null, onCleanupDelete = null, failCleanup = null } = {}) {
+function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDelete = null, pauseDeleteTarget = null, deleteError = false, queueError = false, remove = false, dmFail = false, adminsA = [11], pauseMember, flipAfterClaim = false, timer = false, strikeCount = 0, score = 1, noticeFail = false, memberErrorCode = null, categoryChoice = null, categoryConfidence = 1, scores = null, digestFail = false, groupUsernames = {[groupA]:'group_a',[groupB]:'group_b'}, groupTitles = {[groupA]:'Group A',[groupB]:'Group B'}, groupInvite = '', groupInfoFail = false, owners = {[groupA]:{id:11,first_name:'Alice',last_name:'Owner'},[groupB]:{id:21,first_name:'Bob'}}, aiFail = false, rules = 'Do not post advertisements', policyFail = false, managedStatus = 'active', missingWarningTable = false, warningReadFailsAfterDelete = false, clock = null, onPendingRun = null, onCleanupDelete = null, failCleanup = null, legacyLogDefault = false } = {}) {
   context.Date = clock ? class FakeDate extends Date { static now() { return clock.value; } } : Date;
   const settings = new Map(), archives = new Map(), jobs = new Map();
   const cleanupState = { last_success_day: -1, lease_id: 0, lease_until: 0 };
@@ -199,9 +199,14 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
           if (sql.includes('INSERT INTO group_settings')) {
             const existing=settings.get(values[0]);
             // Both fresh schema and Worker writes on legacy D1 use warn for new rows.
-            const row=existing || {dry_run:null,logs_enabled:1,logs_warn_only:1};
-            if (sql.includes('(chat_id,dry_run,logs_warn_only)')) row.dry_run=values[1];
-            else if (sql.includes('(chat_id,remove_threshold,logs_warn_only)')) row.remove_threshold=values[1];
+            const row=existing || {dry_run:null,logs_enabled:1,logs_warn_only:legacyLogDefault?0:1};
+            if (sql.includes('(chat_id,dry_run,logs_warn_only)')) {
+              row.dry_run=values[1];
+              if (!existing) row.logs_warn_only=1; // literal SQL value, not a bound value
+            } else if (sql.includes('(chat_id,remove_threshold,logs_warn_only)')) {
+              row.remove_threshold=values[1];
+              if (!existing) row.logs_warn_only=1;
+            }
             else {
               row.logs_enabled=values[1];
               row.logs_warn_only=values[2];
@@ -741,19 +746,55 @@ await test('unsaved groups default to warning-only admin DMs while reviews remai
   assert.equal(sends[0].args.chat_id,11);
   assert.match(sends[0].args.text,/模拟命中/);
 });
-await test('first unrelated settings write uses warn, existing full settings remain full',async()=>{
-  const newThreshold=fixture();
-  await newThreshold.consume(command(`/threshold ${groupA} 75%`));
-  assert.equal(newThreshold.settings.get(groupA).logs_warn_only,1);
-  const newDryRun=fixture();
-  await newDryRun.consume(command(`/dry_run ${groupA} off`));
-  assert.equal(newDryRun.settings.get(groupA).logs_warn_only,1);
-  const existing=fixture();
-  enableFullLogs(existing,groupA);
-  await existing.consume(command(`/threshold ${groupA} 80%`));
-  assert.equal(existing.settings.get(groupA).logs_warn_only,0);
-  await existing.consume(message(groupA,3499));
-  assert.ok(existing.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('审核摘要')));
+await test('first unrelated settings write saves warn on both fresh and legacy D1',async()=>{
+  for(const legacyLogDefault of [false,true]) {
+    const threshold=fixture({legacyLogDefault});
+    await threshold.consume(command(`/threshold ${groupA} 75%`));
+    assert.equal(threshold.settings.get(groupA).logs_warn_only,1);
+    assert.equal(threshold.settings.get(groupA).remove_threshold,0.75);
+    assert.equal(threshold.settings.has(groupB),false);
+    const dry=fixture({legacyLogDefault});
+    await dry.consume(command(`/dry_run ${groupA} off`));
+    assert.equal(dry.settings.get(groupA).logs_warn_only,1);
+    assert.equal(dry.settings.get(groupA).dry_run,0);
+    assert.equal(dry.settings.has(groupB),false);
+    const existing=fixture({legacyLogDefault});
+    enableFullLogs(existing,groupA);
+    existing.settings.set(groupB,{dry_run:null,logs_enabled:0,logs_warn_only:0});
+    await existing.consume(command(`/threshold ${groupA} 80%`));
+    await existing.consume({...command(`/dry_run ${groupA} off`),update_id:3500});
+    assert.equal(existing.settings.get(groupA).logs_warn_only,0);
+    assert.equal(existing.settings.get(groupA).dry_run,0);
+    assert.equal(existing.settings.get(groupB).logs_enabled,0);
+    await existing.consume(message(groupA,3499));
+    assert.ok(existing.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('审核摘要')));
+    assert.equal(existing.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===21),false);
+  }
+});
+await test('unsaved warning-only mode isolates mixed-group alerts and suppresses ordinary allows',async()=>{
+  const f=fixture({remove:true,scores:[0.1,0.99,0.1]});
+  await f.consumeBatch([message(groupA,3421),message(groupA,3422),message(groupB,3423)]);
+  const dm=f.telegram.filter(c=>c.method==='sendMessage'&&c.args.chat_id>0);
+  assert.deepEqual(dm.map(c=>c.args.chat_id),[11]);
+  assert.ok(dm[0].args.text.includes('3422'));
+  assert.ok(!dm[0].args.text.includes('3421'));
+  assert.ok(!dm[0].args.text.includes('3423'));
+  assert.equal(f.archives.size,3);
+  assert.equal(f.settings.size,0);
+});
+await test('unsaved-group historical audit reads only its group archive',async()=>{
+  const f=fixture({remove:true});
+  f.archives.set(`${groupA}:3424`,message(groupA,3424).message);
+  f.archives.set(`${groupB}:3425`,message(groupB,3425).message);
+  await f.consume(command(`/scan ${groupA} 3424 audit`));
+  assert.deepEqual(
+    f.statements.filter(x=>x.sql.includes('SELECT payload FROM archived_messages')).map(x=>x.values),
+    [[groupA,3424]]
+  );
+  assert.ok(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('审计命中')));
+  assert.equal(f.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===21),false);
+  assert.equal(f.settings.size,0);
+  assert.equal(f.archives.has(`${groupB}:3425`),true);
 });
 await test('saved full-review logs go only to the reviewed group human administrators', async () => {
  const f = fixture(); enableFullLogs(f,groupA); await f.consume(message(groupA));
