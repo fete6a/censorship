@@ -544,3 +544,99 @@ fn sqlite_like_prefix_triggers_are_visible_in_both_inspection_paths() {
     assert_eq!(check(&db, false).status, Status::Ready);
     assert!(inspect_sqlite(&db).unwrap().iter().all(|r| !r.object_name.starts_with("sqlite_")));
 }
+
+#[test]
+fn case_variant_sensitive_trigger_targets_block_release() {
+    // sqlite_master.tbl_name preserves the spelling in CREATE TRIGGER,
+    // even when SQLite resolves the target table case-insensitively.
+    for table in [
+        "GROUP_SETTINGS",
+        "GrOuP_SeTtInGs",
+        "WARNING_EDIT_RECEIPTS",
+        "WARNING_ADJUSTMENTS",
+        "PENDING_BANS",
+        "CLEANUP_STATE",
+    ] {
+        let db = db();
+        let action = if table.eq_ignore_ascii_case("group_settings") {
+            "UPDATE group_settings SET logs_warn_only=0 WHERE chat_id=NEW.chat_id;"
+        } else {
+            "SELECT 1;"
+        };
+        batch(
+            &db,
+            &format!(
+                "CREATE TRIGGER case_variant_policy AFTER INSERT ON \"{table}\" BEGIN {action} END;"
+            ),
+        );
+        if table.eq_ignore_ascii_case("group_settings") {
+            sql(
+                &db,
+                "INSERT INTO group_settings(chat_id,logs_warn_only) VALUES(-999,1)",
+                json!([]),
+            );
+            assert_eq!(
+                sql(
+                    &db,
+                    "SELECT logs_warn_only FROM group_settings WHERE chat_id=-999",
+                    json!([])
+                ),
+                json!([[0]])
+            );
+        }
+        let direct = inspect_sqlite(&db).unwrap();
+        let imported = parse_inspection_json(
+            &serde_json::to_string(&inspection_batch(&db)).unwrap()
+        )
+        .unwrap();
+        for rows in [&direct, &imported] {
+            assert!(
+                rows.iter().any(|r| {
+                    r.object_name == "case_variant_policy" && r.table_name == table
+                }),
+                "{table}"
+            );
+            for pre in [true, false] {
+                let result = validate(rows, pre).unwrap();
+                assert_eq!(result.status, Status::Incompatible, "{table}, pre={pre}");
+                assert!(
+                    result.errors.iter().any(|e| e.contains("case_variant_policy")),
+                    "{table}, pre={pre}: {:?}",
+                    result.errors
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn internal_sqlite_objects_and_unrelated_triggers_are_still_allowed() {
+    let db = db();
+    batch(
+        &db,
+        "CREATE TABLE extra_autoincrement(id INTEGER PRIMARY KEY AUTOINCREMENT);
+         CREATE TRIGGER user_archive_audit AFTER INSERT ON archived_messages
+         BEGIN SELECT 1; END;",
+    );
+    assert_eq!(
+        sql(
+            &db,
+            "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'",
+            json!([])
+        ),
+        json!([["sqlite_sequence"]])
+    );
+    let direct = inspect_sqlite(&db).unwrap();
+    let imported = parse_inspection_json(
+        &serde_json::to_string(&inspection_batch(&db)).unwrap()
+    )
+    .unwrap();
+    for rows in [&direct, &imported] {
+        assert!(rows.iter().any(|r| r.object_name == "user_archive_audit"));
+        assert!(!rows.iter().any(|r| r.object_name == "sqlite_sequence"));
+        for pre in [true, false] {
+            let result = validate(rows, pre).unwrap();
+            assert_eq!(result.status, Status::Ready, "{:?}", result.errors);
+        }
+    }
+}

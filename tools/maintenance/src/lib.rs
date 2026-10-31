@@ -387,10 +387,12 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         if kind == "trigger"
             && !expected.contains_key(&(kind, name))
             && observed.iter().any(|r| {
+                // SQLite table identifiers are ASCII case-insensitive, while
+                // sqlite_master.tbl_name retains CREATE TRIGGER identifier casing.
                 // Even an unrelated-looking settings trigger may flip private
                 // log mode after an otherwise policy-preserving UPSERT.
                 matches!(
-                    r.table_name.as_str(),
+                    r.table_name.to_ascii_lowercase().as_str(),
                     "warning_edit_receipts" | "warning_adjustments" | "pending_bans"
                         | "cleanup_state" | "group_settings"
                 )
