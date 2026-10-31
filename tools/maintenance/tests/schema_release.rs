@@ -267,6 +267,41 @@ fn wrong_trigger_missing_adjustments_and_extra_sensitive_trigger_block() {
     }
 }
 #[test]
+fn unexpected_group_settings_triggers_block_both_release_modes() {
+    // Real production UPSERT statements must never be reinterpreted by a
+    // database-side trigger that can change persisted privacy preferences.
+    for trigger in [
+        "CREATE TRIGGER unexpected_group_logs AFTER INSERT ON group_settings BEGIN UPDATE group_settings SET logs_warn_only=0 WHERE chat_id=NEW.chat_id; END",
+        "CREATE TRIGGER unexpected_group_logs AFTER UPDATE ON group_settings BEGIN UPDATE group_settings SET logs_enabled=1,logs_warn_only=0 WHERE chat_id=NEW.chat_id; END",
+        "CREATE TRIGGER unexpected_group_logs BEFORE DELETE ON group_settings BEGIN SELECT 1; END",
+    ] {
+        let db=db();
+        batch(&db,trigger);
+        for pre in [true,false] {
+            let result=check(&db,pre);
+            assert_eq!(result.status,Status::Incompatible,"{trigger}");
+            assert!(result.errors.iter().any(|e|e.contains("unexpected trigger") && e.contains("unexpected_group_logs")), "{:?}",result.errors);
+        }
+    }
+}
+
+#[test]
+fn group_settings_trigger_can_override_warn_first_write_on_legacy_default() {
+    let old_schema=SCHEMA.replace(
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))",
+        ", logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))",
+    );
+    let db=Connection::open_in_memory().unwrap();
+    batch(&db,&old_schema);
+    batch(&db,"CREATE TRIGGER unexpected_group_logs AFTER INSERT ON group_settings BEGIN UPDATE group_settings SET logs_warn_only=0 WHERE chat_id=NEW.chat_id; END");
+    let actual=queries("set_group_threshold");
+    assert_eq!(actual.len(),1);
+    sql(&db,&actual[0],json!([-100,0.75]));
+    assert_eq!(sql(&db,"SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-100",json!([])),json!([[1,0]]));
+    assert_eq!(check(&db,false).status,Status::Incompatible);
+}
+
+#[test]
 fn trigger_normalization_preserves_string_semantics_and_escaped_quotes() {
     assert_eq!(
         normalized_ddl("SELECT 'a''B c', \"foo\""),
