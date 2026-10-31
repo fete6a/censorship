@@ -833,6 +833,13 @@ mod tests {
             "SCRIPT_POISON ".repeat(500)
         );
         assert_eq!(excerpt(local.as_bytes(), "application/xhtml+xml"), "Article");
+        // XML character references in xmlns must not bypass script filtering.
+        let encoded = format!(
+            "<h:script xmlns:h='http://www.w3.org/1999/x&#104;tml'>{}</h:script>\
+             <main>Article</main>",
+            "SCRIPT_POISON ".repeat(500)
+        );
+        assert_eq!(excerpt(encoded.as_bytes(), "application/xhtml+xml"), "Article");
         let nested = format!(
             "<h:html xmlns:h='{ns}'><h:nav><h:template><h:nav>POISON</h:nav></h:template>\
              MENU_POISON</h:nav><h:main>Article</h:main></h:html>"
