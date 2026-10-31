@@ -361,6 +361,28 @@ fn xml_namespace_attrs<'a>(input: &'a str, mut i: usize, end: usize,
     }
 }
 
+// XML namespace values may use character references, including numeric ones.
+// Compare against fixed known namespace URIs without allocating decoded copies.
+fn xml_namespace_eq(raw: &str, expected: &str) -> bool {
+    let mut chars = expected.chars();
+    let mut i = 0;
+    while i < raw.len() {
+        let rest = &raw[i..];
+        let first = rest.chars().next().expect("nonempty XML namespace");
+        let (ch, consumed) = if first == '&' {
+            let Some(end) = rest.as_bytes()[1..].iter().take(16).position(|b| *b == b';')
+                else { return false; };
+            let Some(decoded) = html_entity(&rest[1..end + 1]) else { return false; };
+            (decoded, end + 2)
+        } else {
+            (first, first.len_utf8())
+        };
+        if chars.next() != Some(ch) { return false; }
+        i += consumed;
+    }
+    chars.next().is_none()
+}
+
 fn xml_excerpt(text: &str) -> String {
     const XHTML: &str = "http://www.w3.org/1999/xhtml";
     const SVG: &str = "http://www.w3.org/2000/svg";
@@ -400,8 +422,10 @@ fn xml_excerpt(text: &str) -> String {
         } else if let Some((closing, name, after_name)) = xml_tag_name(text, lt) {
             let Some(end) = html_tag_end(text, after_name) else { break; };
             if closing {
-                if let Some(position) = frames.iter().rposition(|frame| frame.name == name) {
-                    frames.truncate(position);
+                // Valid XML closes the innermost element. Do not scan the
+                // entire stack for malformed end tags (quadratic nesting).
+                if frames.last().is_some_and(|frame| frame.name == name) {
+                    frames.pop();
                     while bindings.last().is_some_and(|binding: &XmlBinding<'_>|
                         binding.depth > frames.len()) { bindings.pop(); }
                 }
@@ -414,9 +438,10 @@ fn xml_excerpt(text: &str) -> String {
                     .map(|binding| binding.uri);
                 // For compatibility with XHTML fragments without xmlns, bare
                 // HTML names are treated as XHTML when no default is declared.
-                let xhtml = uri == Some(XHTML) || (uri.is_none() && prefix.is_empty());
-                let svg = uri == Some(SVG) || (uri.is_none() && prefix.is_empty()
-                    && local == "svg");
+                let xhtml = uri.is_some_and(|uri| xml_namespace_eq(uri, XHTML)) ||
+                    (uri.is_none() && prefix.is_empty());
+                let svg = uri.is_some_and(|uri| xml_namespace_eq(uri, SVG)) ||
+                    (uri.is_none() && prefix.is_empty() && local == "svg");
                 let ignored = (xhtml && [
                     "head", "title", "script", "style", "noscript", "template",
                     "nav", "aside", "footer", "canvas", "iframe", "object",
