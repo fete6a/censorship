@@ -387,9 +387,12 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         if kind == "trigger"
             && !expected.contains_key(&(kind, name))
             && observed.iter().any(|r| {
+                // Even an unrelated-looking settings trigger may flip private
+                // log mode after an otherwise policy-preserving UPSERT.
                 matches!(
                     r.table_name.as_str(),
-                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans" | "cleanup_state"
+                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans"
+                        | "cleanup_state" | "group_settings"
                 )
             })
         {
