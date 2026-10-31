@@ -293,11 +293,154 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
     }
     input.len()
 }
+// XHTML is XML, not HTML: namespaces are scoped, names are case-sensitive,
+// CDATA is opaque, and every element can be self-closing. Track only open
+// element names and xmlns attributes; no DOM or unbounded parser lookahead.
+fn xml_tag_name(input: &str, lt: usize) -> Option<(bool, &str, usize)> {
+    let mut i = lt + 1;
+    let closing = input.as_bytes().get(i) == Some(&b'/');
+    if closing { i += 1; }
+    let mut chars = input[i..].char_indices();
+    let (_, first) = chars.next()?;
+    if first != '_' && !first.is_alphabetic() { return None; }
+    let mut end = i + first.len_utf8();
+    for (offset, ch) in chars {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':') {
+            end = i + offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((closing, &input[i..end], end))
+}
+
+struct XmlBinding<'a> {
+    prefix: &'a str,
+    uri: &'a str,
+    depth: usize,
+}
+
+/// Collect only namespace declarations from a single opening tag, bounded by
+/// the already located tag end. The most recent binding shadows an ancestor.
+fn xml_namespace_attrs<'a>(input: &'a str, mut i: usize, end: usize,
+                            depth: usize, bindings: &mut Vec<XmlBinding<'a>>) {
+    let bytes = input.as_bytes();
+    while i < end - 1 {
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || bytes[i] == b'/' { break; }
+        let start = i;
+        while i < end - 1 && !bytes[i].is_ascii_whitespace() &&
+            !matches!(bytes[i], b'=' | b'/' | b'>') { i += 1; }
+        if i == start { i += 1; continue; }
+        let attr = &input[start..i];
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || bytes[i] != b'=' { continue; }
+        i += 1;
+        while i < end - 1 && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= end - 1 || !matches!(bytes[i], b'\'' | b'"') { continue; }
+        let quote = bytes[i];
+        i += 1;
+        let value_start = i;
+        while i < end - 1 && bytes[i] != quote { i += 1; }
+        if i >= end - 1 { break; }
+        let value = &input[value_start..i];
+        i += 1;
+        if attr == "xmlns" {
+            bindings.push(XmlBinding {prefix: "", uri: value, depth});
+        } else if let Some(prefix) = attr.strip_prefix("xmlns:") {
+            bindings.push(XmlBinding {prefix, uri: value, depth});
+        }
+    }
+}
+
+fn xml_excerpt(text: &str) -> String {
+    const XHTML: &str = "http://www.w3.org/1999/xhtml";
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    struct Frame<'a> {
+        name: &'a str,
+        skip: bool,
+    }
+    let mut out = String::new();
+    let mut space = false;
+    let mut frames: Vec<Frame<'_>> = Vec::new();
+    let mut bindings = Vec::new();
+    let mut i = 0;
+    while i < text.len() && out.len() < MAX_EXCERPT {
+        let skipping = frames.last().is_some_and(|frame| frame.skip);
+        let Some(offset) = text[i..].find('<') else {
+            if !skipping { append_excerpt(&mut out, &mut space, &text[i..], true); }
+            break;
+        };
+        let lt = i + offset;
+        if !skipping && !append_excerpt(&mut out, &mut space, &text[i..lt], true) {
+            break;
+        }
+
+        if text[lt..].starts_with("<!--") {
+            i = html_comment_end(text, lt + 4, true);
+        } else if text[lt..].starts_with("<![CDATA[") {
+            let Some(end) = text[lt + 9..].find("]]>") else { break; };
+            if !skipping && !append_excerpt(&mut out, &mut space,
+                                            &text[lt + 9..lt + 9 + end], false) { break; }
+            i = lt + 9 + end + 3;
+        } else if text[lt..].starts_with("<?") {
+            let Some(end) = text[lt + 2..].find("?>") else { break; };
+            i = lt + 2 + end + 2;
+        } else if text[lt..].starts_with("<!") {
+            let Some(end) = html_tag_end(text, lt + 2) else { break; };
+            i = end;
+        } else if let Some((closing, name, after_name)) = xml_tag_name(text, lt) {
+            let Some(end) = html_tag_end(text, after_name) else { break; };
+            if closing {
+                if let Some(position) = frames.iter().rposition(|frame| frame.name == name) {
+                    frames.truncate(position);
+                    while bindings.last().is_some_and(|binding: &XmlBinding<'_>|
+                        binding.depth > frames.len()) { bindings.pop(); }
+                }
+            } else {
+                let depth = frames.len() + 1;
+                xml_namespace_attrs(text, after_name, end, depth, &mut bindings);
+                let (prefix, local) = name.rsplit_once(':').unwrap_or(("", name));
+                let uri = bindings.iter().rev()
+                    .find(|binding| binding.prefix == prefix)
+                    .map(|binding| binding.uri);
+                // For compatibility with XHTML fragments without xmlns, bare
+                // HTML names are treated as XHTML when no default is declared.
+                let xhtml = uri == Some(XHTML) || (uri.is_none() && prefix.is_empty());
+                let svg = uri == Some(SVG) || (uri.is_none() && prefix.is_empty()
+                    && local == "svg");
+                let ignored = (xhtml && [
+                    "head", "title", "script", "style", "noscript", "template",
+                    "nav", "aside", "footer", "canvas", "iframe", "object",
+                ].contains(&local)) || (svg && local == "svg");
+                let self_closed = text[after_name..end - 1].trim_end().ends_with('/');
+                if self_closed {
+                    while bindings.last().is_some_and(|binding: &XmlBinding<'_>|
+                        binding.depth >= depth) { bindings.pop(); }
+                } else {
+                    frames.push(Frame {name, skip: skipping || ignored});
+                }
+            }
+            i = end;
+        } else {
+            // Invalid XML syntax is ordinary text outside ignored elements.
+            if !skipping && !append_excerpt(&mut out, &mut space, "<", false) { break; }
+            i = lt + 1;
+            continue;
+        }
+        if !frames.last().is_some_and(|frame| frame.skip) {
+            if !append_excerpt(&mut out, &mut space, " ", false) { break; }
+        }
+    }
+    out.trim().to_owned()
+}
+
 fn excerpt(bytes: &[u8], mime: &str) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     let mut space = false;
     let xml = mime == "application/xhtml+xml";
+    if xml { return xml_excerpt(&text); }
     if mime != "text/html" && !xml {
         append_excerpt(&mut out, &mut space, &text, false);
         return out.trim().to_owned();
