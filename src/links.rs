@@ -218,15 +218,16 @@ fn html_comment_end(input: &str, from: usize, xml: bool) -> usize {
     input.len()
 }
 
-fn self_closing(input: &str, after_name: usize, end: usize, name: &str, xml: bool) -> bool {
-    // A slash on HTML non-void elements is ignored. SVG roots use foreign
-    // content semantics; XML permits self-closing syntax on every element.
-    (xml || name.eq_ignore_ascii_case("svg")) &&
+fn self_closing(input: &str, after_name: usize, end: usize, name: &str,
+                xml: bool, svg_foreign: bool) -> bool {
+    // In text/html, a trailing slash is ignored on HTML non-void elements,
+    // but honored in SVG foreign content, including its descendants.
+    (xml || svg_foreign || name.eq_ignore_ascii_case("svg")) &&
         input[after_name..end - 1].trim_end().ends_with('/')
 }
 
-/// Scan ignored elements iteratively. A template creates its own delimiter
-/// scope, so fake parent closings inside inert content cannot end the skip.
+/// Scan ignored elements iteratively. Template and SVG nodes keep delimiter
+/// scopes separate, so descendants cannot close their ignored parent.
 fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool) -> usize {
     let mut stack = vec![tag];
     while let Some(offset) = input[from..].find('<') {
@@ -234,8 +235,24 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
         let current = *stack.last().expect("ignored element scope");
         let raw = ["script", "style", "title", "iframe", "noscript"].iter()
             .any(|name| current.eq_ignore_ascii_case(name));
+        // In SVG, foreignObject is an HTML integration point. Keep the
+        // innermost SVG/foreignObject marker to interpret trailing slashes.
+        let svg_foreign = stack.iter().rev().find(|name|
+            name.eq_ignore_ascii_case("svg") || name.eq_ignore_ascii_case("foreignobject"))
+            .is_some_and(|name| name.eq_ignore_ascii_case("svg"));
+        if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
+            input[from..lt].chars().any(|ch| !ch.is_whitespace()) {
+            // Text also implicitly ends an HTML head when </head> is omitted.
+            return from;
+        }
         if !raw && input[lt..].starts_with("<!--") {
             from = html_comment_end(input, lt + 4, xml);
+            continue;
+        }
+        if (xml || svg_foreign) && input[lt..].starts_with("<![CDATA[") {
+            // The apparent </script> inside SVG CDATA is not an end tag.
+            let Some(end) = input[lt + 9..].find("]]>") else { return input.len(); };
+            from = lt + 9 + end + 3;
             continue;
         }
         if let Some((closing, name, after_name)) = html_tag_name(input, lt) {
@@ -247,12 +264,19 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
                     stack.pop();
                     if stack.is_empty() { return end; }
                 } else if !closing && !raw {
-                    if stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
-                        name.eq_ignore_ascii_case("body") { return lt; }
-                    if !self_closing(input, after_name, end, name, xml) &&
+                    if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
+                        !["html", "base", "basefont", "bgsound", "link", "meta",
+                          "noframes", "script", "style", "template", "title", "noscript"]
+                            .iter().any(|allowed| name.eq_ignore_ascii_case(allowed)) {
+                        // HTML's "in head" insertion mode reprocesses a
+                        // body-starting element after implicitly closing head.
+                        return lt;
+                    }
+                    if !self_closing(input, after_name, end, name, xml, svg_foreign) &&
                         (name.eq_ignore_ascii_case(current) ||
-                         ["template", "script", "style", "title", "iframe", "noscript"].iter()
-                            .any(|nested| name.eq_ignore_ascii_case(nested))) {
+                         ["template", "script", "style", "title", "iframe", "noscript", "svg"]
+                            .iter().any(|nested| name.eq_ignore_ascii_case(nested)) ||
+                         svg_foreign && name.eq_ignore_ascii_case("foreignobject")) {
                         stack.push(name);
                     }
                 }
@@ -261,6 +285,11 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
             }
         }
         from = lt + 1;
+    }
+    // No further markup: non-whitespace text after omitted </head> starts body.
+    if !xml && stack.len() == 1 && stack[0].eq_ignore_ascii_case("head") &&
+        input[from..].chars().any(|ch| !ch.is_whitespace()) {
+        return from;
     }
     input.len()
 }
@@ -296,7 +325,7 @@ fn excerpt(bytes: &[u8], mime: &str) -> String {
             i = end;
         } else if let Some((closing, name, after_name)) = html_tag_name(&text, lt) {
             let Some(end) = html_tag_end(&text, after_name) else { break; };
-            let self_closing = self_closing(&text, after_name, end, name, xml);
+            let self_closing = self_closing(&text, after_name, end, name, xml, false);
             if !closing && !self_closing && [
                 "head", "title", "script", "style", "noscript", "template",
                 "nav", "aside", "footer", "svg", "canvas", "iframe", "object",
