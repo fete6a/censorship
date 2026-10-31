@@ -230,16 +230,15 @@ fn self_closing(input: &str, after_name: usize, end: usize, name: &str,
 /// scopes separate, so descendants cannot close their ignored parent.
 fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool) -> usize {
     let mut stack = vec![tag];
+    // Track foreign-content mode alongside ignored scopes in O(1) per tag.
+    // A foreignObject switches to HTML until a nested svg starts again.
+    let mut svg_modes = vec![tag.eq_ignore_ascii_case("svg")];
     while let Some(offset) = input[from..].find('<') {
         let lt = from + offset;
         let current = *stack.last().expect("ignored element scope");
         let raw = ["script", "style", "title", "iframe", "noscript"].iter()
             .any(|name| current.eq_ignore_ascii_case(name));
-        // In SVG, foreignObject is an HTML integration point. Keep the
-        // innermost SVG/foreignObject marker to interpret trailing slashes.
-        let svg_foreign = stack.iter().rev().find(|name|
-            name.eq_ignore_ascii_case("svg") || name.eq_ignore_ascii_case("foreignobject"))
-            .is_some_and(|name| name.eq_ignore_ascii_case("svg"));
+        let svg_foreign = *svg_modes.last().expect("SVG mode scope");
         if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
             input[from..lt].chars().any(|ch| !ch.is_whitespace()) {
             // Text also implicitly ends an HTML head when </head> is omitted.
@@ -262,6 +261,7 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
                 let Some(end) = html_tag_end(input, after_name) else { return input.len(); };
                 if closing && name.eq_ignore_ascii_case(current) {
                     stack.pop();
+                    svg_modes.pop();
                     if stack.is_empty() { return end; }
                 } else if !closing && !raw {
                     if !xml && stack.len() == 1 && current.eq_ignore_ascii_case("head") &&
@@ -277,7 +277,15 @@ fn html_skipped_end<'a>(input: &'a str, mut from: usize, tag: &'a str, xml: bool
                          ["template", "script", "style", "title", "iframe", "noscript", "svg"]
                             .iter().any(|nested| name.eq_ignore_ascii_case(nested)) ||
                          svg_foreign && name.eq_ignore_ascii_case("foreignobject")) {
+                        let next_svg = if name.eq_ignore_ascii_case("svg") {
+                            true
+                        } else if svg_foreign && name.eq_ignore_ascii_case("foreignobject") {
+                            false
+                        } else {
+                            svg_foreign
+                        };
                         stack.push(name);
+                        svg_modes.push(next_svg);
                     }
                 }
                 from = end;
