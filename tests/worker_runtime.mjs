@@ -671,7 +671,7 @@ await test('20 event window groups private reviews by chat without leaking to ot
 });
 
 await test('Queue reuses group descriptions per group without changing per-item AI or D1 writes',async()=>{
- const f=fixture();
+ const f=fixture();enableFullLogs(f,groupA,groupB);
  const updates=[...Array.from({length:12},(_,i)=>message(groupA,1100+i)),
                 ...Array.from({length:8},(_,i)=>message(groupB,1200+i))];
  const outcome=await f.consumeBatch(updates);
@@ -686,7 +686,7 @@ await test('Queue reuses group descriptions per group without changing per-item 
 });
 
 await test('policy snapshots are reset between Queue deliveries and when a command intervenes',async()=>{
- const f=fixture();
+ const f=fixture();enableFullLogs(f,groupA);
  await f.consumeBatch([message(groupA,1301),message(groupA,1302)]);
  assert.equal(f.telegram.filter(c=>c.method==='getChat'&&c.args.chat_id===groupA).length,2);
  f.telegram.length=0;
@@ -1364,7 +1364,7 @@ await test('creator changes and absent names use the current administrator snaps
  await f.consume(message(groupA,1703));
  const text=f.telegram.filter(c=>c.method==='sendMessage').at(-1)?.args.text||'';
  assert.ok(text.includes('[用户 12](tg://user?id=12)'));assert.ok(!text.includes('Alice'));
- const missing=fixture({owners:{}});await missing.consume(message(groupA,1704));
+ const missing=fixture({owners:{}});enableFullLogs(missing,groupA);await missing.consume(message(groupA,1704));
  assert.match(missing.telegram.find(c=>c.method==='sendMessage')?.args.text||'',/群主：暂不可用/);
 });
 
@@ -1382,7 +1382,7 @@ await test('group warnings display escaped user names and the seven-day count as
 });
 
 await test('administrator probability bars keep the exact score and omit duplicate or unavailable fields',async()=>{
- const f=fixture({remove:true,score:0.7956});await f.consume(message(groupA,1801));
+ const f=fixture({remove:true,score:0.7956});enableFullLogs(f,groupA);await f.consume(message(groupA,1801));
  const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
  assert.ok(text.includes('`▰▰▰▰▰▰▰▰▱▱`'));assert.ok(text.includes('79\\.6%'));
  assert.equal(text.split('`'+groupA+'`').length-1,1,'group ID appears once per digest');
@@ -1397,7 +1397,7 @@ await test('policy cache does not retain failed lookups or cross a membership ch
  const outcomes=await fail.consumeBatch([message(groupA,1900),message(groupA,1901)]);
  assert.ok(outcomes.every(o=>o.retried&&!o.acked));
  assert.equal(fail.telegram.filter(c=>c.method==='getChat').length,4,'two policy attempts plus two best-effort admin log metadata lookups');
- const f=fixture();
+ const f=fixture();enableFullLogs(f,groupA);
  await f.consumeBatch([message(groupA,1902),{update_id:1903,chat_member:{chat:{id:groupA}}},message(groupA,1904)]);
  assert.equal(f.telegram.filter(c=>c.method==='getChat').length,3);
  assert.equal(f.aiCalls.length,2);
