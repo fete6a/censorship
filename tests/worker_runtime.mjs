@@ -2109,3 +2109,62 @@ await test('HTML parser review regressions exclude inert payloads and recover co
     assert.ok(!JSON.stringify(f.aiCalls[0].input).includes('POISON'));
   }
 });
+
+
+await test('post-merge HTML/XHTML parser edges reach Workers AI without hidden payloads', async () => {
+  const poison = 'SCRIPT_POISON '.repeat(250);
+  const ns = 'http://www.w3.org/1999/xhtml';
+  const cases = [
+    ['text/html',
+      '<head><title>HEAD_POISON</title><main>Article</main>', 'Article'],
+    ['text/html',
+      '<head><meta name="description" content="HEAD_POISON"><div>Article</div>', 'Article'],
+    ['text/html',
+      "<head><script>const x='</head>';</script><nav>MENU_POISON</nav><main>Article</main>",
+      'Article'],
+    ['text/html',
+      '<svg><script/><title/></svg><main>Article</main>', 'Article'],
+    ['text/html',
+      '<nav><svg><script/><style/></svg>MENU_POISON</nav><main>Article</main>',
+      'Article'],
+    ['text/html',
+      '<svg><foreignObject><script/>' + poison + '</script></foreignObject></svg><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      "<script><![CDATA[const x='</script>'; " + poison + ']]></script><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<style><![CDATA[.x{content:"</style>"} ' + poison + ']]></style><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:script>' + poison + '</h:script>' +
+        '<h:main>Article</h:main></h:html>', 'Article'],
+    ['application/xhtml+xml',
+      '<h:script xmlns:h="' + ns + '">' + poison + '</h:script><main>Article</main>',
+      'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:nav><h:template><h:nav>' + poison + '</h:nav>' +
+        '</h:template>MENU_POISON</h:nav><h:main>Article</h:main></h:html>', 'Article'],
+    ['application/xhtml+xml',
+      '<h:html xmlns:h="' + ns + '"><h:div xmlns:h="urn:foreign">' +
+        '<h:script>Foreign visible</h:script></h:div>' +
+        '<h:script>' + poison + '</h:script><h:main>Article</h:main></h:html>',
+      'Foreign visible Article'],
+  ];
+  for (const [mime, html, expected] of cases) {
+    const f = fixture({pageFetch: () => new Response(html, {headers: {'Content-Type': mime}})});
+    const update = message(groupA, 6128);
+    update.message.text = 'Review https://safe.example.org/article';
+    await f.consume(update);
+    assert.equal(f.pageRequests.length, 1);
+    assert.equal(f.aiCalls.length, 1);
+    const aiInput = f.aiCalls[0].input;
+    assert.equal(aiInput.state.link_evidence[0].status, 'fetched');
+    assert.equal(aiInput.state.link_evidence[0].excerpt, expected,
+      'Incorrect Workers AI evidence for ' + mime + ': ' + html.slice(0, 180));
+    assert.ok(Buffer.byteLength(aiInput.state.link_evidence[0].excerpt, 'utf8') <= 2400);
+    for (const marker of ['SCRIPT_POISON', 'HEAD_POISON', 'MENU_POISON']) {
+      assert.ok(!JSON.stringify(aiInput).includes(marker), marker + ': ' + mime);
+    }
+  }
+});
