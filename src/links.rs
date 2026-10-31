@@ -924,6 +924,19 @@ mod tests {
     }
 
     #[test]
+    fn html5_character_references_decode_named_legacy_and_multicodepoint_text() {
+        // Common named entities, semicolonless legacy names, HTML5 C1 numeric
+        // remapping and a two-codepoint entity are not handled by small tables.
+        let html = "<main>Caf&eacute; &NotEqualTilde; &copy &amp done &#x80; \
+            and &lt;script&gt; is literal</main>";
+        assert_eq!(excerpt(html.as_bytes(), "text/html"),
+            "Café ≂̸ © & done € and <script> is literal");
+        // Plain text is not HTML and must not decode character references.
+        assert_eq!(excerpt(b"Caf&eacute; &amp done", "text/plain"),
+            "Caf&eacute; &amp done");
+    }
+
+    #[test]
     fn xhtml_namespace_scopes_remain_bounded_near_page_limit() {
         // Before the active-prefix index, this input required roughly 94M
         // prefix comparisons to resolve the empty namespace.
