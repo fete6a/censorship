@@ -135,6 +135,68 @@ fn private_log_defaults_match_schema_and_both_readmes() {
     excludes(&cn, &["**管理员私人审核日志默认开启。**"]);
 }
 #[test]
+fn manual_d1_guide_tracks_both_log_defaults_and_release_gate() {
+    const FRESH: &str = "logs_warn_only INTEGER NOT NULL DEFAULT 1 CHECK (logs_warn_only IN (0,1))";
+    const LEGACY: &str = "logs_warn_only INTEGER NOT NULL DEFAULT 0 CHECK (logs_warn_only IN (0,1))";
+    contains(&source("schema/current.sql"), &[FRESH]);
+    contains(
+        &source("schema/ensure_log_filter.sql"),
+        &["ALTER TABLE group_settings ADD COLUMN", LEGACY],
+    );
+    let checker = source("tools/maintenance/src/lib.rs");
+    contains(
+        &checker,
+        &[
+            ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT1CHECK(LOGS_WARN_ONLYIN(0,1)))",
+            ",LOGS_WARN_ONLYINTEGERNOTNULLDEFAULT0CHECK(LOGS_WARN_ONLYIN(0,1)))",
+            "e.default_value.as_deref()==Some(\"1\")",
+            "g.default_value.as_deref()==Some(\"0\")",
+            "approved_log_filter_ddl(got[0].definition.as_deref().unwrap_or(\"\"))",
+        ],
+    );
+    contains(
+        &source("src/store.rs"),
+        &[
+            "None => LogMode::Warn",
+            "Some(s) if s.logs_enabled==0 => LogMode::Off",
+            "Some(s) if s.logs_warn_only!=0 => LogMode::Warn",
+            "Some(_) => LogMode::All",
+            "INSERT INTO group_settings(chat_id,remove_threshold,logs_warn_only) VALUES(?,?,1)",
+            "INSERT INTO group_settings(chat_id,dry_run,logs_warn_only) VALUES(?,?,1)",
+        ],
+    );
+    let doc = source("docs/manual-d1-release.md");
+    let section = doc
+        .split_once("## PR #30: administrator log defaults and D1 compatibility")
+        .expect("missing PR #30 release guidance")
+        .1;
+    contains(
+        section,
+        &[
+            FRESH,
+            LEGACY,
+            "`schema/current.sql`",
+            "`schema/ensure_log_filter.sql`",
+            "no `group_settings` row",
+            "`None => LogMode::Warn`",
+            "Existing saved `on`, `warn`, and `off` modes are preserved",
+            "`logs_warn_only=1`",
+            "both `DEFAULT 0` and `DEFAULT 1`",
+            "`--pre-migration`",
+            "exit `3`",
+            "exit `2`",
+            "do not rebuild the table",
+            "do not alter an existing valid `DEFAULT 0` column",
+            "normal preflight must exit `0`",
+        ],
+    );
+    excludes(
+        &doc,
+        &["The warning-log mode requires `group_settings.logs_warn_only INTEGER NOT NULL DEFAULT 0"],
+    );
+}
+
+#[test]
 fn private_logs_target_current_human_admins_and_group_switch_is_documented() {
     let tg = source("src/tg.rs");
     let delivery = between(
