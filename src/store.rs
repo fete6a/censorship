@@ -633,12 +633,20 @@ impl LogMode {
     }
 }
 
-pub async fn group_log_mode(env: &Env, chat_id: i64) -> Result<LogMode> {
-    Ok(match group_settings(env,chat_id).await? {
+/// An absent settings row means a newly discovered or never-configured group.
+/// Existing rows retain their explicit on/warn/off semantics after upgrades.
+fn log_mode_from_settings(settings: Option<&GroupSettings>) -> LogMode {
+    match settings {
         Some(s) if s.logs_enabled==0 => LogMode::Off,
         Some(s) if s.logs_warn_only!=0 => LogMode::Warn,
-        _ => LogMode::All,
-    })
+        Some(_) => LogMode::All,
+        None => LogMode::Warn,
+    }
+}
+
+pub async fn group_log_mode(env: &Env, chat_id: i64) -> Result<LogMode> {
+    let settings=group_settings(env,chat_id).await?;
+    Ok(log_mode_from_settings(settings.as_ref()))
 }
 
 pub async fn set_group_log_mode(env: &Env, chat_id: i64, mode: LogMode) -> Result<()> {
@@ -656,14 +664,14 @@ pub async fn set_group_threshold(env: &Env, chat_id: i64, threshold: f64) -> Res
         return Err(fail("Invalid group ID or threshold"));
     }
     env.d1("DB")?.prepare(
-        "INSERT INTO group_settings(chat_id,remove_threshold) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET remove_threshold=excluded.remove_threshold"
+        "INSERT INTO group_settings(chat_id,remove_threshold,logs_warn_only) VALUES(?,?,1) ON CONFLICT(chat_id) DO UPDATE SET remove_threshold=excluded.remove_threshold"
     ).bind(&[js_i64(chat_id),JsValue::from_f64(threshold)])?.run().await?;
     Ok(())
 }
 pub async fn set_group_dry_run(env: &Env, chat_id: i64, enabled: bool) -> Result<()> {
     if chat_id>=0 {return Err(fail("Invalid group ID"));}
     env.d1("DB")?.prepare(
-        "INSERT INTO group_settings(chat_id,dry_run) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run"
+        "INSERT INTO group_settings(chat_id,dry_run,logs_warn_only) VALUES(?,?,1) ON CONFLICT(chat_id) DO UPDATE SET dry_run=excluded.dry_run"
     ).bind(&[js_i64(chat_id),js_i64(i64::from(enabled))])?.run().await?;
     if enabled {
         env.d1("DB")?.prepare("UPDATE pending_bans SET status='canceled',cancellation_reason='dry_run_enabled',resolved_at=? WHERE chat_id=? AND status='pending'")
@@ -699,7 +707,20 @@ mod archive_retention_tests {
 
 #[cfg(test)]
 mod log_mode_tests {
-    use super::LogMode;
+    use super::{log_mode_from_settings, GroupSettings, LogMode};
+    #[test]
+    fn absent_settings_use_warn_but_saved_modes_keep_their_behavior() {
+        assert_eq!(log_mode_from_settings(None),LogMode::Warn);
+        let mut settings=GroupSettings {
+            dry_run:None,logs_enabled:1,logs_warn_only:0,remove_threshold:None
+        };
+        assert_eq!(log_mode_from_settings(Some(&settings)),LogMode::All);
+        settings.logs_warn_only=1;
+        assert_eq!(log_mode_from_settings(Some(&settings)),LogMode::Warn);
+        settings.logs_enabled=0;
+        assert_eq!(log_mode_from_settings(Some(&settings)),LogMode::Off);
+    }
+
     #[test]
     fn log_modes_accept_only_the_three_documented_single_arguments() {
         for (arg,mode) in [("on",LogMode::All),("warn",LogMode::Warn),("off",LogMode::Off)] {

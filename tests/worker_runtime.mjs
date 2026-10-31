@@ -188,11 +188,25 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
             if (onCleanupDelete) await onCleanupDelete();
             if (failCleanup?.value) throw new Error('synthetic D1 cleanup failure');
           }
+          if (sql.startsWith('DELETE FROM archived_messages WHERE sent_at<?')) {
+            for (const [key, payload] of archives) {
+              if (typeof payload.date === 'number' && payload.date < values[0]) {
+                archives.delete(key);
+                reviews.delete(key);
+              }
+            }
+          }
           if (sql.includes('INSERT INTO group_settings')) {
-            const row = settings.get(values[0]) || { dry_run: null, logs_enabled: 1 };
-            row[sql.includes('(chat_id,dry_run)') ? 'dry_run' : sql.includes('(chat_id,remove_threshold)') ? 'remove_threshold' : 'logs_enabled'] = values[1];
-            if (sql.includes('logs_warn_only')) row.logs_warn_only = values[2];
-            settings.set(values[0], row);
+            const existing=settings.get(values[0]);
+            // Both fresh schema and Worker writes on legacy D1 use warn for new rows.
+            const row=existing || {dry_run:null,logs_enabled:1,logs_warn_only:1};
+            if (sql.includes('(chat_id,dry_run,logs_warn_only)')) row.dry_run=values[1];
+            else if (sql.includes('(chat_id,remove_threshold,logs_warn_only)')) row.remove_threshold=values[1];
+            else {
+              row.logs_enabled=values[1];
+              row.logs_warn_only=values[2];
+            }
+            settings.set(values[0],row);
           }
           if (sql.includes('INSERT INTO scan_jobs')) throw new Error('Scan start must use atomic RETURNING');
           if (sql.includes("UPDATE scan_jobs SET status='stopped'") && jobs.has(values[sql.includes('lease_id=?')?0:1])) {
@@ -301,6 +315,11 @@ function fixture({ pageFetch = null, pauseAdmins = null, pauseAi = null, pauseDe
     settings, reviews, archives, jobs, warningAdjustments, warningReceiptIds, consume, consumeBatch, env };
 }
 
+function enableFullLogs(f,...groups) {
+  for(const group of groups)f.settings.set(group,{dry_run:null,logs_enabled:1,logs_warn_only:0});
+  return f;
+}
+
 await test('daily cleanup is not lost when midnight Cron starts after its scheduled minute', async () => {
   const midnight = Date.parse('2026-10-25T00:00:00Z');
   const clock = {value: midnight + 61_000};
@@ -332,6 +351,32 @@ await test('daily cleanup performs once per UTC day and retains ARCHIVE_DAYS=0 a
   clock.value += 86_400_000;
   await f.tick(midnight + 86_460_000);
   assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,2);
+});
+
+await test('positive archive retention deletes old synthetic rows only and leaves fixed cleanup independent',async()=>{
+  const instant=Date.parse('2026-10-25T00:00:00Z');
+  const f=fixture({clock:{value:instant}}),now=Math.floor(instant/1000);
+  f.env.ARCHIVE_DAYS='2';
+  f.archives.set(`${groupA}:1`,{message_id:1,date:now-3*86400,text:'expired synthetic'});
+  f.archives.set(`${groupA}:2`,{message_id:2,date:now-86400,text:'retained synthetic'});
+  await f.tick();
+  const deletion=f.statements.find(s=>s.sql.startsWith('DELETE FROM archived_messages'));
+  assert.deepEqual(deletion?.values,[now-2*86400]);
+  assert.equal(f.archives.has(`${groupA}:1`),false);
+  assert.equal(f.archives.has(`${groupA}:2`),true);
+  for(const table of ['processed_updates','violations','warning_edit_receipts','warning_adjustments','pending_bans'])
+    assert.ok(f.statements.some(s=>s.sql.startsWith(`DELETE FROM ${table}`)));
+});
+await test('malformed archive retention fails safely after independent fixed cleanup',async()=>{
+  const f=fixture({clock:{value:Date.parse('2026-10-25T00:00:00Z')}});
+  f.env.ARCHIVE_DAYS='-1';
+  f.archives.set(`${groupA}:1`,{message_id:1,date:1,text:'synthetic'});
+  await f.tick();
+  assert.equal(f.archives.size,1);
+  assert.ok(f.errors.some(e=>e.includes('Invalid ARCHIVE_DAYS')));
+  assert.equal(f.cleanupState.last_success_day,-1);
+  assert.equal(f.statements.some(s=>s.sql.startsWith('DELETE FROM archived_messages')),false);
+  assert.equal(f.statements.filter(s=>s.sql.startsWith('DELETE FROM processed_updates')).length,1);
 });
 
 await test('failure does not record success and retries after a bounded backoff', async () => {
@@ -597,7 +642,7 @@ await test('administrator of A cannot change dry-run or logs for B', async () =>
  await f.consume(command(`/${cmd} ${groupB} off`)); assert.equal(f.settings.size, 0); }
 });
 await test('20 event window groups private reviews by chat without leaking to other admins',async()=>{
- const f=fixture();
+ const f=fixture();enableFullLogs(f,groupA,groupB);
  const inputs=[
   ...Array.from({length:14},(_,i)=>message(groupA,800+i)),
   ...Array.from({length:4},(_,i)=>message(groupB,900+i))
@@ -648,7 +693,7 @@ await test('policy snapshots are reset between Queue deliveries and when a comma
 });
 
 await test('a malformed update in the same batch retries independently of successful reviews',async()=>{
- const f=fixture();
+ const f=fixture();enableFullLogs(f,groupA,groupB);
  const result=await f.consumeBatch([message(groupA,880),{},message(groupB,881)]);
  assert.deepEqual(result.map(x=>[x.acked,x.retried]),[[true,false],[false,true],[true,false]]);
  assert.equal(f.aiCalls.length,2);
@@ -682,14 +727,42 @@ await test('MarkdownV2 action notice uses numeric Telegram links without exposin
  assert.ok(!notice.text.includes('t.me/c/100/889'),'deleted content is not linked');
 });
 
-await test('review logs default on and go only to the reviewed group human administrators', async () => {
- const f = fixture(); await f.consume(message(groupA));
+await test('unsaved groups default to warning-only admin DMs while reviews remain archived',async()=>{
+  const f=fixture();
+  await f.consumeBatch([message(groupA,3401),message(groupB,3402)]);
+  assert.equal(f.settings.size,0);
+  assert.equal(f.telegram.some(c=>c.method==='getChatAdministrators'||c.method==='sendMessage'),false);
+  assert.equal(f.reviews.get(`${groupA}:3401`)?.last_status,'allow');
+  assert.equal(f.archives.size,2);
+  const hit=fixture({remove:true});
+  await hit.consume(message(groupA,3403));
+  const sends=hit.telegram.filter(c=>c.method==='sendMessage');
+  assert.equal(sends.length,1);
+  assert.equal(sends[0].args.chat_id,11);
+  assert.match(sends[0].args.text,/模拟命中/);
+});
+await test('first unrelated settings write uses warn, existing full settings remain full',async()=>{
+  const newThreshold=fixture();
+  await newThreshold.consume(command(`/threshold ${groupA} 75%`));
+  assert.equal(newThreshold.settings.get(groupA).logs_warn_only,1);
+  const newDryRun=fixture();
+  await newDryRun.consume(command(`/dry_run ${groupA} off`));
+  assert.equal(newDryRun.settings.get(groupA).logs_warn_only,1);
+  const existing=fixture();
+  enableFullLogs(existing,groupA);
+  await existing.consume(command(`/threshold ${groupA} 80%`));
+  assert.equal(existing.settings.get(groupA).logs_warn_only,0);
+  await existing.consume(message(groupA,3499));
+  assert.ok(existing.telegram.some(c=>c.method==='sendMessage'&&c.args.chat_id===11&&c.args.text.includes('审核摘要')));
+});
+await test('saved full-review logs go only to the reviewed group human administrators', async () => {
+ const f = fixture(); enableFullLogs(f,groupA); await f.consume(message(groupA));
  const sends = f.telegram.filter(c => c.method === 'sendMessage');
  assert.equal(sends.length, 1); assert.equal(sends[0].args.chat_id, 11);
  assert.match(sends[0].args.text, /-100100/);
 });
 await test('logs off for group A does not disable group B logs or change dry-run', async () => {
- const f = fixture(); f.settings.set(groupA, {dry_run:0,logs_enabled:1});
+ const f = fixture(); enableFullLogs(f,groupB); f.settings.set(groupA, {dry_run:0,logs_enabled:1});
  await f.consume(command(`/logs ${groupA} off`));
  assert.equal(f.settings.get(groupA).logs_enabled,0); assert.equal(f.settings.get(groupA).dry_run,0);
  f.telegram.length=0; await f.consume(message(groupA)); await f.consume(message(groupB,457));
@@ -732,7 +805,7 @@ await test('warn mode suppresses allowed digests and avoids administrator lookup
  assert.equal(f.telegram.some(c=>c.method==='getChatAdministrators'||c.method==='sendMessage'),false);
 });
 await test('warn mode keeps only flagged rows in mixed digests while another group still receives allows',async()=>{
- const f=fixture({remove:true,scores:[0.1,0.99,0.1]});f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
+ const f=fixture({remove:true,scores:[0.1,0.99,0.1]});enableFullLogs(f,groupB);f.settings.set(groupA,{dry_run:1,logs_enabled:1,logs_warn_only:1});
  await f.consumeBatch([message(groupA,2300),message(groupA,2301),message(groupB,2302)]);
  const a=f.telegram.find(c=>c.method==='sendMessage'&&c.args.chat_id===11)?.args.text||'';
  assert.match(a,/1 条/);assert.ok(a.includes('2301'));assert.ok(!a.includes('2300'));assert.match(a,/模拟命中/);
@@ -816,7 +889,7 @@ await test('admin log delivery failure does not retry or roll back a review',asy
  assert.equal(f.statements.find(s=>s.sql.includes('UPDATE archived_messages'))?.values[0],'allow');
 });
 await test('log recipients are refreshed when group administrators change',async()=>{
- const admins=[11];const f=fixture({adminsA:admins});await f.consume(message(groupA,501));
+ const admins=[11];const f=fixture({adminsA:admins});enableFullLogs(f,groupA);await f.consume(message(groupA,501));
  admins.splice(0,1,12);await f.consume(message(groupA,502));
  assert.deepEqual(f.telegram.filter(c=>c.method==='sendMessage').map(c=>c.args.chat_id),[11,12]);
 });
@@ -1030,7 +1103,7 @@ await test('dry-run does not announce deletion or ban in the group',async()=>{
 
 
 await test('20 reviewed updates use one final-status read per group',async()=>{
- const f=fixture();const outcomes=await f.consumeBatch(Array.from({length:20},(_,i)=>message(groupA,1000+i)));
+ const f=fixture();enableFullLogs(f,groupA);const outcomes=await f.consumeBatch(Array.from({length:20},(_,i)=>message(groupA,1000+i)));
  assert.ok(outcomes.every(x=>x.acked&&!x.retried));
  const reads=f.statements.filter(s=>s.operation==='read'&&s.sql.includes('FROM archived_messages'));
  assert.equal(reads.length,1,'read the final committed statuses together');
@@ -1045,7 +1118,7 @@ await test('logs off skips all passive status reads and admin lookups',async()=>
  assert.equal(f.aiCalls.length,20);
 });
 await test('multi-chunk digest fetches the current group administrators once',async()=>{
- const f=fixture({adminsA:[11,12]});
+ const f=fixture({adminsA:[11,12]});enableFullLogs(f,groupA);
  await f.consumeBatch(Array.from({length:80},(_,i)=>message(groupA,1200+i)));
  const sends=f.telegram.filter(c=>c.method==='sendMessage');
  assert.ok(sends.filter(c=>c.args.chat_id===11).length>1,'test spans multiple chunks');
@@ -1054,7 +1127,7 @@ await test('multi-chunk digest fetches the current group administrators once',as
  assert.ok(sends.every(c=>[11,12].includes(c.args.chat_id)));
 });
 await test('a failed digest read cannot retry completed reviews or suppress another group digest',async()=>{
- const f=fixture({digestFail:true});
+ const f=fixture({digestFail:true});enableFullLogs(f,groupA,groupB);
  const outcomes=await f.consumeBatch([message(groupA,1400),message(groupB,1401)]);
  assert.ok(outcomes.every(x=>x.acked&&!x.retried));
  assert.equal(f.completed.size,2);
@@ -1062,7 +1135,7 @@ await test('a failed digest read cannot retry completed reviews or suppress anot
 });
 
 await test('private digests identify each group by its own clickable name and numeric ID',async()=>{
- const f=fixture();await f.consumeBatch([message(groupA,1500),message(groupB,1501)]);
+ const f=fixture();enableFullLogs(f,groupA,groupB);await f.consumeBatch([message(groupA,1500),message(groupB,1501)]);
  const sends=f.telegram.filter(c=>c.method==='sendMessage');
  const a=sends.find(c=>c.args.chat_id===11)?.args.text||'';
  const b=sends.find(c=>c.args.chat_id===21)?.args.text||'';
@@ -1071,7 +1144,7 @@ await test('private digests identify each group by its own clickable name and nu
  assert.ok(!a.includes('group_b'));
 });
 await test('private supergroup name links to a surviving reviewed message without creating invitations',async()=>{
- const f=fixture({groupUsernames:{}});await f.consume(message(groupA,1502));
+ const f=fixture({groupUsernames:{}});enableFullLogs(f,groupA);await f.consume(message(groupA,1502));
  const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
  assert.ok(text.includes('[Group A](https://t.me/c/100/1502)'));
  assert.equal(f.telegram.some(c=>c.method.includes('InviteLink')),false);
@@ -1084,7 +1157,7 @@ await test('private enforcement logs use an existing group invite link and escap
  for(const c of sends)assert.ok(c.args.text.includes('[Group \\*A\\* \\[x\\]](https://t.me/+Existing_Invite-1)'));
 });
 await test('group metadata failure keeps committed reviews and delivers a safe ID-based link',async()=>{
- const f=fixture({groupInfoFail:true,groupUsernames:{}});await f.consume(message(groupA,1504));
+ const f=fixture({groupInfoFail:true,groupUsernames:{}});enableFullLogs(f,groupA);await f.consume(message(groupA,1504));
  assert.equal(f.completed.has(1504),true);
  const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
  assert.ok(text.includes('(https://t.me/c/100/1504)'));
@@ -1092,7 +1165,7 @@ await test('group metadata failure keeps committed reviews and delivers a safe I
 });
 
 await test('group metadata cannot inject an external URL into private logs',async()=>{
- const f=fixture({groupUsernames:{[groupA]:'x](https://evil.example)'},groupInvite:'https://evil.example/invite'});
+ const f=fixture({groupUsernames:{[groupA]:'x](https://evil.example)'},groupInvite:'https://evil.example/invite'});enableFullLogs(f,groupA);
  await f.consume(message(groupA,1505));
  const text=f.telegram.find(c=>c.method==='sendMessage')?.args.text||'';
  assert.ok(text.includes('[Group A](https://t.me/c/100/1505)'));
@@ -1245,7 +1318,7 @@ await test('digests and action logs show the current creator name and numeric pr
 
 await test('creator changes and absent names use the current administrator snapshot',async()=>{
  const admins=[11],owners={[groupA]:{id:11,first_name:'Alice'}};
- const f=fixture({adminsA:admins,owners});await f.consume(message(groupA,1702));
+ const f=fixture({adminsA:admins,owners});enableFullLogs(f,groupA);await f.consume(message(groupA,1702));
  admins.splice(0,1,12);owners[groupA]={id:12};
  await f.consume(message(groupA,1703));
  const text=f.telegram.filter(c=>c.method==='sendMessage').at(-1)?.args.text||'';

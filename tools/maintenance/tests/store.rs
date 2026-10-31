@@ -167,6 +167,19 @@ fn threshold_updates_preserve_other_settings_and_enforce_ranges() {
     .is_err());
 }
 #[test]
+fn first_unrelated_setting_uses_warn_on_legacy_d1_without_changing_saved_full_mode() {
+    let db=db();
+    batch(&db,"INSERT INTO group_settings(chat_id,logs_enabled,logs_warn_only) VALUES(-100,1,0)");
+    q(&db,"set_group_threshold",json!([-100,0.8]));
+    q(&db,"set_group_dry_run",json!([-100,1]));
+    assert_eq!(sql(&db,"SELECT logs_enabled,logs_warn_only FROM group_settings WHERE chat_id=-100",json!([])),json!([[1,0]]));
+
+    q(&db,"set_group_threshold",json!([-200,0.9]));
+    q(&db,"set_group_dry_run",json!([-300,0]));
+    assert_eq!(sql(&db,"SELECT chat_id,logs_enabled,logs_warn_only FROM group_settings WHERE chat_id IN (-200,-300) ORDER BY chat_id",json!([])),json!([[-300,1,1],[-200,1,1]]));
+}
+
+#[test]
 fn managed_chat_states_are_constrained() {
     let db = db();
     for (chat, status) in [(-1001, "active"), (-1002, "delete_only"), (-1003, "paused")] {
