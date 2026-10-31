@@ -11,8 +11,8 @@ pub const ENSURE_WARNINGS: &str = include_str!("../../../schema/ensure_warning_a
 pub const ENSURE_SCAN: &str = include_str!("../../../schema/ensure_scan_fencing.sql");
 pub const ENSURE_LOG_FILTER: &str = include_str!("../../../schema/ensure_log_filter.sql");
 pub const ENSURE_CLEANUP: &str = include_str!("../../../schema/ensure_cleanup_state.sql");
-pub const METADATA_SQL: &str = "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type,name";
-const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.type,p.\"notnull\",p.pk,p.dflt_value FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS p ON m.type='table' WHERE m.type IN ('table','index','trigger') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.type,m.name,p.cid";
+pub const METADATA_SQL: &str = "SELECT type AS object_type,name AS object_name,tbl_name AS table_name,sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') AND name NOT GLOB 'sqlite_*' ORDER BY type,name";
+const INSPECTION_SQL: &str = "SELECT m.type,m.name,m.tbl_name,m.sql,p.name,p.type,p.\"notnull\",p.pk,p.dflt_value FROM sqlite_master AS m LEFT JOIN pragma_table_info(m.name) AS p ON m.type='table' WHERE m.type IN ('table','index','trigger') AND m.name NOT GLOB 'sqlite_*' ORDER BY m.type,m.name,p.cid";
 const SCAN_COLUMNS: [&str; 3] = ["generation", "lease_id", "lease_until"];
 // PRAGMA table_info omits CHECK constraints. The canonical schema and approved
 // additive ALTER both place this exact column declaration last.
@@ -387,14 +387,17 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
         if kind == "trigger"
             && !expected.contains_key(&(kind, name))
             && observed.iter().any(|r| {
+                // Even an unrelated-looking settings trigger may flip private
+                // log mode after an otherwise policy-preserving UPSERT.
                 matches!(
                     r.table_name.as_str(),
-                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans" | "cleanup_state"
+                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans"
+                        | "cleanup_state" | "group_settings"
                 )
             })
         {
             errors.push(format!(
-                "unexpected trigger on warning/pending table: {name}"
+                "unexpected trigger on policy-sensitive table: {name}"
             ));
         }
     }
