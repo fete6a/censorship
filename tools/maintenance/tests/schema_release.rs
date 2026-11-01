@@ -334,7 +334,7 @@ fn double_quoted_expression_cannot_masquerade_as_required_trigger() {
         .unwrap();
     let original = trigger.definition.as_ref().unwrap().clone();
     let old_where = "WHERE chat_id=NEW.chat_id AND user_id=NEW.user_id AND status='pending';";
-    let new_where = "WHERE \\"chat_id=NEW.chat_id\\" AND user_id=NEW.user_id AND status='pending';";
+    let new_where = "WHERE \"chat_id=NEW.chat_id\" AND user_id=NEW.user_id AND status='pending';";
     assert!(original.contains(old_where));
     let altered = original.replace(old_where, new_where);
     assert_ne!(normalized_ddl(&original), normalized_ddl(&altered));
