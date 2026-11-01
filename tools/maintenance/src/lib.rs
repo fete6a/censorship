@@ -208,8 +208,9 @@ pub fn parse_inspection_json(text: &str) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// Normalize SQL keywords/identifier quoting but preserve single-quoted string
-/// values exactly, including doubled quotes and case-sensitive status values.
+/// Normalize SQL case/whitespace outside single-quoted values, but keep
+/// identifier quote delimiters. Removing double quotes could equate a SQL
+/// comparison with a double-quoted SQLite string literal that never compares.
 pub fn normalized_ddl(sql: &str) -> String {
     let mut out = String::new();
     let mut quoted = false;
@@ -224,7 +225,7 @@ pub fn normalized_ddl(sql: &str) -> String {
             }
         } else if quoted {
             out.push(c);
-        } else if !c.is_whitespace() && c != '"' && c != '`' {
+        } else if !c.is_whitespace() {
             out.extend(c.to_uppercase());
         }
     }

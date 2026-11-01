@@ -305,7 +305,7 @@ fn group_settings_trigger_can_override_warn_first_write_on_legacy_default() {
 fn trigger_normalization_preserves_string_semantics_and_escaped_quotes() {
     assert_eq!(
         normalized_ddl("SELECT 'a''B c', \"foo\""),
-        "SELECT'a''B c',FOO"
+        "SELECT'a''B c',\"FOO\""
     );
     let db = db();
     let mut rows = inspect_sqlite(&db).unwrap();
@@ -322,6 +322,30 @@ fn trigger_normalization_preserves_string_semantics_and_escaped_quotes() {
     assert_eq!(validate(&rows, true).unwrap().status, Status::Incompatible);
     verify_warning_trigger_behavior().unwrap();
 }
+#[test]
+fn double_quoted_expression_cannot_masquerade_as_required_trigger() {
+    // SQLite may interpret an unknown double-quoted identifier as a string.
+    // Dropping the quotes during normalization used to hide a changed WHERE
+    // predicate in the canonical warning receipt trigger.
+    let db = db();
+    let mut rows = inspect_sqlite(&db).unwrap();
+    let trigger = rows.iter_mut()
+        .find(|r| r.object_type == "trigger" && r.object_name == "apply_warning_edit_receipt")
+        .unwrap();
+    let original = trigger.definition.as_ref().unwrap().clone();
+    let old_where = "WHERE chat_id=NEW.chat_id AND user_id=NEW.user_id AND status='pending';";
+    let new_where = "WHERE \\"chat_id=NEW.chat_id\\" AND user_id=NEW.user_id AND status='pending';";
+    assert!(original.contains(old_where));
+    let altered = original.replace(old_where, new_where);
+    assert_ne!(normalized_ddl(&original), normalized_ddl(&altered));
+    trigger.definition = Some(altered);
+    for pre in [true, false] {
+        let result = validate(&rows, pre).unwrap();
+        assert_eq!(result.status, Status::Incompatible);
+        assert!(result.errors.iter().any(|e| e.contains("trigger definition mismatch: apply_warning_edit_receipt")), "{:?}", result.errors);
+    }
+}
+
 #[test]
 fn scan_migration_resumes_each_partial_state_preserving_jobs() {
     let db = old();
