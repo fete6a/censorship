@@ -208,8 +208,9 @@ pub fn parse_inspection_json(text: &str) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// Normalize SQL keywords/identifier quoting but preserve single-quoted string
-/// values exactly, including doubled quotes and case-sensitive status values.
+/// Normalize SQL case/whitespace outside single-quoted values, but keep
+/// identifier quote delimiters. Removing double quotes could equate a SQL
+/// comparison with a double-quoted SQLite string literal that never compares.
 pub fn normalized_ddl(sql: &str) -> String {
     let mut out = String::new();
     let mut quoted = false;
@@ -224,7 +225,7 @@ pub fn normalized_ddl(sql: &str) -> String {
             }
         } else if quoted {
             out.push(c);
-        } else if !c.is_whitespace() && c != '"' && c != '`' {
+        } else if !c.is_whitespace() {
             out.extend(c.to_uppercase());
         }
     }
@@ -383,22 +384,11 @@ pub fn validate(rows: &[Row], pre_migration: bool) -> Result<Check> {
             errors.push(format!("{name} CREATE TABLE/CHECK constraints mismatch"));
         }
     }
-    for (&(kind, name), observed) in &actual {
-        if kind == "trigger"
-            && !expected.contains_key(&(kind, name))
-            && observed.iter().any(|r| {
-                // Even an unrelated-looking settings trigger may flip private
-                // log mode after an otherwise policy-preserving UPSERT.
-                matches!(
-                    r.table_name.as_str(),
-                    "warning_edit_receipts" | "warning_adjustments" | "pending_bans"
-                        | "cleanup_state" | "group_settings"
-                )
-            })
-        {
-            errors.push(format!(
-                "unexpected trigger on policy-sensitive table: {name}"
-            ));
+    // A trigger on an unrelated table can still change group privacy settings.
+    // Without reviewing all transitive SQL effects, any extra trigger is unsafe.
+    for (&(kind, name), _) in &actual {
+        if kind == "trigger" && !expected.contains_key(&(kind, name)) {
+            errors.push(format!("unexpected trigger (unreviewed effects): {name}"));
         }
     }
     let receipts = actual.contains_key(&("table", "warning_edit_receipts"));
